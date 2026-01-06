@@ -1,6 +1,7 @@
 # --- data ---
 data/*
 sorting_tmp/*
+sorting_temp/*
 # --- Python ---
 __pycache__/
 *.pyo
@@ -30,4 +31,4 @@ Thumbs.db
 # --- secrets (if any) ---
 .env
 *.key
-.sif
+*.sif
