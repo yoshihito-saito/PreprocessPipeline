@@ -29,3 +29,5 @@ Thumbs.db
 
 # --- secrets (if any) ---
 .env
+*.key
+.sif
