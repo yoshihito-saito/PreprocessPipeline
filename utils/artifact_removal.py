@@ -68,7 +68,8 @@ def detect_high_amplitude_artifacts(
             th_amp = thresholds_dict[gid]
             
             # Median across channels for each timepoint (robust to per-channel outliers)
-            m = np.median(X[:, ch_inds], axis=1)
+            # m = np.median(X[:, ch_inds], axis=1)
+            m = np.median(np.abs(X[:, ch_inds]), axis=1)
             
             violation_mask = np.abs(m) > th_amp
             violation_inds = np.flatnonzero(violation_mask)
@@ -123,9 +124,8 @@ def detect_high_amplitude_artifacts(
         for s in starts:
             # Load window and compute time-wise median across channels
             X_est = sub.get_traces(start_frame=int(s), end_frame=int(s+W_est), return_in_uV=True).astype(np.float32).T
-            m = np.median(X_est, axis=0)
-            m = m - np.median(m)
-            pool_abs.append(np.abs(m))
+            m = np.median(np.abs(X_est), axis=1)
+            pool_abs.append(m)
         
         if not pool_abs:
             # Degenerate case: set an extremely high threshold to avoid false positives
@@ -192,7 +192,7 @@ def detect_high_amplitude_artifacts(
 
 def remove_artifacts(
     recording_in: si.BaseRecording,
-    artifact_per_group: dict[int, list[int]],
+    artifact_per_group: dict[int, list[int]] or list[int],
     by_group: bool = True,         # If False, treat all channels as a single group
     ms_before: float = 0.5,        # Window start relative to trigger (ms; positive values look back in time)
     ms_after: float = 3.0,         # Window end relative to trigger (ms; positive values look forward in time)
@@ -261,7 +261,10 @@ def remove_artifacts(
 
         # Triggers for this group (frames). Deduplicate & sort.
         # If by_group=False, we expect triggers in key 0.
-        trig = artifact_per_group.get(int(gid), [])
+        if type(artifact_per_group) is list:
+            trig = artifact_per_group
+        else:
+            trig = artifact_per_group.get(int(gid), [])
         if trig:
             trig = np.unique(np.asarray(trig, dtype=np.int64)).tolist()
 
@@ -296,7 +299,8 @@ def remove_artifacts(
 
     # Aggregate channels back (keeps original order by our group ordering + in-group order)
     recording_clean = si.aggregate_channels(cleaned_subs)
-
+    original_ids = recording_in.get_channel_ids()
+    recording_clean = recording_clean.select_channels(original_ids)
     # Re-apply original group property on the aggregated recording
     try:
         agg_ch_ids = recording_clean.get_channel_ids()
