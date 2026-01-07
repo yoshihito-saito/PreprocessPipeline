@@ -9,26 +9,28 @@ from scipy.io import savemat
 from pathlib import Path
 
 def extract_datetime(path):
+    """Extract YYMMDD_HHMMSS from path."""
     m = re.search(r'(\d{6}_\d{6})', path)
     if m:
         return datetime.strptime(m.group(1), "%y%m%d_%H%M%S")
     return datetime.min 
 
 def select_folder(initial_drive="S:\\"):
-    # Create a root window and hide it
+    """Open folder selection dialog."""
+    # Create and hide root window
     root = tk.Tk()
     root.withdraw()
-    root.lift()  # Bring window to front
-    root.attributes('-topmost', True)  # Keep on top
-    root.update()  # Process pending events
+    root.lift()
+    root.attributes('-topmost', True)
+    root.update()
 
-    # Open folder selection dialog with initial directory
+    # Open dialog
     basePath = filedialog.askdirectory(
         title="Select data folder",
         initialdir=initial_drive if os.path.exists(initial_drive) else os.getcwd()
     )
 
-    root.destroy()  # Destroy root window
+    root.destroy()
     if basePath:
         print(f"Selected folder: {basePath}")
     return basePath
@@ -49,245 +51,256 @@ def get_sampling_rate(xml_path):
         return float(sr_tag.text)
     except (AttributeError, ValueError):
         return None
+ 
 
-
-def create_channel_map(basepath, basename=None, electrode_type=None, reject_channels=None, probe_assignments=None):
-    """
-    Python implementation of createChannelMapFile_KSW with multiple probe support.
-    Generates a chanMap.mat file based on XML configuration and electrode type.
-    
-    probe_assignments: List of dicts, e.g. :
-    [
-        {'type': 'staggered', 'groups': [0,1,2,3], 'x_offset': 0},
-        {'type': 'poly3', 'groups': [4,5,6,7], 'x_offset': 2000}
-    ]
-    If None, uses electrode_type for all groups.
-    """
-    base_path = Path(basepath)
-    if basename is None:
-        basename = base_path.name
-    if reject_channels is None:
-        reject_channels = []
-
-    xml_path = base_path / f"{basename}.xml"
-                
-    if not xml_path.exists():
-        print(f"Error: Could not find XML file at {xml_path}")
-        return None
-
-    print(f"Reading XML from: {xml_path}")
+def load_xml_metadata(xml_path):
     tree = ET.parse(xml_path)
     root = tree.getroot()
-
-    # Extract AnatGrps and Skips
+    
     anat_grps = []
-    anat_skips = []
-    anat_desc = root.find('.//anatomicalDescription')
+    skipped_channels = []
+    anat_desc = root.find('anatomicalDescription')
     if anat_desc is not None:
         ch_grps = anat_desc.find('channelGroups')
         if ch_grps is not None:
             for group in ch_grps.findall('group'):
                 channels = []
-                skips = []
-                tags = group.findall('channel') if group.find('channel') is not None else group.findall('n')
-                for ch_tag in tags:
-                    channels.append(int(ch_tag.text))
-                    skips.append(int(ch_tag.attrib.get('skip', '0')))
+                tags = group.findall('n')
+                if not tags: tags = group.findall('channel')
+                for ch in tags:
+                    try:
+                        if ch.text and ch.text.strip():
+                            val = int(ch.text)
+                            channels.append(val)
+                            if ch.get('skip') == '1':
+                                skipped_channels.append(val)
+                    except (ValueError, TypeError):
+                        continue
                 if channels:
                     anat_grps.append(channels)
-                    anat_skips.append(skips)
-    
-    ngroups = len(anat_grps)
-    if ngroups == 0:
-        print("Warning: No anatomical groups found.")
-        return None
 
-    # Default probe assignment if not provided
-    if probe_assignments is None:
-        if electrode_type is None:
-            electrode_type = 'staggered'
-            desc = root.find('.//description')
-            if desc is not None and desc.text:
-                if 'NeuroPixel' in desc.text: electrode_type = 'NeuroPixel'
-                elif 'poly3' in desc.text: electrode_type = 'poly3'
-                elif 'poly5' in desc.text: electrode_type = 'poly5'
-        probe_assignments = [{'type': electrode_type, 'groups': list(range(ngroups)), 'x_offset': 0}]
-
-    # Extract SpkGrps
     spk_channels = []
-    spk_desc = root.find('.//spikeDetection')
+    spk_desc = root.find('spikeDetection')
+    has_spk_groups = False
+    
     if spk_desc is not None:
         ch_grps = spk_desc.find('channelGroups')
         if ch_grps is not None:
-            for group in ch_grps.findall('group'):
-                channels_wrapper = group.find('channels')
-                tags = (channels_wrapper.findall('channel') if channels_wrapper is not None else group.findall('channel')) or \
-                       (channels_wrapper.findall('n') if channels_wrapper is not None else group.findall('n'))
-                spk_channels.extend([int(t.text) for t in tags])
+            groups = ch_grps.findall('group')
+            if groups:
+                has_spk_groups = True
+                for group in groups:
+                    channels_container = group.find('channels')
+                    tags = []
+                    if channels_container is not None:
+                        tags = channels_container.findall('n')
+                        if not tags: tags = channels_container.findall('channel')
+                    else:
+                        tags = group.findall('n')
+                        if not tags: tags = group.findall('channel')
+                    for ch in tags:
+                        try:
+                            if ch.text and ch.text.strip():
+                                spk_channels.append(int(ch.text))
+                        except (ValueError, TypeError):
+                            continue
 
-    xcoords_list = []
-    ycoords_list = []
-    kcoords_list = []
-    side_list = []
-    probe_id_list = []
-    ordered_channels = []
+    return anat_grps, spk_channels, has_spk_groups, skipped_channels, root
 
-    last_shank_id = 0
-
-    for i_p, pa in enumerate(probe_assignments):
-        p_type = pa.get('type', 'staggered')
-        p_groups_indices = pa.get('groups', [])
-        p_x_offset = pa.get('x_offset', 0)
-        
-        p_anat_grps = [anat_grps[i] for i in p_groups_indices]
-        p_ngroups = len(p_anat_grps)
-        
-        if p_type == 'NeuroPixel':
-            for a in range(p_ngroups):
-                x_pattern = np.array([20, 60, 0, 40])
-                tchannels = p_anat_grps[a]
-                n_ch = len(tchannels)
-                x = (np.tile(x_pattern, (n_ch // 4) + 1)[:n_ch]) + p_x_offset
-                y = np.repeat(np.arange(n_ch // 2) * -20, 2)[:n_ch]
-                xcoords_list.extend(x.tolist())
-                ycoords_list.extend(y.tolist())
-                kcoords_list.extend([last_shank_id + a + 1] * n_ch)
-                probe_id_list.extend([i_p + 1] * n_ch)
-                side_list.extend([''] * n_ch)
-                ordered_channels.extend(tchannels)
-                
-        elif p_type == 'staggered':
-            for a in range(p_ngroups):
-                tchannels = p_anat_grps[a]
-                n_ch = len(tchannels)
-                x = np.full(n_ch, 20.0)
-                y = np.arange(1, n_ch + 1) * -20.0
-                x[::2] = -20.0 
-                x = x + (a + 1) * 200 + p_x_offset
-                xcoords_list.extend(x.tolist())
-                ycoords_list.extend(y.tolist())
-                kcoords_list.extend([last_shank_id + a + 1] * n_ch)
-                probe_id_list.extend([i_p + 1] * n_ch)
-                side_list.extend([''] * n_ch)
-                ordered_channels.extend(tchannels)
-
-        elif p_type == 'double_sided':
-            for ix in range(p_ngroups // 2):
-                idx_a = ix * 2
-                idx_b = ix * 2 + 1
-                chan_a = p_anat_grps[idx_a]
-                chan_b = p_anat_grps[idx_b]
-                
-                n_a = len(chan_a)
-                xa = np.full(n_a, 20.0)
-                ya = np.arange(1, n_a + 1) * -20.0
-                xa[::2] = -20.0
-                xa = xa + (ix + 1) * 200 + p_x_offset
-                
-                n_b = len(chan_b)
-                xb = np.zeros(n_b)
-                yb = np.arange(1, n_b + 1) * -20.0
-                xb[::2] = xa[:n_b:2] + 40
-                xb[1::2] = xa[1:n_b:2] - 40
-                
-                xcoords_list.extend(xa.tolist()); ycoords_list.extend(ya.tolist())
-                kcoords_list.extend([last_shank_id + ix + 1] * n_a)
-                probe_id_list.extend([i_p + 1] * n_a)
-                side_list.extend(['Back'] * n_a); ordered_channels.extend(chan_a)
-                
-                xcoords_list.extend(xb.tolist()); ycoords_list.extend(yb.tolist())
-                kcoords_list.extend([last_shank_id + ix + 1] * n_b)
-                probe_id_list.extend([i_p + 1] * n_b)
-                side_list.extend(['Front'] * n_b); ordered_channels.extend(chan_b)
-                
-        elif p_type == 'poly3':
-            for a in range(p_ngroups):
-                tchannels = p_anat_grps[a]
-                n_ch = len(tchannels)
-                x = np.zeros(n_ch); y = np.zeros(n_ch)
-                extrachannels = n_ch % 3
-                polyline = np.arange(n_ch - extrachannels) % 3
-                x[np.where(polyline == 1)[0] + extrachannels] = -18
-                x[np.where(polyline == 2)[0] + extrachannels] = 0
-                x[np.where(polyline == 0)[0] + extrachannels] = 18
-                for val in [18, 0, -18]:
-                    mask = (x == val); count = np.sum(mask)
-                    if count > 0:
-                        y[mask] = (np.arange(1, count + 1) * -20) - (10 if val == 0 else 0) + (extrachannels * 20 if val == 0 else 0)
-                x = x + (a + 1) * 200 + p_x_offset
-                xcoords_list.extend(x.tolist()); ycoords_list.extend(y.tolist())
-                kcoords_list.extend([last_shank_id + a + 1] * n_ch)
-                probe_id_list.extend([i_p + 1] * n_ch)
-                side_list.extend([''] * n_ch); ordered_channels.extend(tchannels)
-
-        elif p_type == 'poly5':
-            for a in range(p_ngroups):
-                tchannels = p_anat_grps[a]
-                n_ch = len(tchannels)
-                x = np.zeros(n_ch); y = np.zeros(n_ch)
-                extrachannels = n_ch % 5
-                polyline = np.arange(n_ch - extrachannels) % 5
-                x[np.where(polyline == 1)[0] + extrachannels] = -2 * 18
-                x[np.where(polyline == 2)[0] + extrachannels] = -18
-                x[np.where(polyline == 3)[0] + extrachannels] = 0
-                x[np.where(polyline == 4)[0] + extrachannels] = 18
-                x[np.where(polyline == 0)[0] + extrachannels] = 2 * 18
-                if extrachannels > 0: x[:extrachannels] = 18 * ((-1) ** np.arange(1, extrachannels + 1))
-                for val in [36, 18, 0, -18, -36]:
-                    mask = (x == val); count = np.sum(mask)
-                    if count > 0:
-                        y[mask] = np.arange(1, count + 1) * -28 - (14 if val in [18, -18] else 0)
-                x = x + (a + 1) * 200 + p_x_offset
-                xcoords_list.extend(x.tolist()); ycoords_list.extend(y.tolist())
-                kcoords_list.extend([last_shank_id + a + 1] * n_ch)
-                probe_id_list.extend([i_p + 1] * n_ch)
-                side_list.extend([''] * n_ch); ordered_channels.extend(tchannels)
-
-        # Update last_shank_id to ensure shanks are unique across probes
-        shanks_in_probe = (p_ngroups // 2) if p_type == 'double_sided' else p_ngroups
-        last_shank_id += shanks_in_probe
-
-    # Map back to absolute indices
-    all_channels_flat = np.concatenate(anat_grps)
-    max_ch = np.max(all_channels_flat)
-    connected = np.zeros(max_ch + 1, dtype=bool)
-    side = np.empty((max_ch + 1, 1), dtype=object); side[:] = ''
+def create_channel_map(basepath, outputDir, basename=None, electrode_type=None, reject_channels=None, probe_assignments=None):
+    if reject_channels is None:
+        reject_channels = []
     
-    for grp, skips in zip(anat_grps, anat_skips):
-        for ch, s in zip(grp, skips):
-            connected[ch] = (s == 0)
+    base_path = Path(basepath)
+    if basename is None:
+        basename = base_path.name
+        if basename.endswith('.xml'):
+            basename = os.path.splitext(basename)[0]
+
+    xml_path = base_path / f"{basename}.xml"
+
+    if not xml_path.exists():
+        print(f"Error: XML file {xml_path} not found.")
+        return None
+
+    print(f"Reading XML from: {xml_path}")
+    anat_grps, spk_channels, has_spk_groups, skipped_channels, root = load_xml_metadata(xml_path)
+
+    ngroups = len(anat_grps)
+    if ngroups == 0:
+        print("Warning: No anatomical groups found in XML.")
+        return None
+    print(f"Found {ngroups} anatomical groups (XML document order).")
+
+    if electrode_type is None:
+        electrode_type = 'staggered'
+        desc_node = root.find('generalInfo/description')
+        if desc_node is not None and desc_node.text:
+            val = desc_node.text.strip().lower()
+            if 'neuropixel' in val: electrode_type = 'NeuroPixel'
+            elif 'staggered' in val: electrode_type = 'staggered'
+            elif 'neurogrid' in val: electrode_type = 'neurogrid'
+            elif 'grid' in val: electrode_type = 'neurogrid'
+            elif 'poly3' in val: electrode_type = 'poly3'
+            elif 'poly5' in val: electrode_type = 'poly5'
+    
+    print(f"Default electrode layout: {electrode_type}")
+
+    if not probe_assignments:
+        print("No probe assignments provided. Using default configuration (XML order).")
+        probe_assignments = [
+            {'type': electrode_type, 'groups': list(range(ngroups)), 'x_offset': 0}
+        ]
+
+    channel_coords = [] 
+
+    for probe_idx, probe in enumerate(probe_assignments):
+        p_type = probe.get('type', electrode_type)
+        p_groups = probe.get('groups', [])
+        p_x_offset = probe.get('x_offset', 0)
+        
+        print(f"Processing Probe {probe_idx+1}: Type={p_type}, Groups={p_groups}, X_Offset={p_x_offset}")
+
+        for local_idx, g_idx in enumerate(p_groups):
+            if g_idx >= ngroups:
+                continue
+            
+            tchannels = anat_grps[g_idx]
+            n_ch = len(tchannels)
+            
+            x = np.zeros(n_ch)
+            y = np.zeros(n_ch)
+            
+            # --- Coordinate Calculation ---
+
+            shank_id = local_idx + 1 
+            
+            if p_type == 'double_sided':
+                # double_sided logic:
+                # local_idx: 0(Back), 1(Front), 2(Back), 3(Front)...
+
+                pair_idx = local_idx // 2
+                is_front = (local_idx % 2 == 1)
+                y = np.arange(1, n_ch + 1) * -20.0
+                x[:] = 20.0
+                x[::2] = -20.0
+                # Pair 0 -> 200, Pair 1 -> 400 ...
+                pair_origin = (pair_idx + 1) * 400.0
+            
+                # 60 um offset for front side
+                intra_pair_offset = 80.0 if is_front else 0.0
+                x = x + pair_origin + intra_pair_offset
+
+            elif p_type == 'NeuroPixel':
+                x_pat = [20, 60, 0, 40]
+                x = np.tile(x_pat, (n_ch // 4) + 1)[:n_ch]
+                y_base = (np.arange(n_ch) // 2) + 1
+                y = y_base * -20.0
+                x = x + shank_id * 200
+
+            elif p_type == 'staggered':
+                x[:] = 20.0
+                y = np.arange(1, n_ch + 1) * -20.0
+                x[::2] = -20.0
+                x = x + shank_id * 200
+
+            elif p_type == 'poly3':
+                ext = n_ch % 3
+                poly = (np.arange(1, n_ch - ext + 1)) % 3
+                x[:] = 0 
+                idx_p1 = np.where(poly == 1)[0] + ext
+                idx_p2 = np.where(poly == 2)[0] + ext
+                idx_p0 = np.where(poly == 0)[0] + ext
+                x[idx_p1] = -18; x[idx_p2] = 0; x[idx_p0] = 18
+                x[:ext] = 0
+                mask_18 = (x == 18); y[mask_18] = np.arange(1, np.sum(mask_18) + 1) * -20
+                mask_0 = (x == 0); y[mask_0] = np.arange(1, np.sum(mask_0) + 1) * -20 - 10 + ext * 20
+                mask_m18 = (x == -18); y[mask_m18] = np.arange(1, np.sum(mask_m18) + 1) * -20
+                x = x + shank_id * 200
+
+            elif p_type == 'poly5':
+                ext = n_ch % 5
+                poly = (np.arange(1, n_ch - ext + 1)) % 5
+                x[:] = np.nan
+                x[np.where(poly == 1)[0] + ext] = -36
+                x[np.where(poly == 2)[0] + ext] = -18
+                x[np.where(poly == 3)[0] + ext] = 0
+                x[np.where(poly == 4)[0] + ext] = 18
+                x[np.where(poly == 0)[0] + ext] = 36
+                if ext > 0: x[:ext] = 18 * ((-1.0)**np.arange(1, ext + 1))
+                for val, y_off in [(36, 0), (18, -14), (0, 0), (-18, -14), (-36, 0)]:
+                    mask = (x == val)
+                    if np.any(mask):
+                        y[mask] = np.arange(1, np.sum(mask) + 1) * -28 + y_off
+                x = x + shank_id * 200
+
+            elif p_type == 'neurogrid':
+                for i in range(n_ch):
+                    x[i] = n_ch - (i + 1)
+                    y[i] = -(i + 1) * 30
+                x = x + shank_id * 30
+            
+            x = x + p_x_offset
+            
+            if p_type == 'neurogrid':
+                k_val = (g_idx // 4) + 1
+            else:
+                k_val = g_idx + 1
+
+            for i in range(n_ch):
+                channel_coords.append({
+                    'id': tchannels[i],
+                    'x': x[i],
+                    'y': y[i],
+                    'k': k_val
+                })
+
+    sorted_coords = sorted(channel_coords, key=lambda d: d['id'])
+    
+    if not sorted_coords:
+        return None
+
+    Nchannels = len(sorted_coords)
+    xcoords = np.array([d['x'] for d in sorted_coords])
+    ycoords = np.array([d['y'] for d in sorted_coords])
+    kcoords = np.array([d['k'] for d in sorted_coords])
+    real_channels = np.array([d['id'] for d in sorted_coords])
+
+    connected = np.ones(Nchannels, dtype=bool)
 
     if reject_channels:
         for rc in reject_channels:
-            if 0 <= rc < len(connected): connected[rc] = False
+            matches = np.where(real_channels == rc)[0]
+            if len(matches) > 0:
+                connected[matches] = False
     
-    if spk_channels:
-        for ch in range(len(connected)):
-            if connected[ch] and ch not in spk_channels: connected[ch] = False
-
-    xcoords_sorted = np.zeros(max_ch + 1); ycoords_sorted = np.zeros(max_ch + 1)
-    kcoords_final = np.zeros(max_ch + 1)
-    probe_ids_final = np.zeros(max_ch + 1)
+    if skipped_channels:
+        for sc in skipped_channels:
+            matches = np.where(real_channels == sc)[0]
+            if len(matches) > 0:
+                connected[matches] = False
     
-    for i, ch_idx in enumerate(ordered_channels):
-        xcoords_sorted[ch_idx] = xcoords_list[i]
-        ycoords_sorted[ch_idx] = ycoords_list[i]
-        kcoords_final[ch_idx] = kcoords_list[i]
-        probe_ids_final[ch_idx] = probe_id_list[i]
-        side[ch_idx] = side_list[i]
-
+    if has_spk_groups:
+        spk_set = set(spk_channels)
+        for i, ch_id in enumerate(real_channels):
+            if ch_id not in spk_set:
+                connected[i] = False
+    
+    chanMap = np.arange(1, Nchannels + 1).reshape(1, -1)
+    chanMap0ind = real_channels.reshape(1, -1)
+    
     save_dict = {
-        'chanMap': np.arange(1, max_ch + 2).astype(float),
-        'connected': connected.astype(float).reshape(-1, 1),
-        'xcoords': xcoords_sorted.astype(float).reshape(-1, 1),
-        'ycoords': ycoords_sorted.astype(float).reshape(-1, 1),
-        'kcoords': kcoords_final.astype(float).reshape(-1, 1),
-        'probe_ids': probe_ids_final.astype(float).reshape(-1, 1),
-        'side': side,
-        'chanMap0ind': np.arange(max_ch + 1).astype(float).reshape(-1, 1)
+        'chanMap': chanMap.astype(float),
+        'chanMap0ind': chanMap0ind.astype(float),
+        'connected': connected.reshape(-1, 1).astype(float),
+        'xcoords': xcoords.reshape(-1, 1).astype(float),
+        'ycoords': ycoords.reshape(-1, 1).astype(float),
+        'kcoords': kcoords.reshape(-1, 1).astype(float)
     }
+
+    out_file = Path(outputDir) / 'chanMap.mat'
+    savemat(out_file, save_dict)
+    print(f"Successfully saved chanMap.mat to {out_file}")
     
-    out_path = base_path / 'chanMap.mat'
-    savemat(out_path, save_dict)
-    print(f"Successfully saved multi-probe channel map to: {out_path}")
-    return out_path
+    return out_file
+
