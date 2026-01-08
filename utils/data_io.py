@@ -252,7 +252,8 @@ def create_channel_map(basepath, outputDir, basename=None, electrode_type=None, 
                     'id': tchannels[i],
                     'x': x[i],
                     'y': y[i],
-                    'k': k_val
+                    'k': k_val,
+                    'p': probe_idx + 1
                 })
 
     sorted_coords = sorted(channel_coords, key=lambda d: d['id'])
@@ -264,6 +265,7 @@ def create_channel_map(basepath, outputDir, basename=None, electrode_type=None, 
     xcoords = np.array([d['x'] for d in sorted_coords])
     ycoords = np.array([d['y'] for d in sorted_coords])
     kcoords = np.array([d['k'] for d in sorted_coords])
+    pcoords = np.array([d['p'] for d in sorted_coords])
     real_channels = np.array([d['id'] for d in sorted_coords])
 
     connected = np.ones(Nchannels, dtype=bool)
@@ -295,7 +297,8 @@ def create_channel_map(basepath, outputDir, basename=None, electrode_type=None, 
         'connected': connected.reshape(-1, 1).astype(float),
         'xcoords': xcoords.reshape(-1, 1).astype(float),
         'ycoords': ycoords.reshape(-1, 1).astype(float),
-        'kcoords': kcoords.reshape(-1, 1).astype(float)
+        'kcoords': kcoords.reshape(-1, 1).astype(float),
+        'probe_ids': pcoords.reshape(-1, 1).astype(float)
     }
 
     out_file = Path(outputDir) / 'chanMap.mat'
