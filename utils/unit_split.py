@@ -321,9 +321,6 @@ def autosplit_outliers_pca(
                         # Compute mean template from clean spikes
                         clean_template = np.mean(W_clean, axis=0)
                         
-                        if verbose:
-                            print(f"  [Waveform Gate] Built template from {W_clean.shape[0]} clean spikes")
-                        
                         # --- Step 2: Check ALL outlier candidates ---
                         valid_cand = (spike_frames[cand_idx] - nb >= 0) & (spike_frames[cand_idx] + na <= n_samp)
                         c_valid_idx = cand_idx[valid_cand]
@@ -336,36 +333,12 @@ def autosplit_outliers_pca(
                             W_valid = W_cand[valid_wf]
                             c_valid = c_valid_idx[valid_wf]
                             
-                            if verbose:
-                                print(f"  [Waveform Gate] template shape: {clean_template.shape}, checking {c_valid.size} outliers")
-                                print(f"  [Waveform Gate] zero-filled waveforms: {n_zero}/{c_valid_idx.size}")
-                            
                             if c_valid.size > 0:
                                 s_cand = _cosine_scores(W_valid, clean_template, wf_center)
                                 rescued_mask = s_cand >= wf_threshold
                                 rescued = c_valid[rescued_mask]
                                 out_mask[rescued] = False
                                 wf_used = True
-                                
-                                if verbose:
-                                    n_rescued = rescued.size
-                                    avg_sim = s_cand.mean()
-                                    max_sim = s_cand.max()
-                                    min_sim = s_cand.min()
-                                    pct_rescued = (n_rescued / c_valid.size * 100) if c_valid.size > 0 else 0
-                                    # Histogram of similarity scores
-                                    n_low = (s_cand < 0.5).sum()
-                                    n_mid = ((s_cand >= 0.5) & (s_cand < 0.8)).sum()
-                                    n_high = (s_cand >= 0.8).sum()
-                                    print(f"  [Waveform Gate] rescued {n_rescued}/{c_valid.size} ({pct_rescued:.1f}%) outliers")
-                                    print(f"  [Waveform Gate] similarity: avg={avg_sim:.3f}, range=[{min_sim:.3f}, {max_sim:.3f}]")
-                                    print(f"  [Waveform Gate] distribution: <0.5:{n_low}, 0.5-0.8:{n_mid}, >=0.8:{n_high}")
-                            elif verbose:
-                                print(f"  [Waveform Gate] no valid outlier waveforms to process")
-                    elif verbose:
-                        print(f"  [Waveform Gate] insufficient clean waveforms ({W_clean.shape[0]}) for template")
-                elif verbose:
-                    print(f"  [Waveform Gate] insufficient clean spikes ({tmpl_pick.size}) for template")
 
         # --- C. Output Collection & Logging (Updated Format) ---
         cln_fr = spike_frames[~out_mask]
