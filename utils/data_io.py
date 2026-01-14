@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import tkinter as tk
 from tkinter import filedialog
 from datetime import datetime
@@ -7,6 +8,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from scipy.io import savemat
 from pathlib import Path
+import h5py 
 
 def extract_datetime(path):
     """Extract YYMMDD_HHMMSS from path."""
@@ -307,3 +309,164 @@ def create_channel_map(basepath, outputDir, basename=None, electrode_type=None, 
     
     return out_file
 
+def load_rez(rez_path):
+    """
+    Load MATLAB v7.3 rez.mat file using h5py and return as a dictionary.
+    Properly handles axis reversal for multi-dimensional arrays (Fortran vs C order).
+    """
+    def h5_to_dict(obj):
+        if isinstance(obj, h5py.Group):
+            # MATLAB structs are stored as Groups
+            return {k: h5_to_dict(obj[k]) for k in obj.keys()}
+        elif isinstance(obj, h5py.Dataset):
+            data = obj[()]
+            if isinstance(data, np.ndarray):
+                # MATLAB is Fortran-order (column-major), Python/HDF5 is C-order (row-major)
+                # For N-dimensional arrays, we need to reverse ALL axes
+                if data.ndim > 1:
+                    # Reverse axis order: (A,B,C) in MATLAB -> (C,B,A) in h5py -> reverse to (A,B,C)
+                    data = np.ascontiguousarray(np.transpose(data, axes=range(data.ndim-1, -1, -1)))
+                # Squeeze singleton dimensions to match MATLAB's behavior
+                data = np.squeeze(data)
+            return data
+        return obj
+
+    with h5py.File(rez_path, 'r') as f:
+        if 'rez' in f:
+            return h5_to_dict(f['rez'])
+        else:
+            return h5_to_dict(f)
+
+def rezToPhy(rez, save_path):
+    """
+    Extract and save data for Phy from Kilosort rez structure (Python dictionary format).
+    Handles proper array shapes and 0-based indexing for Phy compatibility.
+    """
+    
+    # Create save directory
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+
+    # 1. Cleanup: delete existing related files
+    outputs = [
+        'amplitudes.npy', 'channel_map.npy', 'channel_positions.npy', 'pc_features.npy',
+        'pc_feature_ind.npy', 'similar_templates.npy', 'spike_clusters.npy', 'spike_templates.npy',
+        'spike_times.npy', 'templates.npy', 'templates_ind.npy', 'template_features.npy',
+        'template_feature_ind.npy', 'whitening_mat.npy', 'whitening_mat_inv.npy'
+    ]
+    
+    for filename in os.listdir(save_path):
+        if filename in outputs:
+            os.remove(os.path.join(save_path, filename))
+            
+    phy_dir = os.path.join(save_path, '.phy')
+    if os.path.exists(phy_dir):
+        shutil.rmtree(phy_dir)
+
+    # 2. Data extraction (rez.st3)
+    st3 = rez['st3']
+    n_spikes = st3.shape[0]
+    
+    # Spike times (samples)
+    spike_times = st3[:, 0].astype(np.uint64)
+    # Template IDs (convert to 0-based)
+    spike_templates = (st3[:, 1] - 1).astype(np.uint32)
+    
+    # Cluster IDs (convert to 0-based)
+    if st3.shape[1] > 4:
+        spike_clusters = (st3[:, 4] - 1).astype(np.int32)
+    else:
+        spike_clusters = spike_templates.copy().astype(np.int32)
+
+    amplitudes = st3[:, 2]
+
+    # 3. Get Ops information
+    ops = rez['ops']
+    chan_map = np.atleast_1d(ops['chanMap']).flatten()
+    chan_map_0ind = (chan_map - 1).astype(np.int32)  # Convert to 0-based
+    
+    connected = np.atleast_1d(rez['connected']).flatten().astype(bool)
+    xcoords = np.atleast_1d(rez['xcoords']).flatten()
+    ycoords = np.atleast_1d(rez['ycoords']).flatten()
+    
+    # 4. Reconstruct templates
+    # After load_rez axis reversal: U should be (n_chan, n_filt, rank), W should be (nt, n_filt, rank)
+    U = rez['U']
+    W = rez['W']
+    
+    # U: (n_chan, n_filt, rank), W: (nt, n_filt, rank)
+    # Output: templates (n_filt, nt, n_chan) for Phy
+    templates = np.einsum('cfr, tfr -> ftc', U, W)
+    n_templates = templates.shape[0]
+    n_chan = U.shape[0]
+    
+    # templates_ind: (n_templates, n_channels)
+    templates_inds = np.tile(np.arange(n_chan), (n_templates, 1)).astype(np.int32)
+
+    # 5. Features
+    # pc_features: (n_spikes, n_pc_features, n_channels_loc)
+    pc_features = rez['cProjPC']
+    # pc_feature_ind: (n_templates, n_channels_loc) - 0-based
+    pc_feature_inds = (np.atleast_2d(rez['iNeighPC']) - 1).astype(np.int32)
+    
+    # template_features: (n_spikes, n_template_features)
+    template_features = rez['cProj']
+    # template_feature_ind: (n_templates, n_template_features) - 0-based
+    template_feature_inds = (np.atleast_2d(rez['iNeigh']) - 1).astype(np.int32)
+    
+    # pc_feature_ind must be (n_templates, n_channels_loc)
+    if pc_feature_inds.shape[0] != n_templates:
+        pc_feature_inds = pc_feature_inds.T
+    
+    # template_feature_ind must be (n_templates, n_template_features)
+    if template_feature_inds.shape[0] != n_templates:
+        template_feature_inds = template_feature_inds.T
+
+    # 6. Save as .npy files (ensure contiguous arrays)
+    np.save(os.path.join(save_path, 'spike_times.npy'), np.ascontiguousarray(spike_times))
+    np.save(os.path.join(save_path, 'spike_templates.npy'), np.ascontiguousarray(spike_templates))
+    np.save(os.path.join(save_path, 'spike_clusters.npy'), np.ascontiguousarray(spike_clusters))
+    
+    np.save(os.path.join(save_path, 'amplitudes.npy'), np.ascontiguousarray(amplitudes))
+    np.save(os.path.join(save_path, 'templates.npy'), np.ascontiguousarray(templates.astype(np.float32)))
+    np.save(os.path.join(save_path, 'templates_ind.npy'), np.ascontiguousarray(templates_inds))
+    
+    np.save(os.path.join(save_path, 'channel_map.npy'), np.ascontiguousarray(chan_map_0ind[connected]))
+    coords = np.column_stack((xcoords[connected], ycoords[connected]))
+    np.save(os.path.join(save_path, 'channel_positions.npy'), np.ascontiguousarray(coords))
+    
+    np.save(os.path.join(save_path, 'template_features.npy'), np.ascontiguousarray(template_features.astype(np.float32)))
+    np.save(os.path.join(save_path, 'template_feature_ind.npy'), np.ascontiguousarray(template_feature_inds))
+    np.save(os.path.join(save_path, 'pc_features.npy'), np.ascontiguousarray(pc_features.astype(np.float32)))
+    np.save(os.path.join(save_path, 'pc_feature_ind.npy'), np.ascontiguousarray(pc_feature_inds))
+    
+    whitening_matrix = rez['Wrot'] / 200
+    whitening_matrix_inv = np.linalg.pinv(whitening_matrix)  # Use pinv for numerical stability
+    np.save(os.path.join(save_path, 'whitening_mat.npy'), np.ascontiguousarray(whitening_matrix.astype(np.float32)))
+    np.save(os.path.join(save_path, 'whitening_mat_inv.npy'), np.ascontiguousarray(whitening_matrix_inv.astype(np.float32)))
+    
+    if 'simScore' in rez:
+        np.save(os.path.join(save_path, 'similar_templates.npy'), np.ascontiguousarray(rez['simScore'].astype(np.float32)))
+
+    # 7. Create params.py
+    params_path = os.path.join(save_path, 'params.py')
+    fb_val = ops.get('fbinary', 'recording.dat')
+    # Handle HDF5 string encoding (array of ints)
+    if isinstance(fb_val, np.ndarray) and fb_val.dtype.kind in 'ui':
+        fbinary = "".join([chr(int(c)) for c in fb_val.flatten()])
+    else:
+        fbinary = str(fb_val)
+        
+    dat_path = '../' + os.path.basename(fbinary)
+    n_chan_tot = int(np.atleast_1d(ops['NchanTOT']).flatten()[0])
+    fs = float(np.atleast_1d(ops['fs']).flatten()[0])
+    
+    with open(params_path, 'w') as f:
+        f.write(f"dat_path = r'{dat_path}'\n")
+        f.write(f"n_channels_dat = {n_chan_tot}\n")
+        f.write("dtype = 'int16'\n")
+        f.write("offset = 0\n")
+        f.write(f"sample_rate = {fs}\n")
+        f.write("hp_filtered = False\n")
+
+    print(f"Done! Phy files saved to {save_path}")
