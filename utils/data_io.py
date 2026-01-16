@@ -309,6 +309,83 @@ def create_channel_map(basepath, outputDir, basename=None, electrode_type=None, 
     
     return out_file
 
+def convert_dual_side_map(chan_map_file, x_shift=6.0, pairs_to_merge=None, custom_shank_positions=None):
+    """
+    Converts a channel map to merge pairs of shanks (representing front/back)
+    into single shanks with a small lateral offset.
+
+    Parameters
+    ----------
+    chan_map_file : str or Path
+        Path to the .mat file.
+    x_shift : float, optional
+        Microns to shift the 'front' side (2nd in pair). Default is 6.0.
+    pairs_to_merge : list of tuples, optional
+        List of (back_shank_id, front_shank_id) to merge.
+    custom_shank_positions : dict, optional
+        Dictionary {shank_id: x_um} to explicitly set positions.
+    """
+    from scipy.io import loadmat
+    
+    p = Path(chan_map_file)
+    if not p.exists():
+        print(f"File not found: {p}")
+        return
+
+    data = loadmat(p)
+    
+    x = data['xcoords'].flatten()
+    y = data['ycoords'].flatten()
+    k = data['kcoords'].flatten()
+    
+    x_shape = data['xcoords'].shape
+    k_shape = data['kcoords'].shape
+    
+    unique_shanks = np.unique(k)
+    unique_shanks.sort()
+    
+    if pairs_to_merge is None:
+        n_pairs = len(unique_shanks) // 2
+        pairs_to_merge = []
+        for i in range(n_pairs):
+            pairs_to_merge.append((unique_shanks[2*i], unique_shanks[2*i+1]))
+        print(f"Auto-detected {len(pairs_to_merge)} pairs to merge.")
+    else:
+        print(f"Using provided list of {len(pairs_to_merge)} pairs to merge.")
+    
+    for (s_back, s_front) in pairs_to_merge:
+        idx_back = (k == s_back)
+        idx_front = (k == s_front)
+        
+        if not np.any(idx_back) or not np.any(idx_front):
+            print(f"Warning: Missing channels for pair ({s_back}, {s_front}).")
+            continue
+        
+        k[idx_front] = s_back
+        
+        mean_x_back = np.mean(x[idx_back])
+        mean_x_front = np.mean(x[idx_front])
+        current_offset = mean_x_front - mean_x_back
+        
+        x[idx_front] = x[idx_front] - current_offset + x_shift
+        print(f"Merged Shank {s_front} into {s_back}. Shifted X by {-current_offset + x_shift:.2f} um.")
+
+    # Custom positions override
+    if custom_shank_positions:
+        print(f"Applying custom positions to {len(custom_shank_positions)} shanks.")
+        for s_id, target_x in custom_shank_positions.items():
+            idx_group = (k == s_id)
+            if np.any(idx_group):
+                start_mean = np.mean(x[idx_group])
+                x[idx_group] += (target_x - start_mean)
+                print(f"  Shank {s_id}: Moved to {target_x:.1f} (shift {target_x - start_mean:.1f})")
+
+    data['xcoords'] = x.reshape(x_shape)
+    data['kcoords'] = k.reshape(k_shape)
+    
+    savemat(p, data)
+    print(f"Updated {p} with dual-side conversion.")
+
 def load_rez(rez_path):
     """
     Load MATLAB v7.3 rez.mat file using h5py and return as a dictionary.
