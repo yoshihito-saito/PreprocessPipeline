@@ -1,0 +1,231 @@
+﻿from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+
+import spikeinterface.extractors as se
+
+from .events import export_analog_digital_events, materialize_intermediate_dat
+from .io import (
+    build_acquisition_catalog,
+    discover_subsessions,
+    ensure_xml,
+    load_xml_metadata,
+    print_catalog_summary,
+    resolve_basepath_and_basename,
+    resolve_local_output_dir,
+    save_params_and_manifest,
+)
+from .mergepoints import compute_mergepoints, save_mergepoints_events_mat
+from .recording import (
+    apply_preprocessing,
+    attach_probe_and_remove_bad_channels,
+    concatenate_recordings_si,
+    load_subsession_recordings,
+    write_concatenated_dat,
+    write_lfp,
+)
+from .session import build_session_struct, save_session_mat
+from .metafile import PreprocessConfig, PreprocessResult
+from .sorter_runner import execute_sorting_job
+
+
+def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
+    basepath, basename = resolve_basepath_and_basename(config.basepath)
+    output_dir = resolve_local_output_dir(basepath, basename, config)
+
+    xml_path = ensure_xml(basepath, output_dir, basename)
+    xml_meta = load_xml_metadata(xml_path)
+
+    amplifier_paths = discover_subsessions(
+        basepath=basepath,
+        sort_files=config.sort_files,
+        alt_sort=config.alt_sort,
+        ignore_folders=config.ignore_folders,
+    )
+    if not amplifier_paths:
+        raise FileNotFoundError(f"No subsession dat files found under {basepath}")
+
+    catalog = build_acquisition_catalog(
+        amplifier_paths=amplifier_paths,
+        n_amplifier_channels=xml_meta.n_channels,
+        dtype=config.dtype,
+    )
+    print_catalog_summary(catalog)
+
+    recordings = load_subsession_recordings(
+        dat_paths=catalog.amplifier_paths,
+        sampling_frequency=xml_meta.sr,
+        num_channels=xml_meta.n_channels,
+        dtype=config.dtype,
+        gain_to_uV=config.gain_to_uV,
+        offset_to_uV=config.offset_to_uV,
+    )
+    recording_concat = concatenate_recordings_si(recordings)
+
+    dat_path: Path | None = None
+    if config.save_raw:
+        dat_path = output_dir / f"{basename}.dat"
+        write_concatenated_dat(
+            recording=recording_concat,
+            output_dat_path=dat_path,
+            overwrite=config.overwrite,
+            job_kwargs=config.job_kwargs,
+        )
+
+    if config.sorter and dat_path is None:
+        dat_path = output_dir / f"{basename}.dat"
+        write_concatenated_dat(
+            recording=recording_concat,
+            output_dat_path=dat_path,
+            overwrite=config.overwrite,
+            job_kwargs=config.job_kwargs,
+        )
+
+    merge_data = compute_mergepoints(
+        dat_paths=catalog.amplifier_paths,
+        n_channels=xml_meta.n_channels,
+        dtype=config.dtype,
+        sampling_frequency=xml_meta.sr,
+        foldernames=catalog.subsession_names,
+    )
+    mergepoints_path = output_dir / f"{basename}.MergePoints.events.mat"
+    save_mergepoints_events_mat(mergepoints_path, merge_data)
+
+    if dat_path is not None:
+        recording_base = se.read_binary(
+            str(dat_path),
+            sampling_frequency=xml_meta.sr,
+            dtype=config.dtype,
+            num_channels=xml_meta.n_channels,
+            gain_to_uV=config.gain_to_uV,
+            offset_to_uV=config.offset_to_uV,
+        )
+    else:
+        recording_base = recording_concat
+
+    recording_raw, bad_0, bad_1 = attach_probe_and_remove_bad_channels(
+        recording=recording_base,
+        chanmap_mat_path=config.chanmap_mat_path,
+        reject_channels_0based=sorted(set(config.reject_channels + xml_meta.skipped_channels_0based)),
+    )
+
+    if config.do_preprocess:
+        _ = apply_preprocessing(
+            recording_raw=recording_raw,
+            bandpass_min_hz=config.bandpass_min_hz,
+            bandpass_max_hz=config.bandpass_max_hz,
+            reference=config.reference,
+            local_radius_um=config.local_radius_um,
+        )
+
+    lfp_path: Path | None = None
+    if config.make_lfp:
+        lfp_path = output_dir / f"{basename}.lfp"
+        write_lfp(
+            recording_raw=recording_base,
+            lfp_path=lfp_path,
+            lfp_fs=config.lfp_fs,
+            dtype=config.dtype,
+            overwrite=config.overwrite,
+            job_kwargs=config.job_kwargs,
+        )
+
+    intermediate_dat_paths: dict[str, Path] = {}
+    if config.export_intermediate_dat:
+        intermediate_dat_paths = materialize_intermediate_dat(
+            output_dir=output_dir,
+            basename=basename,
+            analogin_paths=catalog.analogin_paths,
+            digitalin_paths=catalog.digitalin_paths,
+            auxiliary_paths=catalog.auxiliary_paths,
+            supply_paths=catalog.supply_paths,
+            time_paths=catalog.time_paths,
+            sample_counts=catalog.sample_counts,
+            overwrite=config.overwrite,
+        )
+
+    analog_event_paths, digital_event_paths = export_analog_digital_events(
+        output_dir=output_dir,
+        basename=basename,
+        analog_inputs=config.analog_inputs,
+        analog_channels=config.analog_channels,
+        digital_inputs=config.digital_inputs,
+        digital_channels=config.digital_channels,
+        sr=xml_meta.sr,
+        analog_dat_path=intermediate_dat_paths.get("analogin"),
+        digital_dat_path=intermediate_dat_paths.get("digitalin"),
+    )
+
+    session_struct = build_session_struct(
+        basepath=output_dir,
+        basename=basename,
+        dat_path=(dat_path if dat_path is not None else output_dir / f"{basename}.dat"),
+        lfp_path=lfp_path,
+        sr=xml_meta.sr,
+        sr_lfp=config.lfp_fs if config.make_lfp else None,
+        n_channels=xml_meta.n_channels,
+        bad_channels_1based=bad_1,
+        analog_event_paths=analog_event_paths,
+        digital_event_paths=digital_event_paths,
+    )
+    session_mat_path = output_dir / f"{basename}.session.mat"
+    save_session_mat(session_mat_path, session_struct)
+
+    sorter_output_dir: Path | None = None
+    if config.sorter:
+        sorter_label = str(config.sorter).strip()
+        sorter_name_for_folder = sorter_label[:1].upper() + sorter_label[1:].lower()
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        sorter_output_dir = output_dir / f"{sorter_name_for_folder}_{timestamp}"
+        if sorter_output_dir.exists():
+            suffix = 1
+            while True:
+                candidate = output_dir / f"{sorter_name_for_folder}_{timestamp}_{suffix:02d}"
+                if not candidate.exists():
+                    sorter_output_dir = candidate
+                    break
+                suffix += 1
+        _ = execute_sorting_job(
+            sorter=config.sorter,
+            dat_path=dat_path if dat_path is not None else (output_dir / f"{basename}.dat"),
+            xml_path=xml_path,
+            output_folder=sorter_output_dir,
+            config_path=config.sorter_config_path,
+            kilosort1_path=config.sorter_path,
+            matlab_path=config.matlab_path,
+            chanmap_mat_path=config.chanmap_mat_path,
+            remove_existing_folder=config.overwrite,
+        )
+
+    result = PreprocessResult(
+        basepath=basepath,
+        basename=basename,
+        local_output_dir=output_dir,
+        dat_path=dat_path,
+        lfp_path=lfp_path,
+        session_mat_path=session_mat_path,
+        mergepoints_mat_path=mergepoints_path,
+        analog_event_paths=analog_event_paths,
+        digital_event_paths=digital_event_paths,
+        intermediate_dat_paths=intermediate_dat_paths,
+        n_channels=xml_meta.n_channels,
+        sr=xml_meta.sr,
+        sr_lfp=config.lfp_fs if config.make_lfp else None,
+        bad_channels_0based=bad_0,
+        bad_channels_1based=bad_1,
+        subsession_paths=catalog.amplifier_paths,
+        subsession_sample_counts=(
+            merge_data.firstlasttimepoints_samples[:, 1].astype(int).tolist()
+        ),
+        sorter=config.sorter,
+        sorter_output_dir=sorter_output_dir,
+    )
+
+    save_params_and_manifest(
+        config=config,
+        result=result,
+        output_dir=output_dir,
+        script_path=Path(__file__).resolve(),
+    )
+    return result

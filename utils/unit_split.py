@@ -1,7 +1,9 @@
-import numpy as np
+﻿import numpy as np
+import scipy.linalg
 import spikeinterface as si
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import chi2
+from joblib import Parallel, delayed
 
 def autosplit_outliers_pca(
     analyzer,
@@ -22,6 +24,8 @@ def autosplit_outliers_pca(
     min_spikes: int = 10,
     return_details: bool = False,
     verbose: bool = True,
+    # ---- Parallelism ----
+    n_jobs: int = -1,
 ):
     """
     Split per-unit outliers using PCA features and Mahalanobis distance with an optional waveform rescue gate.
@@ -67,7 +71,9 @@ def autosplit_outliers_pca(
         If True, returns a dictionary containing action details for each original unit.
     verbose : bool, default True
         If True, prints progress and split information to the console.
-
+    n_jobs : int, default -1
+        Number of parallel jobs for unit processing. -1 uses all available CPUs.
+        Uses thread-based parallelism (safe for SpikeInterface recordings).
 
     Returns
     -------
@@ -136,37 +142,89 @@ def autosplit_outliers_pca(
             return None
 
         cov = np.cov(X_scaled, rowvar=False)
-        cov += np.eye(cov.shape[0]) * 1e-6 
-
-        try:
-            U, s, Vt = np.linalg.svd(cov)
-            s[s < 1e-8] = 1e-8 
-            inv_cov = (U / s) @ Vt
-        except np.linalg.LinAlgError:
-            inv_cov = np.diag(1.0 / np.diag(cov))
+        cov += np.eye(cov.shape[0]) * 1e-6
 
         mu = np.mean(X_scaled, axis=0)
-        diff = X_scaled - mu
-        d2 = np.sum(diff @ inv_cov * diff, axis=1)
+        diff = X_scaled - mu  # (n_spikes, n_dims)
+
+        try:
+            # Cholesky: ~3x faster than SVD for positive-definite Î£.
+            # dÂ² = ||Lâ»Â¹(x-Î¼)||Â²  avoids forming Î£â»Â¹ explicitly.
+            L, lower = scipy.linalg.cho_factor(cov, lower=True, check_finite=False)
+            z = scipy.linalg.solve_triangular(L, diff.T, lower=True, check_finite=False)  # (n_dims, n_spikes)
+            d2 = np.einsum('ij,ij->j', z, z)  # sum of squares per spike
+        except (np.linalg.LinAlgError, scipy.linalg.LinAlgError):
+            # Fallback: diagonal approximation
+            diag_var = np.clip(np.diag(cov), 1e-8, None)
+            d2 = np.sum((diff ** 2) / diag_var, axis=1)
+
         return np.sqrt(d2)
 
     def _extract_waveforms(rec, frs, ch_ids, nb, na):
+        """
+        Batch waveform extraction: sort frames, read minimal contiguous chunks,
+        then slice. Much faster than per-spike get_traces calls.
+        """
         frs = frs.astype(np.int64)
+        n_spikes = frs.size
         ns = nb + na
         nc = len(ch_ids)
-        W = np.empty((frs.size, ns, nc), dtype=np.float32)
-        n_zero = 0
-        for i, f in enumerate(frs):
-            if f - nb < 0 or f + na > rec.get_total_samples():
-                W[i] = 0
-                n_zero += 1
+        n_samp = rec.get_total_samples()
+
+        valid = (frs - nb >= 0) & (frs + na <= n_samp)
+        W = np.zeros((n_spikes, ns, nc), dtype=np.float32)
+        valid_frs = frs[valid]
+        if valid_frs.size == 0:
+            return W, n_spikes
+
+        # Sort to enable sequential (cache-friendly) reads
+        sort_order = np.argsort(valid_frs)
+        sorted_frs = valid_frs[sort_order]
+
+        # Merge nearby windows into larger chunks (gap < 2x window = read together)
+        gap_thresh = ns * 2
+        chunk_starts = [int(sorted_frs[0]) - nb]
+        chunk_ends = [int(sorted_frs[0]) + na]
+        for f in sorted_frs[1:]:
+            start = int(f) - nb
+            if start <= chunk_ends[-1] + gap_thresh:
+                chunk_ends[-1] = max(chunk_ends[-1], int(f) + na)
+            else:
+                chunk_starts.append(start)
+                chunk_ends.append(int(f) + na)
+
+        # Read each chunk once
+        chunk_cache: dict[int, np.ndarray] = {}
+        for cs, ce in zip(chunk_starts, chunk_ends):
+            try:
+                chunk_cache[cs] = rec.get_traces(
+                    start_frame=cs, end_frame=ce, channel_ids=ch_ids, return_in_uV=True
+                )
+            except Exception:
+                pass
+
+        # Slice each spike from its chunk using binary search (O(log n_chunks) per spike)
+        valid_indices = np.flatnonzero(valid)
+        inv_order = np.empty_like(sort_order)
+        inv_order[sort_order] = np.arange(sort_order.size)
+
+        chunk_starts_arr = np.array(chunk_starts, dtype=np.int64)
+        for sorted_i in range(sorted_frs.size):
+            f = int(sorted_frs[sorted_i])
+            spike_start = f - nb
+            # Binary search: rightmost chunk_start <= spike_start
+            ci = int(np.searchsorted(chunk_starts_arr, spike_start, side='right')) - 1
+            if ci < 0:
                 continue
-            tr = rec.get_traces(start_frame=f-nb, end_frame=f+na, channel_ids=ch_ids, return_in_uV=True)
-            if tr.shape[0] == ns: 
-                W[i] = tr
-            else: 
-                W[i] = 0
-                n_zero += 1
+            cs = chunk_starts[ci]
+            chunk = chunk_cache.get(cs)
+            if chunk is not None:
+                local_start = spike_start - cs
+                local_end = local_start + ns
+                if local_end <= chunk.shape[0]:
+                    W[valid_indices[inv_order[sorted_i]]] = chunk[local_start:local_end]
+
+        n_zero = int((~valid).sum())
         return W, n_zero
 
     def _cosine_scores(W, tmpl_win, c_mode):
@@ -180,36 +238,29 @@ def autosplit_outliers_pca(
         return (Xn @ tn)
 
     # ==========================================================================
-    #  3. Main Loop
+    #  3. Per-unit processing task (parallelizable)
     # ==========================================================================
-    orig_unit_ids = sorting.get_unit_ids()
-    final_spike_trains = [] 
-    details = {}
+    def _process_unit(uid, rng_seed):
+        rng_u = np.random.default_rng(rng_seed)
+        log_lines = []
 
-    for uid in orig_unit_ids:
-        # --- Load spike train first (cheap), so we can early-discard tiny units ---
+        # --- Load spike train first (cheap) ---
         try:
             spike_frames = sorting.get_unit_spike_train(unit_id=uid)
         except Exception:
-            if verbose:
-                print(f"unit {uid}: spike_train load error")
-            details[uid] = {"clean_new_id": None, "action": "error_load_spike_train"}
-            continue
+            log_lines.append(f"unit {uid}: spike_train load error")
+            return uid, None, None, {"action": "error_load_spike_train", "clean_new_id": None}, log_lines
 
         n_total = int(spike_frames.size)
 
-        # --- Early drop (Small original units) ---
-        # Rationale:
-        # - Units with extremely few spikes can produce all-zero templates (e.g., spikes near segment edges -> no waveforms).
-        # - Those all-zero templates crash Phy when it tries to find the best channel.
-        # So, if the ORIGINAL unit has < min_spikes, we drop it entirely (no new ID).
+        # --- Early drop (small original units) ---
         if n_total < min_spikes:
-            if verbose:
-                print(f"unit {uid} (orig): discarded ({n_total} spikes) [below min_spikes={min_spikes}]")
-            details[uid] = {"clean_new_id": None, "action": "discard_small", "n_total": int(n_total)}
-            continue
+            log_lines.append(
+                f"unit {uid} (orig): discarded ({n_total} spikes) [below min_spikes={min_spikes}]"
+            )
+            return uid, None, None, {"clean_new_id": None, "action": "discard_small", "n_total": n_total}, log_lines
 
-        # --- Load PCA only for sufficiently large units ---
+        # --- Load PCA ---
         try:
             if hasattr(pc_ext, "get_projections_one_unit"):
                 pca_data = pc_ext.get_projections_one_unit(unit_id=uid)
@@ -218,42 +269,26 @@ def autosplit_outliers_pca(
         except Exception:
             pca_data = None
 
-        # If PCA data is missing but unit is large enough, keep it as-is.
         if pca_data is None:
-            new_id = len(final_spike_trains)
-            final_spike_trains.append(spike_frames)
-            if verbose:
-                print(f"unit {uid} (orig) -> unit {new_id} (new): keep all ({n_total} spikes) [no-pca]")
-            details[uid] = {"clean_new_id": new_id, "action": "passthrough_no_pca", "n_total": int(n_total)}
-            continue
+            log_lines.append(f"unit {uid} (orig): keep all ({n_total} spikes) [no-pca]")
+            return uid, spike_frames, None, {"action": "passthrough_no_pca", "n_total": n_total}, log_lines
 
-        # Flatten PCA
         features_flat = pca_data.reshape(n_total, -1)
         n_dims = features_flat.shape[1]
 
         # --- A. Distance Gate ---
         d_dist = _compute_stable_dist(features_flat)
-        
         if d_dist is None:
-            new_id = len(final_spike_trains)
-            final_spike_trains.append(spike_frames)
-            details[uid] = {"new_clean_id": new_id, "action": "error_math"}
-            continue
+            return uid, spike_frames, None, {"action": "error_math"}, log_lines
 
-        # Threshold
         if threshold_mode == "empirical":
             thr_val = np.quantile(d_dist, 1.0 - contamination)
         elif threshold_mode == "adaptive_chi2":
-            # Theoretical threshold with data-driven scale correction
             theo_thr_sq = chi2.ppf(1.0 - contamination, df=n_dims)
-            
-            # Estimate scale factor using median (robust to outliers)
             d2 = d_dist ** 2
             median_d2 = np.median(d2)
             expected_median = chi2.median(df=n_dims)
             scale_factor = median_d2 / expected_median
-            
-            # Apply scale correction
             thr_val = np.sqrt(theo_thr_sq * scale_factor)
         else:
             raise ValueError(f"Unknown threshold_mode: {threshold_mode}")
@@ -276,136 +311,126 @@ def autosplit_outliers_pca(
             out_mask = d_dist > thr_val
 
         # --- B. Waveform Refinement (Rescue) ---
-        wf_used = False
         if use_waveform_gate and recording is not None:
-            cand_idx = np.flatnonzero(out_mask)      # outlier candidates
-            clean_idx = np.flatnonzero(~out_mask)    # clean spikes
-            
+            cand_idx = np.flatnonzero(out_mask)
+            clean_idx = np.flatnonzero(~out_mask)
+
             if cand_idx.size > 0 and clean_idx.size > 0:
-                # Use analyzer's ms_before/after
                 nb = int(round(analyzer_ms_before * fs / 1000.0))
                 na = int(round(analyzer_ms_after * fs / 1000.0))
-                
-                # Select best channels based on pre-computed template PTP
+
                 if templates is not None and uid in uid_to_uindex:
                     tmpl_full = templates[uid_to_uindex[uid]]
                     ptp = np.ptp(tmpl_full, axis=0)
                 else:
-                    # Fallback: use all channels
                     ptp = np.ones(recording.get_num_channels())
                 ch_inds = np.argsort(ptp)[-wf_n_chans:][::-1] if wf_n_chans < ptp.size else np.arange(ptp.size)
                 ch_ids_rec = recording.get_channel_ids()
                 sel_ch_ids = [ch_ids_rec[i] for i in ch_inds]
-                
+
                 n_samp = recording.get_num_samples(segment_index=0)
-                
-                # --- Step 1: Build clean template from clean spikes ---
-                # Sample clean spikes for template computation
+
                 if wf_template_max and clean_idx.size > wf_template_max:
-                    tmpl_pick = rng.choice(clean_idx, size=int(wf_template_max), replace=False)
+                    tmpl_pick = rng_u.choice(clean_idx, size=int(wf_template_max), replace=False)
                 else:
                     tmpl_pick = clean_idx
-                
-                # Filter valid frames
+
                 valid_tmpl = (spike_frames[tmpl_pick] - nb >= 0) & (spike_frames[tmpl_pick] + na <= n_samp)
                 tmpl_pick = tmpl_pick[valid_tmpl]
-                
-                if tmpl_pick.size > 10:  # Need minimum spikes for reliable template
+
+                if tmpl_pick.size > 10:
                     W_clean, _ = _extract_waveforms(recording, spike_frames[tmpl_pick], sel_ch_ids, nb, na)
-                    
-                    # Filter out zero-filled
                     valid_clean = np.any(W_clean != 0, axis=(1, 2))
                     W_clean = W_clean[valid_clean]
-                    
+
                     if W_clean.shape[0] > 10:
-                        # Compute mean template from clean spikes
                         clean_template = np.mean(W_clean, axis=0)
-                        
-                        # --- Step 2: Check ALL outlier candidates ---
+
                         valid_cand = (spike_frames[cand_idx] - nb >= 0) & (spike_frames[cand_idx] + na <= n_samp)
                         c_valid_idx = cand_idx[valid_cand]
-                        
+
                         if c_valid_idx.size > 0:
-                            W_cand, n_zero = _extract_waveforms(recording, spike_frames[c_valid_idx], sel_ch_ids, nb, na)
-                            
-                            # Filter out zero-filled
+                            W_cand, _ = _extract_waveforms(
+                                recording, spike_frames[c_valid_idx], sel_ch_ids, nb, na
+                            )
                             valid_wf = np.any(W_cand != 0, axis=(1, 2))
                             W_valid = W_cand[valid_wf]
                             c_valid = c_valid_idx[valid_wf]
-                            
+
                             if c_valid.size > 0:
                                 s_cand = _cosine_scores(W_valid, clean_template, wf_center)
                                 rescued_mask = s_cand >= wf_threshold
-                                rescued = c_valid[rescued_mask]
-                                out_mask[rescued] = False
-                                wf_used = True
+                                out_mask[c_valid[rescued_mask]] = False
 
-        # --- C. Output Collection & Logging (Updated Format) ---
+        # --- C. Build results ---
         cln_fr = spike_frames[~out_mask]
         nz_fr = spike_frames[out_mask]
-        
+        outlier_fr = nz_fr if (nz_fr.size >= min_spikes and squeeze_all_outlier_to_new) else None
+
+        if nz_fr.size == 0:
+            log_lines.append(f"unit {uid} (orig): keep all ({n_total} spikes)")
+        elif outlier_fr is not None:
+            log_lines.append(
+                f"unit {uid} (orig): keep {cln_fr.size} clean | split {nz_fr.size} outliers"
+            )
+        else:
+            log_lines.append(
+                f"unit {uid} (orig): keep {cln_fr.size} clean | discard {nz_fr.size} outliers"
+            )
+
+        detail = {"n_clean": int(cln_fr.size), "n_outlier": int(nz_fr.size)}
+        return uid, cln_fr if cln_fr.size > 0 else None, outlier_fr, detail, log_lines
+
+    # ==========================================================================
+    #  4. Run in parallel (threads â€” safe for SI recordings via mmap)
+    # ==========================================================================
+    orig_unit_ids = sorting.get_unit_ids()
+    seeds = rng.integers(0, 2**31, size=len(orig_unit_ids)).tolist()
+
+    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(_process_unit)(uid, seed)
+        for uid, seed in zip(orig_unit_ids, seeds)
+    )
+
+    # ==========================================================================
+    #  5. Reconstruct output in original unit order
+    # ==========================================================================
+    final_spike_trains = []
+    details = {}
+
+    for uid, cln_fr, nz_fr, detail, log_lines in results:
+        if verbose:
+            for line in log_lines:
+                print(line)
+
         assigned_clean_id = None
         assigned_split_id = None
-        
-        # 1. Main Unit (Clean)
-        if cln_fr.size > 0:
+
+        if cln_fr is not None:
             assigned_clean_id = len(final_spike_trains)
             final_spike_trains.append(cln_fr)
-        
-        # 2. Split Unit (Outliers) - only if meets minimum spike threshold
-        if nz_fr.size >= min_spikes and squeeze_all_outlier_to_new:
+
+        if nz_fr is not None:
             assigned_split_id = len(final_spike_trains)
             final_spike_trains.append(nz_fr)
-            
-        # --- Verbose Output ---
-        if verbose:
-            # Case 1: Split to new unit
-            if assigned_split_id is not None:
-                if assigned_clean_id is not None:
-                    # unit 2 (orig) -> unit 2 (clean) | split to unit 516 (outliers)
-                    print(f"unit {uid} (orig) -> unit {assigned_clean_id} (clean, {cln_fr.size} spikes) | split to unit {assigned_split_id} (outliers, {nz_fr.size} spikes)")
-                else:
-                    # All moved
-                    print(f"unit {uid} (orig) -> unit {assigned_split_id} (all outliers, {n_total} spikes)")
-            
-            # Case 2: No split (Keep all or Discarded)
-            else:
-                if assigned_clean_id is not None:
-                    if nz_fr.size == 0:
-                        # unit 1 (orig) -> unit 1 (new): keep all
-                        print(f"unit {uid} (orig) -> unit {assigned_clean_id} (new): keep all")
-                    elif nz_fr.size < min_spikes:
-                        # Outliers below min_spikes threshold
-                        print(f"unit {uid} (orig) -> unit {assigned_clean_id} (new): kept ({cln_fr.size} spikes) | discarded {nz_fr.size} outliers (below min_spikes={min_spikes})")
-                    else:
-                        # Noise discarded (if squeeze_all_outlier_to_new=False)
-                        print(f"unit {uid} (orig) -> unit {assigned_clean_id} (new): kept ({cln_fr.size} spikes) | discarded {nz_fr.size} outliers")
-                else:
-                    # All spikes discarded
-                    print(f"unit {uid} (orig): all {n_total} spikes discarded")
 
-        details[uid] = {
-            "clean_new_id": assigned_clean_id,
-            "split_new_id": assigned_split_id,
-            "n_clean": cln_fr.size, 
-            "n_outlier": nz_fr.size
-        }
+        detail["clean_new_id"] = assigned_clean_id
+        detail["split_new_id"] = assigned_split_id
+        details[uid] = detail
 
     # ==========================================================================
-    #  4. Construct Output Sorting
+    #  6. Construct Output Sorting
     # ==========================================================================
-    # Ensure contiguous unit IDs (0, 1, 2, ...) with no gaps
-    # This is critical for Phy compatibility
     spikes_list = []
     labels_list = []
-    
+
     contiguous_id = 0
     for times in final_spike_trains:
         if times.size > 0:
             spikes_list.append(times)
             labels_list.append(np.full(times.size, contiguous_id, dtype=np.int64))
             contiguous_id += 1
-            
+
     if spikes_list:
         times_concat = np.concatenate(spikes_list)
         labels_concat = np.concatenate(labels_list)
@@ -417,8 +442,9 @@ def autosplit_outliers_pca(
         sorting_out = si.NumpySorting.from_samples_and_labels(
             np.array([], dtype=np.int64), np.array([], dtype=np.int64), fs
         )
-    
+
     if verbose:
-        print(f"\n[Summary] Output: {contiguous_id} units with contiguous IDs (0 to {contiguous_id-1})")
+        print(f"\n[Summary] Output: {contiguous_id} units (0 to {contiguous_id - 1})")
 
     return (sorting_out, details) if return_details else sorting_out
+
