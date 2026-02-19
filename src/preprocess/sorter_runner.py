@@ -51,10 +51,14 @@ _KILOSORT1_FLOAT_VECTOR_PARAMS = {
 _KILOSORT1_ALLOWED_PARAM_KEYS: set[str] | None = None
 
 
-def _prepend_to_windows_path(path_to_add: str) -> None:
+def _prepend_to_path(path_to_add: str) -> None:
     existing_path = os.environ.get("PATH", "")
-    existing_path_alt = os.environ.get("Path", existing_path)
     os.environ["PATH"] = path_to_add + os.pathsep + existing_path
+
+
+def _prepend_to_windows_path(path_to_add: str) -> None:
+    _prepend_to_path(path_to_add)
+    existing_path_alt = os.environ.get("Path", "")
     os.environ["Path"] = path_to_add + os.pathsep + existing_path_alt
 
 
@@ -73,6 +77,93 @@ def _default_sorter_config_path(sorter: str) -> Path:
 
 def _default_kilosort1_path() -> Path:
     return _repo_root() / "sorter" / "Kilosort1"
+
+
+def _resolve_matlab_cmd(matlab_path: Path | None) -> str | None:
+    if matlab_path is not None:
+        mp = Path(matlab_path).expanduser().resolve()
+        if mp.is_file() and mp.name.lower() in {"matlab", "matlab.exe"}:
+            return str(mp)
+        if mp.is_dir():
+            candidates = (
+                mp / "matlab",
+                mp / "matlab.exe",
+                mp / "bin" / "matlab",
+                mp / "bin" / "matlab.exe",
+            )
+            for candidate in candidates:
+                if candidate.is_file():
+                    return str(candidate.resolve())
+            raise FileNotFoundError(
+                "MATLAB executable was not found under directory: "
+                f"{mp}. Checked: " + ", ".join(str(c) for c in candidates)
+            )
+        raise FileNotFoundError(
+            f"Invalid matlab_path: {mp}. Provide MATLAB executable or MATLAB/bin directory."
+        )
+
+    matlab_cmd = shutil.which("matlab")
+    if matlab_cmd is not None:
+        return matlab_cmd
+
+    if os.name == "nt":
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        root = Path(program_files) / "MATLAB"
+        if root.exists():
+            versions = sorted([d for d in root.iterdir() if d.is_dir()], reverse=True)
+            for vdir in versions:
+                candidate = vdir / "bin" / "matlab.exe"
+                if candidate.exists():
+                    return str(candidate)
+    return None
+
+
+def _inject_matlab_shim(matlab_cmd: str, matlab_log: Path) -> Path:
+    shim_dir = _repo_root() / ".matlab_shim"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    startup_m = shim_dir / "startup.m"
+    startup_m.write_text(
+        (
+            "try\n"
+            "    parallel.gpu.enableCUDAForwardCompatibility(true);\n"
+            "catch\n"
+            "end\n"
+        ),
+        encoding="utf-8",
+    )
+    existing_matlabpath = os.environ.get("MATLABPATH", "")
+    os.environ["MATLABPATH"] = (
+        str(shim_dir) if not existing_matlabpath else str(shim_dir) + os.pathsep + existing_matlabpath
+    )
+
+    if os.name == "nt":
+        shim_path = shim_dir / "matlab.bat"
+        shim_path.write_text(
+            f'@echo off\r\n"{matlab_cmd}" -logfile "{matlab_log}" %*\r\n',
+            encoding="utf-8",
+        )
+        _prepend_to_windows_path(str(shim_dir))
+        return shim_path
+
+    shim_path = shim_dir / "matlab"
+    shim_path.write_text(
+        (
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "args=(\"$@\")\n"
+            "for ((i=0; i<${#args[@]}; i++)); do\n"
+            "  if [[ \"${args[$i]}\" == \"-r\" ]] && (( i + 1 < ${#args[@]} )); then\n"
+            "    args[$((i + 1))]=\"${args[$((i + 1))]}; try, delete(gcp('nocreate')); catch, end; exit\"\n"
+            "    break\n"
+            "  fi\n"
+            "done\n"
+            f'exec "{matlab_cmd}" -logfile "{matlab_log}" "${{args[@]}}"\n'
+        ),
+        encoding="utf-8",
+    )
+    shim_path.chmod(0o755)
+    _prepend_to_path(str(shim_dir))
+    return shim_path
 
 
 def _load_params(path: Path) -> dict[str, Any]:
@@ -292,57 +383,32 @@ def execute_sorting_job(
         if not ks1_path.exists():
             raise FileNotFoundError(f"KiloSort1 path not found: {ks1_path}")
 
-        if matlab_path is not None:
-            mp = Path(matlab_path).expanduser().resolve()
-            if mp.is_dir():
-                candidate = mp / "matlab.exe"
-                if candidate.exists():
-                    matlab_cmd = str(candidate)
-                else:
-                    raise FileNotFoundError(f"matlab.exe was not found under directory: {mp}")
-            elif mp.is_file() and mp.name.lower() == "matlab.exe":
-                matlab_cmd = str(mp)
-            else:
-                raise FileNotFoundError(f"Invalid matlab_path: {mp}")
-        else:
-            matlab_cmd = shutil.which("matlab")
-            if matlab_cmd is None:
-                program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-                root = Path(program_files) / "MATLAB"
-                if root.exists():
-                    versions = sorted([d for d in root.iterdir() if d.is_dir()], reverse=True)
-                    for vdir in versions:
-                        candidate = vdir / "bin" / "matlab.exe"
-                        if candidate.exists():
-                            matlab_cmd = str(candidate)
-                            break
+        matlab_cmd = _resolve_matlab_cmd(matlab_path)
 
         if matlab_cmd is None:
             raise RuntimeError(
-                "MATLAB executable was not found. Set PreprocessConfig(matlab_path=Path('C:/.../MATLAB/.../bin/matlab.exe'))"
+                "MATLAB executable was not found. "
+                "Set PreprocessConfig(matlab_path=Path('/local/workdir/ys2375/MATLAB/R2024b/bin/matlab')) "
+                "or PreprocessConfig(matlab_path=Path('C:/.../MATLAB/.../bin/matlab.exe'))."
             )
 
         matlab_bin = str(Path(matlab_cmd).parent)
-        _prepend_to_windows_path(matlab_bin)
+        if os.name == "nt":
+            _prepend_to_windows_path(matlab_bin)
+        else:
+            _prepend_to_path(matlab_bin)
         print(f"Prepended MATLAB bin to PATH for this run: {matlab_bin}")
 
-        shim_dir = _repo_root() / ".matlab_shim"
-        shim_dir.mkdir(parents=True, exist_ok=True)
-        shim_bat = shim_dir / "matlab.bat"
-        matlab_log = shim_dir / "matlab_run.log"
-        shim_bat.write_text(
-            f'@echo off\r\n"{matlab_cmd}" -logfile "{matlab_log}" %*\r\n',
-            encoding="utf-8",
-        )
-        _prepend_to_windows_path(str(shim_dir))
-        print(f"Injected MATLAB shim: {shim_bat}")
+        matlab_log = _repo_root() / ".matlab_shim" / "matlab_run.log"
+        shim_path = _inject_matlab_shim(matlab_cmd, matlab_log)
+        print(f"Injected MATLAB shim: {shim_path}")
         print(f"MATLAB output will be logged to: {matlab_log}")
 
         matlab_resolved = shutil.which("matlab")
         if matlab_resolved is None:
             raise RuntimeError(
                 "Failed to resolve 'matlab' command even after PATH injection. "
-                f"matlab_path={matlab_cmd}, shim={shim_bat}"
+                f"matlab_path={matlab_cmd}, shim={shim_path}"
             )
         print(f"Resolved matlab command: {matlab_resolved}")
 
@@ -395,12 +461,20 @@ def execute_sorting_job(
         # GPU initialization can fail transiently on first MATLAB call.
         # Check the MATLAB log for details, then re-run the cell.
         matlab_log = _repo_root() / ".matlab_shim" / "matlab_run.log"
+        hint = ""
         if matlab_log.exists():
+            log_tail = matlab_log.read_text(encoding="utf-8", errors="replace")[-3000:]
             print(f"\n[MATLAB log: {matlab_log}]")
-            print(matlab_log.read_text(encoding="utf-8", errors="replace")[-3000:])
+            print(log_tail)
+            if "higher compute capability" in log_tail:
+                hint = (
+                    "\nDetected MATLAB CUDA compatibility error. "
+                    "Try updating NVIDIA driver/CUDA runtime visible to MATLAB, "
+                    "or use a MATLAB release with support for your GPU architecture."
+                )
         raise RuntimeError(
             f"Kilosort failed (possible GPU initialization error). "
-            f"Check the MATLAB log above, then re-run the cell.\nOriginal error: {err}"
+            f"Check the MATLAB log above, then re-run the cell.{hint}\nOriginal error: {err}"
         ) from err
     print("Sorter finished")
     return output_folder
@@ -435,7 +509,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sorter", default="kilosort", help="Sorter name (kilosort or kilosort4)")
     p.add_argument("--config", default="sorter/Kilosort1_config.yaml", help="Config path (.yaml/.yml/.json)")
     p.add_argument("--kilosort1-path", default="sorter/Kilosort1", help="Kilosort1 folder path")
-    p.add_argument("--matlab-path", default=None, help="Optional matlab.exe path")
+    p.add_argument(
+        "--matlab-path",
+        default=None,
+        help="Optional MATLAB executable or MATLAB bin directory path",
+    )
 
     p.add_argument("--dat-path", required=True, help="Path to input dat file")
     p.add_argument("--xml-path", default=None, help="Optional XML path for sr/nChannels")
