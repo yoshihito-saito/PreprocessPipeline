@@ -35,4 +35,5 @@ Thumbs.db
 *.lnk
 neurocode
 .matlab_shim
-sorter
+sorter/KiloSort1
+tests

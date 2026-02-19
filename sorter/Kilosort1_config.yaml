@@ -1,0 +1,55 @@
+detect_threshold: 4
+car: false
+useGPU: true
+freq_min: 500
+freq_max: 8000
+ntbuff: 64
+Nfilt: null
+NT: 32*1024+ntbuff
+wave_length: 61
+delete_tmp_files:
+- matlab_files
+delete_recording_dat: false
+parfor: true
+nNeighPC: 16
+nNeigh: 16
+whitening: full
+nSkipCov: 1
+whiteningRange: 64
+Nrank: 3
+nfullpasses: 6
+maxFR: 40000
+Th:
+- 6.0
+- 10.0
+- 10.0
+lam:
+- 12.0
+- 40.0
+- 40.0
+nannealpasses: 4
+momentum:
+- 0.05
+- 0.00125
+shuffle_clusters: true
+mergeT: 0.1
+splitT: 0.1
+initialize: fromData
+loc_range:
+- 3
+- 1
+long_range:
+- 30
+- 6
+maskMaxChannels: 8
+crit: 0.65
+nFiltMax: 80000
+fracse: 0.1
+epu: .inf
+ForceMaxRAMforDat: 15000000000.0
+pool_engine: process
+n_jobs: 1
+chunk_duration: 1s
+progress_bar: true
+mp_context: null
+max_threads_per_worker: 1
