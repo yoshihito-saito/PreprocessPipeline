@@ -60,7 +60,7 @@ class PostprocessConfig:
     verbose: bool = True
 
     metric_names: list[str] = field(
-        default_factory=lambda: ["isi_violation", "presence_ratio", "snr", "amplitude_median"]
+        default_factory=lambda: ["isi_violation", "presence_ratio", "snr", "amplitude_median", "firing_rate"]
     )
     skip_pc_metrics: bool = True
 
@@ -75,11 +75,12 @@ class PostprocessConfig:
 
     noise_thresholds: dict[str, float] = field(
         default_factory=lambda: {
-            "isi_violations_ratio_gt": 3.0,
+            "isi_violations_ratio_gt": 5.0,
             "isi_violations_count_gt": 50.0,
             "presence_ratio_lt": 0.1,
             "snr_lt": 0.3,
             "amplitude_median_lt": 25.0,
+            "firing_rate_lt": 0.01,
         }
     )
     noise_backup: bool = False

@@ -378,7 +378,8 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
         **config.job_kwargs,
     )
     metrics_csv_path = output_folder / config.metrics_csv_name
-    pd.DataFrame(metrics_df).to_csv(metrics_csv_path, index=True)
+    metrics_out_df = pd.DataFrame(metrics_df)
+    metrics_out_df.to_csv(metrics_csv_path, index=True)
 
     _log("exporting to Phy")
     export_to_phy(
@@ -409,6 +410,10 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
             dat_path=params_dat_path_override,
             hp_filtered=config.phy_hp_filtered,
         )
+
+    # export_to_phy can recreate output_folder when remove_if_exists=True.
+    # Persist metrics again after export so quality_metrics.csv is always present.
+    metrics_out_df.to_csv(metrics_csv_path, index=True)
 
     _log("marking noise clusters from metrics")
     updated = mark_noise_clusters_from_metrics(
