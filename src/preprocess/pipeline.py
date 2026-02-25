@@ -9,6 +9,7 @@ from .events import export_analog_digital_events, materialize_intermediate_dat
 from .io import (
     build_acquisition_catalog,
     discover_subsessions,
+    ensure_rhd,
     ensure_xml,
     load_session_xml_metadata,
     load_xml_metadata,
@@ -17,12 +18,15 @@ from .io import (
     resolve_local_output_dir,
     save_params_and_manifest,
 )
+from .intan_rhd import read_intan_rhd_header
 from .mergepoints import compute_mergepoints, save_mergepoints_events_mat
 from .recording import (
     apply_preprocessing,
     attach_probe_and_remove_bad_channels,
     concatenate_recordings_si,
     load_subsession_recordings,
+    write_concatenated_dat_analogin,
+    write_concatenated_dat_digitalin,
     write_concatenated_dat,
     write_lfp,
 )
@@ -38,6 +42,35 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     xml_path = ensure_xml(basepath, output_dir, basename)
     xml_meta = load_xml_metadata(xml_path)
     session_xml_meta = load_session_xml_metadata(xml_path)
+    rhd_path = ensure_rhd(basepath, output_dir, basename)
+
+    rhd_header = None
+    if rhd_path is not None and rhd_path.exists():
+        try:
+            rhd_header = read_intan_rhd_header(rhd_path)
+        except Exception as exc:
+            print(f"Warning: failed to parse info.rhd header ({rhd_path}): {exc}")
+
+    effective_sr = (
+        float(rhd_header.amplifier_sample_rate)
+        if rhd_header is not None and rhd_header.amplifier_sample_rate > 0
+        else float(xml_meta.sr)
+    )
+    effective_n_channels = (
+        int(rhd_header.num_amplifier_channels)
+        if rhd_header is not None and rhd_header.num_amplifier_channels > 0
+        else int(xml_meta.n_channels)
+    )
+    analog_sr = (
+        float(rhd_header.board_adc_sample_rate)
+        if rhd_header is not None and rhd_header.board_adc_sample_rate > 0
+        else effective_sr
+    )
+    digital_sr = (
+        float(rhd_header.board_dig_in_sample_rate)
+        if rhd_header is not None and rhd_header.board_dig_in_sample_rate > 0
+        else effective_sr
+    )
 
     amplifier_paths = discover_subsessions(
         basepath=basepath,
@@ -50,15 +83,16 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
 
     catalog = build_acquisition_catalog(
         amplifier_paths=amplifier_paths,
-        n_amplifier_channels=xml_meta.n_channels,
+        n_amplifier_channels=effective_n_channels,
         dtype=config.dtype,
+        intan_header=rhd_header,
     )
     print_catalog_summary(catalog)
 
     recordings = load_subsession_recordings(
         dat_paths=catalog.amplifier_paths,
-        sampling_frequency=xml_meta.sr,
-        num_channels=xml_meta.n_channels,
+        sampling_frequency=effective_sr,
+        num_channels=effective_n_channels,
         dtype=config.dtype,
         gain_to_uV=config.gain_to_uV,
         offset_to_uV=config.offset_to_uV,
@@ -86,9 +120,9 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
 
     merge_data = compute_mergepoints(
         dat_paths=catalog.amplifier_paths,
-        n_channels=xml_meta.n_channels,
+        n_channels=effective_n_channels,
         dtype=config.dtype,
-        sampling_frequency=xml_meta.sr,
+        sampling_frequency=effective_sr,
         foldernames=catalog.subsession_names,
     )
     mergepoints_path = output_dir / f"{basename}.MergePoints.events.mat"
@@ -97,9 +131,9 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     if dat_path is not None:
         recording_base = se.read_binary(
             str(dat_path),
-            sampling_frequency=xml_meta.sr,
+            sampling_frequency=effective_sr,
             dtype=config.dtype,
-            num_channels=xml_meta.n_channels,
+            num_channels=effective_n_channels,
             gain_to_uV=config.gain_to_uV,
             offset_to_uV=config.offset_to_uV,
         )
@@ -135,28 +169,79 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
 
     intermediate_dat_paths: dict[str, Path] = {}
     if config.export_intermediate_dat:
-        intermediate_dat_paths = materialize_intermediate_dat(
+        analog_ch = (
+            int(catalog.board_adc_channels)
+            if int(catalog.board_adc_channels) > 0
+            else (len(config.analog_channels) if config.analog_channels else 1)
+        )
+        digital_word_ch = (
+            int(catalog.board_digital_word_channels)
+            if int(catalog.board_digital_word_channels) > 0
+            else 1
+        )
+
+        analog_concat = write_concatenated_dat_analogin(
+            dat_paths=catalog.analogin_paths,
+            output_dat_path=output_dir / "analogin.dat",
+            sampling_frequency=analog_sr,
+            num_channels=analog_ch,
+            overwrite=config.overwrite,
+            job_kwargs=config.job_kwargs,
+        )
+        if analog_concat is not None:
+            intermediate_dat_paths["analogin"] = analog_concat
+
+        digital_concat = write_concatenated_dat_digitalin(
+            dat_paths=catalog.digitalin_paths,
+            output_dat_path=output_dir / "digitalin.dat",
+            sampling_frequency=digital_sr,
+            num_channels=digital_word_ch,
+            overwrite=config.overwrite,
+            job_kwargs=config.job_kwargs,
+        )
+        if digital_concat is not None:
+            intermediate_dat_paths["digitalin"] = digital_concat
+
+        sidecar_paths = materialize_intermediate_dat(
             output_dir=output_dir,
             basename=basename,
-            analogin_paths=catalog.analogin_paths,
-            digitalin_paths=catalog.digitalin_paths,
+            analogin_paths=[],
+            digitalin_paths=[],
             auxiliary_paths=catalog.auxiliary_paths,
             supply_paths=catalog.supply_paths,
             time_paths=catalog.time_paths,
             sample_counts=catalog.sample_counts,
             overwrite=config.overwrite,
         )
+        intermediate_dat_paths.update(sidecar_paths)
+
+    analog_num_channels = (
+        int(catalog.board_adc_channels)
+        if int(catalog.board_adc_channels) > 0
+        else (len(config.analog_channels) if config.analog_channels else 1)
+    )
+    digital_word_channels = (
+        int(catalog.board_digital_word_channels)
+        if int(catalog.board_digital_word_channels) > 0
+        else 1
+    )
 
     analog_event_paths, digital_event_paths = export_analog_digital_events(
         output_dir=output_dir,
         basename=basename,
         analog_inputs=config.analog_inputs,
         analog_channels=config.analog_channels,
+        analog_num_channels=analog_num_channels,
         digital_inputs=config.digital_inputs,
         digital_channels=config.digital_channels,
-        sr=xml_meta.sr,
+        digital_word_channels=digital_word_channels,
+        sr=effective_sr,
+        analog_sr=analog_sr,
+        digital_sr=digital_sr,
         analog_dat_path=intermediate_dat_paths.get("analogin"),
         digital_dat_path=intermediate_dat_paths.get("digitalin"),
+        merge_timestamps_sec=merge_data.timestamps_sec,
+        overwrite=config.overwrite,
     )
 
     session_dat_path = dat_path if dat_path is not None else output_dir / f"{basename}.dat"
@@ -175,9 +260,9 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         basename=basename,
         dat_path=session_dat_path,
         dat_dtype=config.dtype,
-        sr=xml_meta.sr,
+        sr=effective_sr,
         sr_lfp=(xml_meta.sr_lfp if xml_meta.sr_lfp is not None else config.lfp_fs),
-        n_channels=xml_meta.n_channels,
+        n_channels=effective_n_channels,
         bad_channels_1based=bad_1,
         merge_data=merge_data,
         xml_meta=session_xml_meta,
@@ -222,8 +307,8 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         analog_event_paths=analog_event_paths,
         digital_event_paths=digital_event_paths,
         intermediate_dat_paths=intermediate_dat_paths,
-        n_channels=xml_meta.n_channels,
-        sr=xml_meta.sr,
+        n_channels=effective_n_channels,
+        sr=effective_sr,
         sr_lfp=config.lfp_fs if config.make_lfp else None,
         bad_channels_0based=bad_0,
         bad_channels_1based=bad_1,

@@ -103,6 +103,7 @@ class AcquisitionCatalog:
     supply_voltage_channels: int
     board_adc_channels: int
     board_digital_input_channels: int
+    board_digital_word_channels: int
     board_digital_output_channels: int
     temperature_sensor_channels: int
 

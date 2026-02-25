@@ -97,6 +97,103 @@ def write_concatenated_dat(
     return output_dat_path
 
 
+def _load_sidecar_recordings_si(
+    *,
+    dat_paths: list[Path],
+    sampling_frequency: float,
+    num_channels: int,
+    dtype: str,
+) -> list[Any]:
+    recordings: list[Any] = []
+    for p in dat_paths:
+        rec = se.read_binary(
+            str(p),
+            sampling_frequency=sampling_frequency,
+            dtype=dtype,
+            num_channels=num_channels,
+            gain_to_uV=1.0,
+            offset_to_uV=0.0,
+        )
+        recordings.append(rec)
+    return recordings
+
+
+def _write_concatenated_sidecar_dat(
+    *,
+    dat_paths: list[Path],
+    output_dat_path: Path,
+    sampling_frequency: float,
+    num_channels: int,
+    dtype: str,
+    overwrite: bool,
+    job_kwargs: dict[str, Any],
+) -> Path | None:
+    if not dat_paths:
+        return None
+    if output_dat_path.exists() and not overwrite:
+        return output_dat_path
+
+    if num_channels <= 0:
+        raise ValueError(f"num_channels must be > 0 for sidecar concat: {num_channels}")
+
+    recs = _load_sidecar_recordings_si(
+        dat_paths=dat_paths,
+        sampling_frequency=sampling_frequency,
+        num_channels=num_channels,
+        dtype=dtype,
+    )
+    rec_concat = si.concatenate_recordings(recs)
+    si.write_binary_recording(
+        rec_concat,
+        file_paths=str(output_dat_path),
+        add_file_extension=False,
+        dtype=dtype,
+        verbose=True,
+        **job_kwargs,
+    )
+    return output_dat_path
+
+
+def write_concatenated_dat_analogin(
+    *,
+    dat_paths: list[Path],
+    output_dat_path: Path,
+    sampling_frequency: float,
+    num_channels: int,
+    overwrite: bool,
+    job_kwargs: dict[str, Any],
+) -> Path | None:
+    return _write_concatenated_sidecar_dat(
+        dat_paths=dat_paths,
+        output_dat_path=output_dat_path,
+        sampling_frequency=sampling_frequency,
+        num_channels=num_channels,
+        dtype="uint16",
+        overwrite=overwrite,
+        job_kwargs=job_kwargs,
+    )
+
+
+def write_concatenated_dat_digitalin(
+    *,
+    dat_paths: list[Path],
+    output_dat_path: Path,
+    sampling_frequency: float,
+    num_channels: int,
+    overwrite: bool,
+    job_kwargs: dict[str, Any],
+) -> Path | None:
+    return _write_concatenated_sidecar_dat(
+        dat_paths=dat_paths,
+        output_dat_path=output_dat_path,
+        sampling_frequency=sampling_frequency,
+        num_channels=num_channels,
+        dtype="uint16",
+        overwrite=overwrite,
+        job_kwargs=job_kwargs,
+    )
+
+
 def _load_bad_channels_from_chanmap(chanmap_mat_path: Path) -> list[int]:
     mat = loadmat(chanmap_mat_path)
     if "connected" not in mat:

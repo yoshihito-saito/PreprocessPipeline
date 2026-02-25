@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from scipy.io import loadmat, savemat
 
+from .intan_rhd import IntanRhdHeader
 from .metafile import (
     AcquisitionCatalog,
     PreprocessConfig,
@@ -504,6 +505,28 @@ def ensure_xml(basepath: Path, local_output_dir: Path, basename: str) -> Path:
     raise FileNotFoundError(f"No xml file found in parent/basepath for {basepath}")
 
 
+def ensure_rhd(basepath: Path, local_output_dir: Path, basename: str) -> Path | None:
+    target = local_output_dir / f"{basename}.rhd"
+    if target.exists():
+        return target
+
+    local_rhd = sorted(basepath.glob("*.rhd"))
+    for rhd in local_rhd:
+        if rhd.stem == basename:
+            copy2(rhd, target)
+            return target
+    if local_rhd:
+        copy2(local_rhd[0], target)
+        return target
+
+    nested_rhd = sorted(basepath.rglob("*.rhd"))
+    if nested_rhd:
+        copy2(nested_rhd[0], target)
+        return target
+
+    return None
+
+
 def load_xml_metadata(xml_path: Path) -> XmlMeta:
     tree = ET.parse(xml_path)
     root = tree.getroot()
@@ -621,6 +644,7 @@ def build_acquisition_catalog(
     amplifier_paths: list[Path],
     n_amplifier_channels: int,
     dtype: str,
+    intan_header: IntanRhdHeader | None = None,
 ) -> AcquisitionCatalog:
     itemsize = np.dtype(dtype).itemsize
     sample_counts = [int(p.stat().st_size // (n_amplifier_channels * itemsize)) for p in amplifier_paths]
@@ -654,10 +678,30 @@ def build_acquisition_catalog(
     supply_ch = _infer_channels_from_file(supply_paths[0], sample_counts[0]) if supply_paths else 0
     adc_ch = _infer_channels_from_file(analogin_paths[0], sample_counts[0]) if analogin_paths else 0
 
+    if intan_header is not None:
+        if intan_header.num_aux_input_channels > 0:
+            aux_ch = int(intan_header.num_aux_input_channels)
+        if intan_header.num_supply_voltage_channels > 0:
+            supply_ch = int(intan_header.num_supply_voltage_channels)
+        if intan_header.num_board_adc_channels > 0:
+            adc_ch = int(intan_header.num_board_adc_channels)
+
     dig_ch = 0
+    dig_word_ch = 0
     if digitalin_paths:
         raw_words = _infer_channels_from_file(digitalin_paths[0], sample_counts[0])
+        dig_word_ch = raw_words if raw_words > 0 else 1
         dig_ch = 16 if raw_words in (0, 1, 16) else raw_words
+    if intan_header is not None:
+        if intan_header.num_board_dig_in_channels > 0:
+            dig_ch = int(intan_header.num_board_dig_in_channels)
+            if dig_word_ch <= 0:
+                dig_word_ch = 1
+        board_dig_out_ch = int(intan_header.num_board_dig_out_channels)
+        temp_sensor_ch = int(intan_header.num_temp_sensor_channels)
+    else:
+        board_dig_out_ch = 0
+        temp_sensor_ch = 0
 
     return AcquisitionCatalog(
         subsession_names=[p.parent.name for p in amplifier_paths],
@@ -673,8 +717,9 @@ def build_acquisition_catalog(
         supply_voltage_channels=supply_ch,
         board_adc_channels=adc_ch,
         board_digital_input_channels=dig_ch,
-        board_digital_output_channels=0,
-        temperature_sensor_channels=0,
+        board_digital_word_channels=dig_word_ch,
+        board_digital_output_channels=board_dig_out_ch,
+        temperature_sensor_channels=temp_sensor_ch,
     )
 
 
