@@ -14,7 +14,13 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from scipy.io import loadmat, savemat
 
-from .metafile import AcquisitionCatalog, PreprocessConfig, PreprocessResult, XmlMeta
+from .metafile import (
+    AcquisitionCatalog,
+    PreprocessConfig,
+    PreprocessResult,
+    SessionXmlMeta,
+    XmlMeta,
+)
 
 
 def extract_datetime(path: str) -> datetime:
@@ -104,60 +110,91 @@ def get_sampling_rate(xml_path: Path | str) -> float | None:
         return None
 
 
-def _load_xml_groups_for_chanmap(xml_path: Path):
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
+def _clean_text(node: ET.Element | None) -> str | None:
+    if node is None or node.text is None:
+        return None
+    text = node.text.strip()
+    return text if text else None
 
+
+def _group_channel_nodes(group: ET.Element) -> list[ET.Element]:
+    channels_container = group.find("channels")
+    if channels_container is not None:
+        tags = channels_container.findall("n")
+        if not tags:
+            tags = channels_container.findall("channel")
+        return tags
+    tags = group.findall("n")
+    if not tags:
+        tags = group.findall("channel")
+    return tags
+
+
+def _parse_group_channels(group: ET.Element) -> list[int]:
+    channels: list[int] = []
+    for ch in _group_channel_nodes(group):
+        try:
+            if ch.text and ch.text.strip():
+                channels.append(int(ch.text.strip()))
+        except (ValueError, TypeError):
+            continue
+    return channels
+
+
+def _parse_xml_channel_groups(root: ET.Element) -> tuple[list[list[int]], list[list[int]], list[int]]:
     anat_grps: list[list[int]] = []
+    spike_grps: list[list[int]] = []
     skipped_channels: list[int] = []
+
     anat_desc = root.find("anatomicalDescription")
     if anat_desc is not None:
         ch_grps = anat_desc.find("channelGroups")
         if ch_grps is not None:
             for group in ch_grps.findall("group"):
-                channels: list[int] = []
-                tags = group.findall("n")
-                if not tags:
-                    tags = group.findall("channel")
-                for ch in tags:
-                    try:
-                        if ch.text and ch.text.strip():
-                            val = int(ch.text)
-                            channels.append(val)
-                            if ch.get("skip") == "1":
-                                skipped_channels.append(val)
-                    except (ValueError, TypeError):
-                        continue
+                channels = _parse_group_channels(group)
                 if channels:
                     anat_grps.append(channels)
+                for ch in _group_channel_nodes(group):
+                    try:
+                        if ch.get("skip") == "1" and ch.text and ch.text.strip():
+                            skipped_channels.append(int(ch.text.strip()))
+                    except (ValueError, TypeError):
+                        continue
 
-    spk_channels: list[int] = []
     spk_desc = root.find("spikeDetection")
-    has_spk_groups = False
     if spk_desc is not None:
         ch_grps = spk_desc.find("channelGroups")
         if ch_grps is not None:
-            groups = ch_grps.findall("group")
-            if groups:
-                has_spk_groups = True
-                for group in groups:
-                    channels_container = group.find("channels")
-                    tags = []
-                    if channels_container is not None:
-                        tags = channels_container.findall("n")
-                        if not tags:
-                            tags = channels_container.findall("channel")
-                    else:
-                        tags = group.findall("n")
-                        if not tags:
-                            tags = group.findall("channel")
-                    for ch in tags:
-                        try:
-                            if ch.text and ch.text.strip():
-                                spk_channels.append(int(ch.text))
-                        except (ValueError, TypeError):
-                            continue
+            for group in ch_grps.findall("group"):
+                channels = _parse_group_channels(group)
+                if channels:
+                    spike_grps.append(channels)
 
+    return anat_grps, spike_grps, sorted(set(skipped_channels))
+
+
+def load_session_xml_metadata(xml_path: Path) -> SessionXmlMeta:
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    anat_grps, spike_grps, skipped = _parse_xml_channel_groups(root)
+    return SessionXmlMeta(
+        date=_clean_text(root.find("generalInfo/date")),
+        experimenters=_clean_text(root.find("generalInfo/experimenters")),
+        notes=_clean_text(root.find("generalInfo/notes")) or "",
+        description=_clean_text(root.find("generalInfo/description")) or "",
+        anatomical_groups_0based=anat_grps,
+        spike_groups_0based=spike_grps,
+        skipped_channels_0based=skipped,
+    )
+
+
+def _load_xml_groups_for_chanmap(xml_path: Path):
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    anat_grps, spike_grps, skipped_channels = _parse_xml_channel_groups(root)
+    spk_channels = [ch for group in spike_grps for ch in group]
+    has_spk_groups = len(spike_grps) > 0
     return anat_grps, spk_channels, has_spk_groups, skipped_channels, root
 
 
@@ -470,6 +507,7 @@ def ensure_xml(basepath: Path, local_output_dir: Path, basename: str) -> Path:
 def load_xml_metadata(xml_path: Path) -> XmlMeta:
     tree = ET.parse(xml_path)
     root = tree.getroot()
+    session_xml_meta = load_session_xml_metadata(xml_path)
 
     sr_tag = root.find(".//sampleRate")
     if sr_tag is None:
@@ -477,6 +515,16 @@ def load_xml_metadata(xml_path: Path) -> XmlMeta:
     if sr_tag is None or sr_tag.text is None:
         raise ValueError(f"Could not parse sampling rate from {xml_path}")
     sr = float(sr_tag.text)
+
+    sr_lfp: float | None = None
+    lfp_tag = root.find(".//fieldPotentials/lfpSamplingRate")
+    if lfp_tag is None:
+        lfp_tag = root.find(".//lfpSampleRate")
+    if lfp_tag is not None and lfp_tag.text:
+        try:
+            sr_lfp = float(lfp_tag.text)
+        except ValueError:
+            sr_lfp = None
 
     n_channels = None
     n_tag = root.find(".//acquisitionSystem/nChannels")
@@ -493,17 +541,12 @@ def load_xml_metadata(xml_path: Path) -> XmlMeta:
     if n_channels is None:
         raise ValueError(f"Could not parse channel count from {xml_path}")
 
-    skipped = []
-    anat_desc = root.find("anatomicalDescription")
-    if anat_desc is not None:
-        ch_grps = anat_desc.find("channelGroups")
-        if ch_grps is not None:
-            for group in ch_grps.findall("group"):
-                for ch in group.findall("n") + group.findall("channel"):
-                    if ch.get("skip") == "1" and ch.text and ch.text.strip():
-                        skipped.append(int(ch.text.strip()))
-
-    return XmlMeta(sr=sr, n_channels=n_channels, skipped_channels_0based=sorted(set(skipped)))
+    return XmlMeta(
+        sr=sr,
+        sr_lfp=sr_lfp,
+        n_channels=n_channels,
+        skipped_channels_0based=session_xml_meta.skipped_channels_0based,
+    )
 
 
 def discover_subsessions(

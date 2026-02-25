@@ -10,6 +10,7 @@ from .io import (
     build_acquisition_catalog,
     discover_subsessions,
     ensure_xml,
+    load_session_xml_metadata,
     load_xml_metadata,
     print_catalog_summary,
     resolve_basepath_and_basename,
@@ -36,6 +37,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
 
     xml_path = ensure_xml(basepath, output_dir, basename)
     xml_meta = load_xml_metadata(xml_path)
+    session_xml_meta = load_session_xml_metadata(xml_path)
 
     amplifier_paths = discover_subsessions(
         basepath=basepath,
@@ -157,17 +159,28 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         digital_dat_path=intermediate_dat_paths.get("digitalin"),
     )
 
+    session_dat_path = dat_path if dat_path is not None else output_dir / f"{basename}.dat"
+    if not session_dat_path.exists():
+        raise FileNotFoundError(
+            "neurocode_strict session generation requires concatenated dat. "
+            "Enable save_raw or sorter, or ensure basename.dat exists in output_dir."
+        )
+    if dat_path is None:
+        dat_path = session_dat_path
+
     session_struct = build_session_struct(
-        basepath=output_dir,
+        source_basepath=basepath,
+        local_basepath=output_dir,
+        session_basepath_mode=config.session_basepath_mode,
         basename=basename,
-        dat_path=(dat_path if dat_path is not None else output_dir / f"{basename}.dat"),
-        lfp_path=lfp_path,
+        dat_path=session_dat_path,
+        dat_dtype=config.dtype,
         sr=xml_meta.sr,
-        sr_lfp=config.lfp_fs if config.make_lfp else None,
+        sr_lfp=(xml_meta.sr_lfp if xml_meta.sr_lfp is not None else config.lfp_fs),
         n_channels=xml_meta.n_channels,
         bad_channels_1based=bad_1,
-        analog_event_paths=analog_event_paths,
-        digital_event_paths=digital_event_paths,
+        merge_data=merge_data,
+        xml_meta=session_xml_meta,
     )
     session_mat_path = output_dir / f"{basename}.session.mat"
     save_session_mat(session_mat_path, session_struct)

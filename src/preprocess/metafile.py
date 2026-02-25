@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -28,6 +28,7 @@ class PreprocessConfig:
 
     make_lfp: bool = True
     lfp_fs: float = 1250.0
+    session_basepath_mode: Literal["local", "source"] = "local"
 
     analog_inputs: bool = False
     analog_channels: list[int] | None = None
@@ -62,7 +63,19 @@ class PreprocessConfig:
 @dataclass
 class XmlMeta:
     sr: float
+    sr_lfp: float | None
     n_channels: int
+    skipped_channels_0based: list[int]
+
+
+@dataclass
+class SessionXmlMeta:
+    date: str | None
+    experimenters: str | None
+    notes: str
+    description: str
+    anatomical_groups_0based: list[list[int]]
+    spike_groups_0based: list[list[int]]
     skipped_channels_0based: list[int]
 
 
