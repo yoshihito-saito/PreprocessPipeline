@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from typing import Any
+import warnings
 
 import numpy as np
 from scipy.io import loadmat
@@ -28,10 +29,53 @@ def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path) -> Any:
     probe_ids = np.asarray(mat.get("probe_ids", np.ones_like(x))).flatten()
     device_ch_inds = np.asarray(mat["chanMap"]).flatten().astype(int) - 1
 
+    n_contacts = min(
+        x.size,
+        y.size,
+        shank_ids.size,
+        probe_ids.size,
+        device_ch_inds.size,
+    )
+    if n_contacts <= 0:
+        return recording
+
+    x = x[:n_contacts]
+    y = y[:n_contacts]
+    shank_ids = shank_ids[:n_contacts]
+    probe_ids = probe_ids[:n_contacts]
+    device_ch_inds = device_ch_inds[:n_contacts]
+
+    n_recording_channels = int(recording.get_num_channels())
+    valid_mask = (device_ch_inds >= 0) & (device_ch_inds < n_recording_channels)
+    if not np.any(valid_mask):
+        warnings.warn(
+            "chanMap has no valid device_channel_indices for this recording; "
+            "skipping probe attachment.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return recording
+    if int(np.size(valid_mask)) != int(np.count_nonzero(valid_mask)):
+        dropped = int(np.size(valid_mask) - np.count_nonzero(valid_mask))
+        warnings.warn(
+            f"Dropping {dropped} chanMap contacts outside recording channel range "
+            f"[0, {n_recording_channels - 1}] before probe attachment.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    x = x[valid_mask]
+    y = y[valid_mask]
+    shank_ids = shank_ids[valid_mask]
+    probe_ids = probe_ids[valid_mask]
+    device_ch_inds = device_ch_inds[valid_mask]
+
     probegroup = ProbeGroup()
     unique_probes = [p for p in np.unique(probe_ids) if p > 0]
     for p_id in unique_probes:
         mask = probe_ids == p_id
+        if not np.any(mask):
+            continue
         probe = Probe(ndim=2, si_units="um")
         probe.set_contacts(
             positions=np.column_stack((x[mask], y[mask])),
@@ -46,9 +90,27 @@ def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path) -> Any:
         return recording
 
     if hasattr(recording, "set_probegroup"):
-        return recording.set_probegroup(probegroup, group_mode="by_probe")
+        try:
+            return recording.set_probegroup(probegroup, group_mode="by_probe")
+        except Exception as exc:
+            warnings.warn(
+                f"Failed to attach probe from chanMap ({chanmap_mat_path}): {exc}. "
+                "Continuing without probe geometry.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return recording
     if hasattr(recording, "set_probe"):
-        return recording.set_probe(probegroup.probes[0])
+        try:
+            return recording.set_probe(probegroup.probes[0])
+        except Exception as exc:
+            warnings.warn(
+                f"Failed to attach probe from chanMap ({chanmap_mat_path}): {exc}. "
+                "Continuing without probe geometry.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return recording
     return recording
 
 

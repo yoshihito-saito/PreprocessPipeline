@@ -9,7 +9,6 @@ from .events import export_analog_digital_events, materialize_intermediate_dat
 from .io import (
     build_acquisition_catalog,
     discover_subsessions,
-    ensure_rhd,
     ensure_xml,
     load_session_xml_metadata,
     load_xml_metadata,
@@ -18,7 +17,6 @@ from .io import (
     resolve_local_output_dir,
     save_params_and_manifest,
 )
-from .intan_rhd import read_intan_rhd_header
 from .mergepoints import compute_mergepoints, save_mergepoints_events_mat
 from .recording import (
     apply_preprocessing,
@@ -42,35 +40,12 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     xml_path = ensure_xml(basepath, output_dir, basename)
     xml_meta = load_xml_metadata(xml_path)
     session_xml_meta = load_session_xml_metadata(xml_path)
-    rhd_path = ensure_rhd(basepath, output_dir, basename)
 
-    rhd_header = None
-    if rhd_path is not None and rhd_path.exists():
-        try:
-            rhd_header = read_intan_rhd_header(rhd_path)
-        except Exception as exc:
-            print(f"Warning: failed to parse info.rhd header ({rhd_path}): {exc}")
-
-    effective_sr = (
-        float(rhd_header.amplifier_sample_rate)
-        if rhd_header is not None and rhd_header.amplifier_sample_rate > 0
-        else float(xml_meta.sr)
-    )
-    effective_n_channels = (
-        int(rhd_header.num_amplifier_channels)
-        if rhd_header is not None and rhd_header.num_amplifier_channels > 0
-        else int(xml_meta.n_channels)
-    )
-    analog_sr = (
-        float(rhd_header.board_adc_sample_rate)
-        if rhd_header is not None and rhd_header.board_adc_sample_rate > 0
-        else effective_sr
-    )
-    digital_sr = (
-        float(rhd_header.board_dig_in_sample_rate)
-        if rhd_header is not None and rhd_header.board_dig_in_sample_rate > 0
-        else effective_sr
-    )
+    # Neurocode-compatible behavior: use XML-derived amplifier metadata.
+    effective_sr = float(xml_meta.sr)
+    effective_n_channels = int(xml_meta.n_channels)
+    analog_sr = effective_sr
+    digital_sr = effective_sr
 
     amplifier_paths = discover_subsessions(
         basepath=basepath,
@@ -85,7 +60,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         amplifier_paths=amplifier_paths,
         n_amplifier_channels=effective_n_channels,
         dtype=config.dtype,
-        intan_header=rhd_header,
+        intan_header=None,
     )
     print_catalog_summary(catalog)
 
@@ -293,6 +268,8 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             kilosort1_path=config.sorter_path,
             matlab_path=config.matlab_path,
             chanmap_mat_path=config.chanmap_mat_path,
+            exclude_channels_0based=bad_0,
+            job_kwargs=config.job_kwargs,
             remove_existing_folder=config.overwrite,
         )
 

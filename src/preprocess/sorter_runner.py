@@ -8,10 +8,12 @@ import shutil
 from typing import Any
 import ast
 
+import numpy as np
 import spikeinterface.extractors as se
 import spikeinterface.sorters as ss
 import yaml
 from scipy.io import loadmat
+from spikeinterface.core.job_tools import job_keys as _SI_JOB_KEYS
 
 from .io import load_xml_metadata
 from .recording import attach_probe_from_chanmap
@@ -49,6 +51,7 @@ _KILOSORT1_FLOAT_VECTOR_PARAMS = {
 }
 
 _KILOSORT1_ALLOWED_PARAM_KEYS: set[str] | None = None
+_JOB_KWARG_KEYS = set(_SI_JOB_KEYS)
 
 
 def _prepend_to_path(path_to_add: str) -> None:
@@ -299,6 +302,7 @@ def _normalize_kilosort_params(
     *,
     num_channels: int,
     chanmap_mat_path: Path | None,
+    active_channel_count: int | None = None,
 ) -> dict[str, Any]:
     normalized = {
         _KILOSORT1_WRAPPER_ALIASES.get(key, key): value
@@ -333,7 +337,11 @@ def _normalize_kilosort_params(
 
     nfilt_raw = normalized.get("Nfilt", None)
     if nfilt_raw is None:
-        n_active = _get_active_channel_count(chanmap_mat_path, num_channels)
+        n_active = (
+            int(active_channel_count)
+            if active_channel_count is not None and int(active_channel_count) > 0
+            else _get_active_channel_count(chanmap_mat_path, num_channels)
+        )
         templatemultiplier = 8
         nfilt = n_active * templatemultiplier
         normalized["Nfilt"] = int(nfilt - (nfilt % 32))
@@ -348,6 +356,166 @@ def _normalize_kilosort_params(
         normalized = {k: v for k, v in normalized.items() if k in allowed_keys}
 
     return normalized
+
+
+def _merge_sorter_job_kwargs(
+    params: dict[str, Any],
+    job_kwargs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    merged = dict(params)
+    if not job_kwargs:
+        return merged
+    for k, v in job_kwargs.items():
+        if k in _JOB_KWARG_KEYS and v is not None:
+            merged[k] = v
+    n_jobs = merged.get("n_jobs", None)
+    try:
+        n_jobs_val = None if n_jobs is None else float(n_jobs)
+    except (TypeError, ValueError):
+        n_jobs_val = None
+    has_chunk_setting = any(
+        merged.get(k, None) is not None
+        for k in ("chunk_size", "chunk_memory", "total_memory", "chunk_duration")
+    )
+    if n_jobs_val is not None and n_jobs_val != 1.0 and not has_chunk_setting:
+        merged["chunk_duration"] = "1s"
+        print(
+            "No chunk_* job kwargs provided for n_jobs!=1. "
+            "Setting chunk_duration='1s' for sorter binary export."
+        )
+    return merged
+
+
+def _resolve_active_channels_0based(
+    *,
+    num_channels: int,
+    chanmap_mat_path: Path | None,
+    exclude_channels_0based: list[int] | None,
+) -> list[int]:
+    all_channels = list(range(int(num_channels)))
+    active_from_chanmap: list[int] | None = None
+
+    if chanmap_mat_path is not None and chanmap_mat_path.exists():
+        try:
+            mat = loadmat(str(chanmap_mat_path), simplify_cells=True)
+            chanmap_raw = mat.get("chanMap", None)
+            connected_raw = mat.get("connected", None)
+
+            if chanmap_raw is not None:
+                chanmap = np.asarray(chanmap_raw).reshape(-1).astype(np.int64) - 1
+                chanmap = chanmap[(chanmap >= 0) & (chanmap < int(num_channels))]
+            else:
+                chanmap = np.arange(int(num_channels), dtype=np.int64)
+
+            if connected_raw is not None:
+                connected = np.asarray(connected_raw).reshape(-1)
+                if connected.size == chanmap.size:
+                    conn_mask = connected.astype(float) > 0
+                    chanmap = chanmap[conn_mask]
+                elif connected.size == int(num_channels) and chanmap_raw is None:
+                    chanmap = np.flatnonzero(connected.astype(float) > 0).astype(np.int64)
+
+            # Preserve channel order from chanMap while removing duplicates.
+            active_from_chanmap = []
+            seen: set[int] = set()
+            for ch in chanmap.tolist():
+                ch_i = int(ch)
+                if ch_i not in seen:
+                    active_from_chanmap.append(ch_i)
+                    seen.add(ch_i)
+        except Exception:
+            active_from_chanmap = None
+
+    base = active_from_chanmap if active_from_chanmap is not None else all_channels
+    excluded_set = {
+        int(ch)
+        for ch in (exclude_channels_0based or [])
+        if 0 <= int(ch) < int(num_channels)
+    }
+    active = [ch for ch in base if ch not in excluded_set]
+    if not active:
+        raise ValueError(
+            "No active channels remain for sorting after applying chanMap/reject channels."
+        )
+    return active
+
+
+def _patch_params_py(params_path: Path, *, dat_path: Path, n_channels_dat: int) -> None:
+    if not params_path.exists():
+        return
+    dat_literal = repr(str(dat_path))
+    lines = params_path.read_text(encoding="utf-8").splitlines()
+
+    out_lines: list[str] = []
+    dat_set = False
+    nch_set = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("dat_path"):
+            out_lines.append(f"dat_path = {dat_literal}")
+            dat_set = True
+        elif stripped.startswith("n_channels_dat"):
+            out_lines.append(f"n_channels_dat = {int(n_channels_dat)}")
+            nch_set = True
+        else:
+            out_lines.append(line)
+
+    if not dat_set:
+        out_lines.append(f"dat_path = {dat_literal}")
+    if not nch_set:
+        out_lines.append(f"n_channels_dat = {int(n_channels_dat)}")
+
+    params_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+
+
+def _patch_channel_map_npy(channel_map_path: Path, active_channels_0based: list[int]) -> None:
+    if not channel_map_path.exists():
+        return
+    try:
+        arr = np.load(channel_map_path)
+    except Exception:
+        return
+
+    mapped = np.asarray(active_channels_0based, dtype=np.int32)
+    if arr.ndim == 2 and arr.shape[1] == 1:
+        mapped = mapped.reshape(-1, 1)
+    elif arr.ndim == 2 and arr.shape[0] == 1:
+        mapped = mapped.reshape(1, -1)
+    elif arr.ndim != 1:
+        return
+
+    np.save(channel_map_path, mapped)
+
+
+def _patch_phy_outputs_for_raw_dat(
+    *,
+    output_folder: Path,
+    raw_dat_path: Path,
+    n_channels_dat: int,
+    active_channels_0based: list[int],
+) -> None:
+    for params_path in output_folder.rglob("params.py"):
+        _patch_params_py(params_path, dat_path=raw_dat_path, n_channels_dat=n_channels_dat)
+
+    for channel_map_name in ("channel_map.npy", "channel_map_si.npy"):
+        for p in output_folder.rglob(channel_map_name):
+            _patch_channel_map_npy(p, active_channels_0based)
+
+
+def _slice_recording_channels(recording: Any, channel_ids: list[int]) -> Any:
+    if hasattr(recording, "channel_slice"):
+        return recording.channel_slice(channel_ids=channel_ids)
+    if hasattr(recording, "select_channels"):
+        return recording.select_channels(channel_ids=channel_ids)
+    if hasattr(recording, "remove_channels") and hasattr(recording, "get_channel_ids"):
+        existing = [int(ch) for ch in recording.get_channel_ids()]
+        keep = {int(ch) for ch in channel_ids}
+        remove = [ch for ch in existing if ch not in keep]
+        return recording.remove_channels(channel_ids=remove)
+    raise AttributeError(
+        "Recording object does not support channel slicing APIs "
+        "(channel_slice/select_channels/remove_channels)."
+    )
 
 
 def execute_sorting_job(
@@ -365,6 +533,8 @@ def execute_sorting_job(
     offset_to_uV: float = 0.0,
     sampling_frequency: float | None = None,
     num_channels: int | None = None,
+    exclude_channels_0based: list[int] | None = None,
+    job_kwargs: dict[str, Any] | None = None,
     remove_existing_folder: bool = True,
     docker_image: str | None = None,
 ) -> Path:
@@ -420,14 +590,21 @@ def execute_sorting_job(
     print(f"Loaded sorter params: {cfg_path}")
 
     sr, nch = _resolve_sr_nch(sampling_frequency, num_channels, xml_path)
+    active_channels_0based = _resolve_active_channels_0based(
+        num_channels=nch,
+        chanmap_mat_path=Path(chanmap_mat_path) if chanmap_mat_path is not None else None,
+        exclude_channels_0based=exclude_channels_0based,
+    )
 
     if sorter_input == "kilosort":
         params = _normalize_kilosort_params(
             params,
             num_channels=nch,
             chanmap_mat_path=Path(chanmap_mat_path) if chanmap_mat_path is not None else None,
+            active_channel_count=len(active_channels_0based),
         )
         print(f"Resolved Kilosort params: NT={params.get('NT')} Nfilt={params.get('Nfilt')} ntbuff={params.get('ntbuff')}")
+    params = _merge_sorter_job_kwargs(params, job_kwargs)
 
     dat_path = Path(dat_path).resolve()
     recording = se.read_binary(
@@ -441,6 +618,13 @@ def execute_sorting_job(
 
     if chanmap_mat_path is not None and Path(chanmap_mat_path).exists():
         recording = attach_probe_from_chanmap(recording, Path(chanmap_mat_path))
+
+    if len(active_channels_0based) != int(nch):
+        recording = _slice_recording_channels(recording, active_channels_0based)
+        print(
+            "Sorting with active channels only: "
+            f"{len(active_channels_0based)}/{int(nch)}"
+        )
 
     run_kwargs: dict[str, Any] = {
         "sorter_name": sorter_name,
@@ -476,6 +660,17 @@ def execute_sorting_job(
             f"Kilosort failed (possible GPU initialization error). "
             f"Check the MATLAB log above, then re-run the cell.{hint}\nOriginal error: {err}"
         ) from err
+    if len(active_channels_0based) != int(nch):
+        _patch_phy_outputs_for_raw_dat(
+            output_folder=output_folder,
+            raw_dat_path=dat_path,
+            n_channels_dat=int(nch),
+            active_channels_0based=active_channels_0based,
+        )
+        print(
+            "Patched output metadata for full raw.dat compatibility: "
+            f"n_channels_dat={int(nch)}, active={len(active_channels_0based)}"
+        )
     print("Sorter finished")
     return output_folder
 
@@ -499,6 +694,8 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
         offset_to_uV=args.offset_to_uV,
         sampling_frequency=args.sampling_frequency,
         num_channels=args.num_channels,
+        exclude_channels_0based=None,
+        job_kwargs=None,
         remove_existing_folder=args.remove_existing_folder,
         docker_image=args.docker_image,
     )

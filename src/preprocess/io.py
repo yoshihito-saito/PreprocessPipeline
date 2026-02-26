@@ -484,13 +484,16 @@ def resolve_local_output_dir(basepath: Path, basename: str, config: PreprocessCo
 
 def ensure_xml(basepath: Path, local_output_dir: Path, basename: str) -> Path:
     target = local_output_dir / f"{basename}.xml"
-    if target.exists():
-        return target
+    preferred = [
+        basepath / f"{basename}.xml",
+    ]
+    preferred.extend(sorted(basepath.rglob(f"{basename}.xml")))
+    preferred.extend(sorted(basepath.parent.glob(f"{basename}.xml")))
 
-    parent_xml = sorted(basepath.parent.glob("*.xml"))
-    if parent_xml:
-        copy2(parent_xml[0], target)
-        return target
+    for src in preferred:
+        if src.exists():
+            copy2(src, target)
+            return target
 
     local_xml = sorted(basepath.glob("*.xml"))
     if local_xml:
@@ -502,19 +505,32 @@ def ensure_xml(basepath: Path, local_output_dir: Path, basename: str) -> Path:
         copy2(nested_xml[0], target)
         return target
 
+    parent_xml = sorted(basepath.parent.glob("*.xml"))
+    if parent_xml:
+        copy2(parent_xml[0], target)
+        return target
+
+    if target.exists():
+        return target
+
     raise FileNotFoundError(f"No xml file found in parent/basepath for {basepath}")
 
 
 def ensure_rhd(basepath: Path, local_output_dir: Path, basename: str) -> Path | None:
     target = local_output_dir / f"{basename}.rhd"
-    if target.exists():
-        return target
+    preferred = [
+        basepath / f"{basename}.rhd",
+        basepath / "info.rhd",
+    ]
+    preferred.extend(sorted(basepath.rglob("info.rhd")))
+    preferred.extend(sorted(basepath.rglob(f"{basename}.rhd")))
+
+    for src in preferred:
+        if src.exists():
+            copy2(src, target)
+            return target
 
     local_rhd = sorted(basepath.glob("*.rhd"))
-    for rhd in local_rhd:
-        if rhd.stem == basename:
-            copy2(rhd, target)
-            return target
     if local_rhd:
         copy2(local_rhd[0], target)
         return target
@@ -522,6 +538,9 @@ def ensure_rhd(basepath: Path, local_output_dir: Path, basename: str) -> Path | 
     nested_rhd = sorted(basepath.rglob("*.rhd"))
     if nested_rhd:
         copy2(nested_rhd[0], target)
+        return target
+
+    if target.exists():
         return target
 
     return None
