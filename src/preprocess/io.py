@@ -814,6 +814,8 @@ def save_params_and_manifest(
         "subsession_sample_counts": result.subsession_sample_counts,
         "sorter": result.sorter,
         "sorter_output_dir": str(result.sorter_output_dir) if result.sorter_output_dir else None,
+        "state_score_paths": [str(p) for p in result.state_score_paths],
+        "state_score_figure_paths": [str(p) for p in result.state_score_figure_paths],
     }
 
     if config.save_manifest_json:

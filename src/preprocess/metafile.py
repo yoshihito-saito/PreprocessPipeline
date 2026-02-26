@@ -29,6 +29,15 @@ class PreprocessConfig:
     make_lfp: bool = True
     lfp_fs: float = 1250.0
     session_basepath_mode: Literal["local", "source"] = "local"
+    state_score: bool = False
+    sw_channels: list[int] | None = None
+    theta_channels: list[int] | None = None
+    state_ignore_manual: bool = False
+    state_save_lfp_mat: bool = True
+    state_sticky_trigger: bool = False
+    state_winparms: tuple[float, float] = (2.0, 15.0)
+    state_min_state_length: float = 6.0
+    state_block_wake_to_rem: bool = True
 
     analog_inputs: bool = False
     analog_channels: list[int] | None = None
@@ -136,3 +145,5 @@ class PreprocessResult:
 
     sorter: str | None = None
     sorter_output_dir: Path | None = None
+    state_score_paths: list[Path] = field(default_factory=list)
+    state_score_figure_paths: list[Path] = field(default_factory=list)

@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import spikeinterface.extractors as se
+from scipy.io import loadmat
 
 from .events import export_analog_digital_events, materialize_intermediate_dat
 from .io import (
@@ -33,6 +34,7 @@ from .recording import (
 from .session import build_session_struct, save_session_mat
 from .metafile import PreprocessConfig, PreprocessResult
 from .sorter_runner import execute_sorting_job
+from .state_scoring import run_state_scoring
 
 
 def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
@@ -267,6 +269,44 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     session_mat_path = output_dir / f"{basename}.session.mat"
     save_session_mat(session_mat_path, session_struct)
 
+    def _load_pulses_struct(paths: list[Path], basename_local: str) -> dict | None:
+        pulses_candidates = [
+            output_dir / f"{basename_local}.pulses.events.mat",
+            *paths,
+        ]
+        for p in pulses_candidates:
+            if not p.exists():
+                continue
+            if "pulses.events.mat" not in p.name:
+                continue
+            try:
+                loaded = loadmat(p, simplify_cells=True)
+            except Exception:
+                continue
+            pulses = loaded.get("pulses")
+            if isinstance(pulses, dict):
+                return pulses
+        return None
+
+    state_score_paths: list[Path] = []
+    state_score_figure_paths: list[Path] = []
+    if config.state_score:
+        pulses_struct = _load_pulses_struct(analog_event_paths, basename)
+        state_score_result = run_state_scoring(
+            basepath=output_dir,
+            basename=basename,
+            session_struct=session_struct,
+            pulses=pulses_struct,
+            config=config,
+        )
+        state_score_paths = [
+            state_score_result.emg_mat_path,
+            state_score_result.sleepscore_lfp_mat_path,
+            state_score_result.sleep_state_mat_path,
+            state_score_result.sleep_state_episodes_mat_path,
+        ]
+        state_score_figure_paths = list(state_score_result.figure_paths)
+
     sorter_output_dir: Path | None = None
     if config.sorter:
         sorter_label = str(config.sorter).strip()
@@ -317,6 +357,8 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         ),
         sorter=config.sorter,
         sorter_output_dir=sorter_output_dir,
+        state_score_paths=state_score_paths,
+        state_score_figure_paths=state_score_figure_paths,
     )
 
     save_params_and_manifest(
