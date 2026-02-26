@@ -106,6 +106,8 @@ class AcquisitionCatalog:
     board_digital_word_channels: int
     board_digital_output_channels: int
     temperature_sensor_channels: int
+    board_adc_native_orders: list[int]
+    board_digital_input_native_orders: list[int]
 
 
 @dataclass

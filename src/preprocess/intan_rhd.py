@@ -24,6 +24,8 @@ class IntanRhdHeader:
     num_board_adc_channels: int
     num_board_dig_in_channels: int
     num_board_dig_out_channels: int
+    board_adc_native_orders: list[int]
+    board_dig_in_native_orders: list[int]
 
 
 def _read_qstring(fid) -> str:
@@ -83,6 +85,8 @@ def read_intan_rhd_header(rhd_path: Path) -> IntanRhdHeader:
         n_adc = 0
         n_dig_in = 0
         n_dig_out = 0
+        adc_native_orders: list[int] = []
+        dig_in_native_orders: list[int] = []
 
         for _group in range(number_of_signal_groups):
             _ = _read_qstring(fid)  # signal_group_name
@@ -96,7 +100,7 @@ def read_intan_rhd_header(rhd_path: Path) -> IntanRhdHeader:
                 _ = _read_qstring(fid)  # native_channel_name
                 _ = _read_qstring(fid)  # custom_channel_name
                 # native_order, custom_order, signal_type, channel_enabled, chip_channel, board_stream
-                _, _, signal_type, channel_enabled, _, _ = struct.unpack("<hhhhhh", fid.read(12))
+                native_order, _, signal_type, channel_enabled, _, _ = struct.unpack("<hhhhhh", fid.read(12))
                 # trigger settings
                 fid.read(8)
                 # impedance magnitude / phase
@@ -112,8 +116,10 @@ def read_intan_rhd_header(rhd_path: Path) -> IntanRhdHeader:
                     n_supply += 1
                 elif signal_type == 3:
                     n_adc += 1
+                    adc_native_orders.append(int(native_order))
                 elif signal_type == 4:
                     n_dig_in += 1
+                    dig_in_native_orders.append(int(native_order))
                 elif signal_type == 5:
                     n_dig_out += 1
 
@@ -132,4 +138,6 @@ def read_intan_rhd_header(rhd_path: Path) -> IntanRhdHeader:
         num_board_adc_channels=int(n_adc),
         num_board_dig_in_channels=int(n_dig_in),
         num_board_dig_out_channels=int(n_dig_out),
+        board_adc_native_orders=adc_native_orders,
+        board_dig_in_native_orders=dig_in_native_orders,
     )

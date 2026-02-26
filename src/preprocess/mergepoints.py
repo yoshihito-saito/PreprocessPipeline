@@ -41,8 +41,9 @@ def compute_mergepoints(
 def save_mergepoints_events_mat(path: Path, data: MergePointsData) -> Path:
     merge_points = {
         "timestamps": data.timestamps_sec,
-        "timestamps_samples": data.timestamps_samples,
-        "firstlasttimepoints_samples": data.firstlasttimepoints_samples,
+        # neurocode MAT output stores these as MATLAB double
+        "timestamps_samples": np.asarray(data.timestamps_samples, dtype=np.float64),
+        "firstlasttimpoints_samples": np.asarray(data.firstlasttimepoints_samples, dtype=np.float64),
         "foldernames": np.asarray(data.foldernames, dtype=object),
         "detectorinfo": {
             "detectorname": "preprocessSession.py",
@@ -51,4 +52,3 @@ def save_mergepoints_events_mat(path: Path, data: MergePointsData) -> Path:
     }
     savemat(path, {"MergePoints": merge_points}, do_compression=True)
     return path
-

@@ -9,6 +9,7 @@ from .events import export_analog_digital_events, materialize_intermediate_dat
 from .io import (
     build_acquisition_catalog,
     discover_subsessions,
+    ensure_rhd,
     ensure_xml,
     load_session_xml_metadata,
     load_xml_metadata,
@@ -17,6 +18,7 @@ from .io import (
     resolve_local_output_dir,
     save_params_and_manifest,
 )
+from .intan_rhd import read_intan_rhd_header
 from .mergepoints import compute_mergepoints, save_mergepoints_events_mat
 from .recording import (
     apply_preprocessing,
@@ -38,14 +40,24 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     output_dir = resolve_local_output_dir(basepath, basename, config)
 
     xml_path = ensure_xml(basepath, output_dir, basename)
+    rhd_path = ensure_rhd(basepath, output_dir, basename)
     xml_meta = load_xml_metadata(xml_path)
     session_xml_meta = load_session_xml_metadata(xml_path)
+    intan_header = None
+    if rhd_path is not None and rhd_path.exists():
+        try:
+            intan_header = read_intan_rhd_header(rhd_path)
+        except Exception as exc:
+            print(f"Warning: failed to parse info.rhd ({rhd_path}): {exc}")
 
     # Neurocode-compatible behavior: use XML-derived amplifier metadata.
     effective_sr = float(xml_meta.sr)
     effective_n_channels = int(xml_meta.n_channels)
     analog_sr = effective_sr
     digital_sr = effective_sr
+    if intan_header is not None:
+        analog_sr = float(intan_header.board_adc_sample_rate)
+        digital_sr = float(intan_header.board_dig_in_sample_rate)
 
     amplifier_paths = discover_subsessions(
         basepath=basepath,
@@ -60,7 +72,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         amplifier_paths=amplifier_paths,
         n_amplifier_channels=effective_n_channels,
         dtype=config.dtype,
-        intan_header=None,
+        intan_header=intan_header,
     )
     print_catalog_summary(catalog)
 
@@ -207,9 +219,19 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         analog_inputs=config.analog_inputs,
         analog_channels=config.analog_channels,
         analog_num_channels=analog_num_channels,
+        analog_active_channels_1based=(
+            [int(ch) + 1 for ch in catalog.board_adc_native_orders]
+            if catalog.board_adc_native_orders
+            else None
+        ),
         digital_inputs=config.digital_inputs,
         digital_channels=config.digital_channels,
         digital_word_channels=digital_word_channels,
+        digital_active_channels_1based=(
+            [int(ch) + 1 for ch in catalog.board_digital_input_native_orders]
+            if catalog.board_digital_input_native_orders
+            else None
+        ),
         sr=effective_sr,
         analog_sr=analog_sr,
         digital_sr=digital_sr,

@@ -696,6 +696,7 @@ def build_acquisition_catalog(
     aux_ch = _infer_channels_from_file(auxiliary_paths[0], sample_counts[0]) if auxiliary_paths else 0
     supply_ch = _infer_channels_from_file(supply_paths[0], sample_counts[0]) if supply_paths else 0
     adc_ch = _infer_channels_from_file(analogin_paths[0], sample_counts[0]) if analogin_paths else 0
+    adc_native_orders: list[int] = []
 
     if intan_header is not None:
         if intan_header.num_aux_input_channels > 0:
@@ -704,9 +705,14 @@ def build_acquisition_catalog(
             supply_ch = int(intan_header.num_supply_voltage_channels)
         if intan_header.num_board_adc_channels > 0:
             adc_ch = int(intan_header.num_board_adc_channels)
+        if intan_header.board_adc_native_orders:
+            adc_native_orders = [int(ch) for ch in intan_header.board_adc_native_orders]
+    if not adc_native_orders and adc_ch > 0:
+        adc_native_orders = list(range(int(adc_ch)))
 
     dig_ch = 0
     dig_word_ch = 0
+    dig_native_orders: list[int] = []
     if digitalin_paths:
         raw_words = _infer_channels_from_file(digitalin_paths[0], sample_counts[0])
         dig_word_ch = raw_words if raw_words > 0 else 1
@@ -716,11 +722,15 @@ def build_acquisition_catalog(
             dig_ch = int(intan_header.num_board_dig_in_channels)
             if dig_word_ch <= 0:
                 dig_word_ch = 1
+        if intan_header.board_dig_in_native_orders:
+            dig_native_orders = [int(ch) for ch in intan_header.board_dig_in_native_orders]
         board_dig_out_ch = int(intan_header.num_board_dig_out_channels)
         temp_sensor_ch = int(intan_header.num_temp_sensor_channels)
     else:
         board_dig_out_ch = 0
         temp_sensor_ch = 0
+    if not dig_native_orders and dig_ch > 0:
+        dig_native_orders = list(range(int(dig_ch)))
 
     return AcquisitionCatalog(
         subsession_names=[p.parent.name for p in amplifier_paths],
@@ -739,6 +749,8 @@ def build_acquisition_catalog(
         board_digital_word_channels=dig_word_ch,
         board_digital_output_channels=board_dig_out_ch,
         temperature_sensor_channels=temp_sensor_ch,
+        board_adc_native_orders=adc_native_orders,
+        board_digital_input_native_orders=dig_native_orders,
     )
 
 
