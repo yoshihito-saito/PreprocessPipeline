@@ -254,10 +254,12 @@ def _int_to_idx(ints: dict[str, np.ndarray], statenames: list[str], sf: float = 
             continue
         arr = np.asarray(ints.get(f"{name}state", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
         for start, stop in arr:
-            s = max(0, int(np.rint(start * sf)))
-            e = min(max_t - 1, int(np.rint(stop * sf)))
-            if e >= s:
-                states[s : e + 1] = np.uint8(state_id)
+            # MATLAB bz_INTtoIDX behavior:
+            # stateints = round(INT*sf); stateints(stateints==0)=1; IDX(stateints(1):stateints(2))=state_id
+            s1 = max(1, int(np.rint(start * sf)))
+            e1 = min(max_t, int(np.rint(stop * sf)))
+            if e1 >= s1:
+                states[s1 - 1 : e1] = np.uint8(state_id)
     timestamps = np.arange(1, max_t + 1, dtype=np.float64) / float(sf)
     return {
         "states": states,
@@ -451,7 +453,18 @@ def _normtoint_modz(data: np.ndarray) -> np.ndarray:
 
 def _matlab_smooth(x: np.ndarray, window: float) -> np.ndarray:
     win = max(1, int(np.rint(float(window))))
-    return _moving_average(np.asarray(x, dtype=np.float64).reshape(-1), win)
+    arr = np.asarray(x, dtype=np.float64).reshape(-1)
+    if arr.size == 0 or win <= 1:
+        return arr
+    win = max(1, min(win, arr.size))
+    kernel = np.ones(win, dtype=np.float64)
+    finite = np.isfinite(arr)
+    num = np.convolve(np.where(finite, arr, 0.0), kernel, mode="same")
+    den = np.convolve(finite.astype(np.float64), kernel, mode="same")
+    out = np.full_like(arr, np.nan, dtype=np.float64)
+    valid = den > 0
+    out[valid] = num[valid] / den[valid]
+    return out
 
 
 def _hist_counts_centers(x: np.ndarray, bins: int) -> tuple[np.ndarray, np.ndarray]:
@@ -635,33 +648,6 @@ def _hartigans_dip_statistic(xpdf: np.ndarray) -> float:
             high = int(lcm[ih])
 
     return 0.5 * float(dip)
-
-
-def _find_hist_dip_threshold(hist: np.ndarray, centers: np.ndarray) -> float:
-    hh = np.asarray(hist, dtype=np.float64).reshape(-1)
-    cc = np.asarray(centers, dtype=np.float64).reshape(-1)
-    if hh.size == 0 or cc.size == 0:
-        return 0.5
-    peaks, props = signal.find_peaks(hh)
-    if peaks.size < 2:
-        return float(np.nanmedian(cc))
-    heights = props.get("peak_heights")
-    if heights is None:
-        heights = hh[peaks]
-    order = np.argsort(heights)[-2:]
-    locs = np.sort(peaks[order])
-    left = int(locs[0])
-    right = int(locs[1])
-    if right <= left:
-        return float(cc[left])
-    seg = -hh[left : right + 1]
-    dip_peaks, _ = signal.find_peaks(seg)
-    if dip_peaks.size == 0:
-        dip_idx = left + int(np.argmin(hh[left : right + 1]))
-    else:
-        dip_idx = left + int(dip_peaks[np.argmax(seg[dip_peaks])])
-    dip_idx = int(np.clip(dip_idx, 0, cc.size - 1))
-    return float(cc[dip_idx])
 
 
 def _find_peak_locs_for_threshold(
@@ -1588,6 +1574,7 @@ def _compute_sleep_state(
     th_channels_1based: np.ndarray | None,
     state_ignore_manual: bool,
     state_save_lfp_mat: bool,
+    emg_th_alpha: float,
     min_state_length: float,
     block_wake_to_rem: bool,
     overwrite: bool,
@@ -1732,6 +1719,7 @@ def _compute_sleep_state(
         numpeaks = int(emg_locs.size)
         numbins += 1
     emgthresh = _find_hist_dip_threshold_between(emghist, emghistbins, emg_locs)
+    emgthresh = float(np.clip(emgthresh * float(emg_th_alpha), 0.0, 1.0))
     mov_times = (broadband < swthresh) & (emg_interp > emgthresh)
 
     numpeaks = 1
@@ -1766,19 +1754,20 @@ def _compute_sleep_state(
     states[nrem] = 3
     states[rem] = 5
 
-    idx_struct = {
-        "states": states.reshape(-1, 1),
-        "timestamps": np.rint(t_clus).astype(_safe_uint_dtype(int(np.max(t_clus)) if t_clus.size else 0), copy=False).reshape(-1, 1),
-        "statenames": np.asarray(["WAKE", "", "NREM", "", "REM"], dtype=object).reshape(1, -1),
-    }
+    statename_list = ["WAKE", "", "NREM", "", "REM"]
+    ints = _idx_to_int(states=states, timestamps=t_clus, statenames=statename_list)
+    idx_round = _int_to_idx(ints=ints, statenames=statename_list, sf=1.0)
+    states = np.asarray(idx_round["states"], dtype=np.uint8).reshape(-1)
+    idx_timestamps = np.asarray(idx_round["timestamps"], dtype=np.float64).reshape(-1)
+
     min_len = float(max(0.0, min_state_length))
     if block_wake_to_rem:
         states = _suppress_wake_to_rem_transitions(
             states,
-            t_clus,
+            idx_timestamps,
             min_wake_before_rem_secs=min_len,
         )
-    ints = _idx_to_int(states=states, timestamps=t_clus, statenames=["WAKE", "", "NREM", "", "REM"])
+    ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
 
     # Minimum interruption passes (approximation of ClusterStates_DetermineStates)
     min_sws = min_len
@@ -1795,10 +1784,10 @@ def _compute_sleep_state(
     short_nrem = (nrem_int[:, 1] - nrem_int[:, 0]) <= min_sws if nrem_int.size else np.asarray([], dtype=bool)
     if short_nrem.size and np.any(short_nrem):
         for st, en in nrem_int[short_nrem]:
-            m = (t_clus >= st) & (t_clus <= en)
+            m = (idx_timestamps >= st) & (idx_timestamps <= en)
             states[m] = 1
 
-    ints = _idx_to_int(states=states, timestamps=t_clus, statenames=["WAKE", "", "NREM", "", "REM"])
+    ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
     wake_int = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
     rem_int = np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
 
@@ -1807,10 +1796,10 @@ def _compute_sleep_state(
     wr, rw = _find_next_to_ints(wake_int, rem_int)
     if short_w.size and np.any(short_w & (wr | rw)):
         for st, en in wake_int[short_w & (wr | rw)]:
-            m = (t_clus >= st) & (t_clus <= en)
+            m = (idx_timestamps >= st) & (idx_timestamps <= en)
             states[m] = 5
 
-    ints = _idx_to_int(states=states, timestamps=t_clus, statenames=["WAKE", "", "NREM", "", "REM"])
+    ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
     rem_int = np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
     wake_int = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
 
@@ -1819,41 +1808,41 @@ def _compute_sleep_state(
     rr, rl = _find_next_to_ints(rem_int, wake_int)
     if short_r.size and np.any(short_r & (rr & rl)):
         for st, en in rem_int[short_r & (rr & rl)]:
-            m = (t_clus >= st) & (t_clus <= en)
+            m = (idx_timestamps >= st) & (idx_timestamps <= en)
             states[m] = 1
 
-    ints = _idx_to_int(states=states, timestamps=t_clus, statenames=["WAKE", "", "NREM", "", "REM"])
+    ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
     rem_int = np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
     short_r2 = (rem_int[:, 1] - rem_int[:, 0]) <= min_rem if rem_int.size else np.asarray([], dtype=bool)
     if short_r2.size and np.any(short_r2):
         for st, en in rem_int[short_r2]:
-            m = (t_clus >= st) & (t_clus <= en)
+            m = (idx_timestamps >= st) & (idx_timestamps <= en)
             states[m] = 1
 
-    ints = _idx_to_int(states=states, timestamps=t_clus, statenames=["WAKE", "", "NREM", "", "REM"])
+    ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
     wake_int = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
     nrem_int = np.asarray(ints.get("NREMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
     short_w2 = (wake_int[:, 1] - wake_int[:, 0]) <= min_wake if wake_int.size else np.asarray([], dtype=bool)
     wn, nw = _find_next_to_ints(wake_int, nrem_int)
     if short_w2.size and np.any(short_w2 & (wn | nw)):
         for st, en in wake_int[short_w2 & (wn | nw)]:
-            m = (t_clus >= st) & (t_clus <= en)
+            m = (idx_timestamps >= st) & (idx_timestamps <= en)
             states[m] = 3
 
-    ints = _idx_to_int(states=states, timestamps=t_clus, statenames=["WAKE", "", "NREM", "", "REM"])
+    ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
     nrem_int = np.asarray(ints.get("NREMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
     short_nrem2 = (nrem_int[:, 1] - nrem_int[:, 0]) <= min_sws if nrem_int.size else np.asarray([], dtype=bool)
     if short_nrem2.size and np.any(short_nrem2):
         for st, en in nrem_int[short_nrem2]:
-            m = (t_clus >= st) & (t_clus <= en)
+            m = (idx_timestamps >= st) & (idx_timestamps <= en)
             states[m] = 1
 
-    ints = _idx_to_int(states=states, timestamps=t_clus, statenames=["WAKE", "", "NREM", "", "REM"])
+    ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
 
-    statenames = np.asarray(["WAKE", "", "NREM", "", "REM"], dtype=object).reshape(1, -1)
+    statenames = np.asarray(statename_list, dtype=object).reshape(1, -1)
     idx_struct = {
         "states": states.astype(np.uint8, copy=False).reshape(-1, 1),
-        "timestamps": _to_uint_vector(np.rint(t_clus)).reshape(-1, 1),
+        "timestamps": _to_uint_vector(np.rint(idx_timestamps)).reshape(-1, 1),
         "statenames": statenames,
     }
     ints_struct = {
@@ -1908,6 +1897,7 @@ def _compute_sleep_state(
         "ignoreManual": bool(state_ignore_manual),
         "ignoretime": np.asarray(ignoretime, dtype=np.float64).reshape(-1, 2) if np.asarray(ignoretime).size else np.empty((0,), dtype=np.uint8),
         "noPrompts": True,
+        "EMGthAlpha": float(emg_th_alpha),
         "Notch60Hz": np.uint8(0),
         "NotchHVS": np.uint8(0),
         "NotchTheta": np.uint8(0),
@@ -2108,9 +2098,9 @@ def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, An
     plt.close(fig)
 
     # Figure 2: SSCluster2D
-    fig = plt.figure(figsize=(10, 9))
+    fig = plt.figure(figsize=(10, 10.5))
     # 6-row grid lets the right column use two equal-height panels (3 rows each).
-    gs = fig.add_gridspec(6, 2, wspace=0.35, hspace=0.55)
+    gs = fig.add_gridspec(6, 2, wspace=0.35, hspace=0.9)
     ax11 = fig.add_subplot(gs[0:2, 0])
     ax21 = fig.add_subplot(gs[2:4, 0])
     ax31 = fig.add_subplot(gs[4:6, 0])
@@ -2119,7 +2109,7 @@ def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, An
 
     def _bar_split(ax, bins, vals, thr, c_hi, c_lo, title, xlabel):
         if bins.size == 0 or vals.size == 0:
-            ax.set_title(title)
+            ax.set_title(title, pad=10.0)
             ax.set_xlabel(xlabel)
             return
         bw = float(np.median(np.diff(bins))) if bins.size > 1 else 0.05
@@ -2128,7 +2118,7 @@ def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, An
         ax.bar(bins[hi], vals[hi], color=c_hi, width=bw * 0.9, linewidth=0.8)
         ax.bar(bins[lo], vals[lo], color=c_lo, width=bw * 0.9, linewidth=0.8)
         ax.plot([thr, thr], [0, float(np.nanmax(vals) if vals.size else 1.0)], "r", linewidth=1.0)
-        ax.set_title(title)
+        ax.set_title(title, pad=10.0)
         ax.set_xlabel(xlabel)
 
     _bar_split(ax11, sw_bins, sw_hist, sw_thr, "b", (0.9, 0.9, 0.9), "Step 1: Broadband for NREM", "Broadband Slow Wave")
@@ -2139,7 +2129,7 @@ def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, An
         ax31.bar(th_bins[hi], th_hist[hi], color="r", width=bw * 0.9, linewidth=0.8)
         ax31.bar(th_bins[~hi], th_hist[~hi], color="k", width=bw * 0.9, linewidth=0.8)
         ax31.plot([th_thr, th_thr], [0, float(np.nanmax(th_hist) if th_hist.size else 1.0)], "r", linewidth=1.0)
-    ax31.set_title("Step 3: Theta for REM")
+    ax31.set_title("Step 3: Theta for REM", pad=10.0)
     ax31.set_xlabel("Theta")
 
     # MATLAB-like state coloring for 2D split panels
@@ -2409,6 +2399,7 @@ def run_state_scoring(
         th_channels_1based=th_channels_1based,
         state_ignore_manual=config.state_ignore_manual,
         state_save_lfp_mat=config.state_save_lfp_mat,
+        emg_th_alpha=float(config.emg_th_alpha),
         min_state_length=float(config.state_min_state_length),
         block_wake_to_rem=bool(config.state_block_wake_to_rem),
         overwrite=config.overwrite,
