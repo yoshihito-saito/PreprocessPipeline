@@ -29,7 +29,7 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
 - [x] Bad-channel handling (sorting target channels and output channel maps)
 - [ ] Artifact removal (`cleanArtifacts`, pulse-based cleaning)
 - [ ] Denoise (`removeNoise`)
-- [ ] State scoring
+- [x] State scoring
 - [ ] Spike sorting
 - [ ] Acceleration extraction (`getAcceleration` / `computeIntanAccel`)
 - [ ] Tracking/DLC (`getPos`, `path_to_dlc_bat_file`, `general_behavior_file`)
