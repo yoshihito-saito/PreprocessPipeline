@@ -5,8 +5,8 @@ freq_min: 500
 freq_max: 8000
 ntbuff: 64
 Nfilt: null
-NT: 32*1024+ntbuff
-wave_length: 61
+NT: 32*1028+ntbuff
+wave_length: 32
 delete_tmp_files:
 - matlab_files
 delete_recording_dat: false

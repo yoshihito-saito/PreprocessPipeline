@@ -118,7 +118,15 @@ def _build_spike_sorting_entry(
 
 
 def _first_kilosort_folder(basepath: Path) -> Path | None:
-    kilo_folders = sorted([p for p in basepath.glob("Kilosort_*") if p.is_dir()], key=lambda p: p.name)
+    kilo_folders = sorted(
+        [
+            p
+            for pattern in ("Kilosort_*", "Kilosort4_*")
+            for p in basepath.glob(pattern)
+            if p.is_dir()
+        ],
+        key=lambda p: p.name,
+    )
     if kilo_folders:
         return kilo_folders[0]
     return None

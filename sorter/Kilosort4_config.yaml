@@ -1,0 +1,40 @@
+# Kilosort4 core parameters (restored from original tuned config)
+nt: 41
+nblocks: 0
+batch_size: 120000
+Th_single_ch: 4
+Th_universal: 8
+Th_learned: 8
+max_peels: 150
+nearest_templates: 150
+n_templates: 6
+dmin: 20
+dminx: 32
+nearest_chans: 16
+max_channel_distance: 160
+x_centers: 8
+whitening_range: 32
+highpass_cutoff: 500
+
+# Wrapper / runtime options
+do_CAR: false
+acg_threshold: 0.5
+ccg_threshold: 0.0
+delete_recording_dat: false
+clear_cache: true
+
+# Auto-derive geometry-related params from attached probe (Probe/ProbeGroup)
+auto_geom_from_probe: true
+auto_geom_nearest_chans_target: 16
+auto_geom_whitening_range_target: 32
+auto_geom_max_channel_distance_factor: 1.25
+auto_geom_gap_factor: 2.5
+auto_geom_max_xcenters_cap: 12
+
+# SpikeInterface job kwargs (can be overridden by PreprocessConfig.job_kwargs)
+n_jobs: -1
+chunk_duration: 1s
+progress_bar: true
+pool_engine: process
+mp_context: null
+max_threads_per_worker: 1

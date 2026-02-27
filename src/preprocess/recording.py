@@ -288,6 +288,22 @@ def attach_probe_and_remove_bad_channels(
     return recording_with_probe, bad_0, bad_1
 
 
+def select_recording_channels(recording: Any, channel_ids: list[int]) -> Any:
+    if hasattr(recording, "channel_slice"):
+        return recording.channel_slice(channel_ids=channel_ids)
+    if hasattr(recording, "select_channels"):
+        return recording.select_channels(channel_ids=channel_ids)
+    if hasattr(recording, "remove_channels") and hasattr(recording, "get_channel_ids"):
+        existing = [int(ch) for ch in recording.get_channel_ids()]
+        keep = {int(ch) for ch in channel_ids}
+        remove = [ch for ch in existing if ch not in keep]
+        return recording.remove_channels(channel_ids=remove)
+    raise AttributeError(
+        "Recording object does not support channel slicing APIs "
+        "(channel_slice/select_channels/remove_channels)."
+    )
+
+
 def apply_preprocessing(
     recording_raw: Any,
     bandpass_min_hz: float,
@@ -322,6 +338,68 @@ def apply_preprocessing(
         rec_ref = spre.common_reference(rec_f, reference="global", operator="median")
 
     return rec_ref
+
+
+def preprocess_selected_channels_preserve_shape(
+    *,
+    recording_raw: Any,
+    selected_channel_ids: list[int],
+    bandpass_min_hz: float,
+    bandpass_max_hz: float,
+    reference: str,
+    local_radius_um: tuple[float, float],
+) -> Any:
+    all_channel_ids = list(recording_raw.get_channel_ids())
+    if not all_channel_ids:
+        return recording_raw
+
+    selected_set = {int(ch) for ch in selected_channel_ids}
+    selected_ids_in_order = [ch for ch in all_channel_ids if int(ch) in selected_set]
+    if not selected_ids_in_order:
+        return recording_raw
+
+    rec_selected = select_recording_channels(recording_raw, selected_ids_in_order)
+    rec_selected_pre = apply_preprocessing(
+        recording_raw=rec_selected,
+        bandpass_min_hz=bandpass_min_hz,
+        bandpass_max_hz=bandpass_max_hz,
+        reference=reference,
+        local_radius_um=local_radius_um,
+    )
+
+    bypass_ids = [ch for ch in all_channel_ids if int(ch) not in selected_set]
+    if not bypass_ids:
+        return rec_selected_pre
+
+    # Build channel runs in original order and aggregate run-by-run.
+    # This avoids re-slicing ChannelsAggregationRecording with interleaved
+    # integer channel ids, which can reorder channels in some SI code paths.
+    run_recordings: list[Any] = []
+    run_ids: list[int] = []
+    run_is_selected: bool | None = None
+
+    def _flush_run() -> None:
+        nonlocal run_ids, run_is_selected
+        if not run_ids:
+            return
+        src = rec_selected_pre if bool(run_is_selected) else recording_raw
+        run_recordings.append(select_recording_channels(src, run_ids))
+        run_ids = []
+
+    for ch in all_channel_ids:
+        ch_selected = int(ch) in selected_set
+        if run_is_selected is None:
+            run_is_selected = ch_selected
+        elif ch_selected != run_is_selected:
+            _flush_run()
+            run_is_selected = ch_selected
+        run_ids.append(ch)
+
+    _flush_run()
+
+    if len(run_recordings) == 1:
+        return run_recordings[0]
+    return si.aggregate_channels(run_recordings)
 
 
 def write_lfp(

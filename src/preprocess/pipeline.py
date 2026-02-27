@@ -3,7 +3,6 @@
 from datetime import datetime
 from pathlib import Path
 
-import spikeinterface.extractors as se
 from scipy.io import loadmat
 
 from .events import export_analog_digital_events, materialize_intermediate_dat
@@ -22,10 +21,10 @@ from .io import (
 from .intan_rhd import read_intan_rhd_header
 from .mergepoints import compute_mergepoints, save_mergepoints_events_mat
 from .recording import (
-    apply_preprocessing,
     attach_probe_and_remove_bad_channels,
     concatenate_recordings_si,
     load_subsession_recordings,
+    preprocess_selected_channels_preserve_shape,
     write_concatenated_dat_analogin,
     write_concatenated_dat_digitalin,
     write_concatenated_dat,
@@ -35,6 +34,15 @@ from .session import build_session_struct, save_session_mat
 from .metafile import PreprocessConfig, PreprocessResult
 from .sorter_runner import execute_sorting_job
 from .state_scoring import run_state_scoring
+
+
+def _sorter_output_prefix(sorter_name: str) -> str:
+    sorter_normalized = sorter_name.strip().lower()
+    if sorter_normalized == "kilosort":
+        return "Kilosort"
+    if sorter_normalized == "kilosort4":
+        return "Kilosort4"
+    return sorter_name[:1].upper() + sorter_name[1:].lower()
 
 
 def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
@@ -88,21 +96,12 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     )
     recording_concat = concatenate_recordings_si(recordings)
 
-    dat_path: Path | None = None
+    raw_dat_path: Path | None = None
     if config.save_raw:
-        dat_path = output_dir / f"{basename}.dat"
+        raw_dat_path = output_dir / f"{basename}_raw.dat"
         write_concatenated_dat(
             recording=recording_concat,
-            output_dat_path=dat_path,
-            overwrite=config.overwrite,
-            job_kwargs=config.job_kwargs,
-        )
-
-    if config.sorter and dat_path is None:
-        dat_path = output_dir / f"{basename}.dat"
-        write_concatenated_dat(
-            recording=recording_concat,
-            output_dat_path=dat_path,
+            output_dat_path=raw_dat_path,
             overwrite=config.overwrite,
             job_kwargs=config.job_kwargs,
         )
@@ -117,17 +116,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     mergepoints_path = output_dir / f"{basename}.MergePoints.events.mat"
     save_mergepoints_events_mat(mergepoints_path, merge_data)
 
-    if dat_path is not None:
-        recording_base = se.read_binary(
-            str(dat_path),
-            sampling_frequency=effective_sr,
-            dtype=config.dtype,
-            num_channels=effective_n_channels,
-            gain_to_uV=config.gain_to_uV,
-            offset_to_uV=config.offset_to_uV,
-        )
-    else:
-        recording_base = recording_concat
+    recording_base = recording_concat
 
     recording_raw, bad_0, bad_1 = attach_probe_and_remove_bad_channels(
         recording=recording_base,
@@ -135,14 +124,28 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         reject_channels_0based=sorted(set(config.reject_channels + xml_meta.skipped_channels_0based)),
     )
 
+    good_channels_0based = [
+        int(ch)
+        for ch in recording_raw.get_channel_ids()
+        if int(ch) not in set(bad_0)
+    ]
+    recording_preprocessed = recording_raw
     if config.do_preprocess:
-        _ = apply_preprocessing(
+        recording_preprocessed = preprocess_selected_channels_preserve_shape(
             recording_raw=recording_raw,
+            selected_channel_ids=good_channels_0based,
             bandpass_min_hz=config.bandpass_min_hz,
             bandpass_max_hz=config.bandpass_max_hz,
             reference=config.reference,
             local_radius_um=config.local_radius_um,
         )
+    dat_path: Path | None = output_dir / f"{basename}.dat"
+    write_concatenated_dat(
+        recording=recording_preprocessed,
+        output_dat_path=dat_path,
+        overwrite=config.overwrite,
+        job_kwargs=config.job_kwargs,
+    )
 
     lfp_path: Path | None = None
     if config.make_lfp:
@@ -243,14 +246,12 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         overwrite=config.overwrite,
     )
 
-    session_dat_path = dat_path if dat_path is not None else output_dir / f"{basename}.dat"
+    session_dat_path = output_dir / f"{basename}.dat"
     if not session_dat_path.exists():
         raise FileNotFoundError(
             "neurocode_strict session generation requires concatenated dat. "
             "Enable save_raw or sorter, or ensure basename.dat exists in output_dir."
         )
-    if dat_path is None:
-        dat_path = session_dat_path
 
     session_struct = build_session_struct(
         source_basepath=basepath,
@@ -309,8 +310,13 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
 
     sorter_output_dir: Path | None = None
     if config.sorter:
+        sorter_dat_path = output_dir / f"{basename}.dat"
+        sorter_preprocess_for_sorting = False
+        sorter_input_is_preprocessed = bool(config.do_preprocess)
+        sorter_exclude_channels_0based = None if sorter_input_is_preprocessed else bad_0
+
         sorter_label = str(config.sorter).strip()
-        sorter_name_for_folder = sorter_label[:1].upper() + sorter_label[1:].lower()
+        sorter_name_for_folder = _sorter_output_prefix(sorter_label)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         sorter_output_dir = output_dir / f"{sorter_name_for_folder}_{timestamp}"
         if sorter_output_dir.exists():
@@ -323,16 +329,22 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
                 suffix += 1
         _ = execute_sorting_job(
             sorter=config.sorter,
-            dat_path=dat_path if dat_path is not None else (output_dir / f"{basename}.dat"),
+            dat_path=sorter_dat_path,
             xml_path=xml_path,
             output_folder=sorter_output_dir,
             config_path=config.sorter_config_path,
             kilosort1_path=config.sorter_path,
             matlab_path=config.matlab_path,
             chanmap_mat_path=config.chanmap_mat_path,
-            exclude_channels_0based=bad_0,
+            exclude_channels_0based=sorter_exclude_channels_0based,
             job_kwargs=config.job_kwargs,
             remove_existing_folder=config.overwrite,
+            preprocess_for_sorting=sorter_preprocess_for_sorting,
+            input_is_preprocessed=sorter_input_is_preprocessed,
+            bandpass_min_hz=config.bandpass_min_hz,
+            bandpass_max_hz=config.bandpass_max_hz,
+            reference=config.reference,
+            local_radius_um=config.local_radius_um,
         )
 
     result = PreprocessResult(

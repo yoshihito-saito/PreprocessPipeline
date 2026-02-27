@@ -26,6 +26,19 @@ from ..preprocess.recording import (
 from .metafile import PostprocessConfig, PostprocessResult
 
 
+def _find_sorting_output_dirs(root: Path) -> list[Path]:
+    return sorted(
+        [
+            p
+            for pattern in ("Kilosort_*", "Kilosort4_*")
+            for p in root.glob(pattern)
+            if p.is_dir()
+        ],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
 def _safe_rmtree(path: Path, *, retries: int = 3, delay: float = 1.0) -> None:
     """shutil.rmtree with retry for Windows memory-mapped file locks."""
     for attempt in range(retries):
@@ -465,11 +478,7 @@ def attach_existing_sorting_result(
         sorting_dir = Path(existing_sorting_dir)
     else:
         root = Path(sorting_temp_root) if sorting_temp_root is not None else (Path("sorting_temp") / result.basename)
-        candidates = sorted(
-            [p for p in root.glob("Kilosort_*") if p.is_dir()],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
+        candidates = _find_sorting_output_dirs(root)
         if not candidates:
             raise FileNotFoundError(f"No sorting result found under {root}.")
         sorting_dir = candidates[0]
@@ -527,7 +536,9 @@ def run_postprocess_from_preprocess(
     if result.sorter_output_dir is None:
         raise RuntimeError("No sorter output found in result.sorter_output_dir")
 
-    sorting_phy_folder = Path(result.sorter_output_dir) / "sorter_output"
+    sorting_root = Path(result.sorter_output_dir)
+    sorter_output_subdir = sorting_root / "sorter_output"
+    sorting_phy_folder = sorter_output_subdir if sorter_output_subdir.exists() else sorting_root
     use_recording_object = recording is not None
 
     post_cfg = PostprocessConfig(

@@ -16,7 +16,7 @@ from scipy.io import loadmat
 from spikeinterface.core.job_tools import job_keys as _SI_JOB_KEYS
 
 from .io import load_xml_metadata
-from .recording import attach_probe_from_chanmap
+from .recording import apply_preprocessing, attach_probe_from_chanmap, select_recording_channels
 
 
 _SORTER_ALIASES = {
@@ -51,6 +51,13 @@ _KILOSORT1_FLOAT_VECTOR_PARAMS = {
 }
 
 _KILOSORT1_ALLOWED_PARAM_KEYS: set[str] | None = None
+_KILOSORT4_ALLOWED_PARAM_KEYS: set[str] | None = None
+_KILOSORT4_BOOL_PARAMS = {
+    "do_CAR",
+    "clear_cache",
+    "delete_recording_dat",
+    "progress_bar",
+}
 _JOB_KWARG_KEYS = set(_SI_JOB_KEYS)
 
 
@@ -324,6 +331,18 @@ def _get_kilosort1_allowed_param_keys() -> set[str]:
     return keys
 
 
+def _get_kilosort4_allowed_param_keys() -> set[str]:
+    global _KILOSORT4_ALLOWED_PARAM_KEYS
+    if _KILOSORT4_ALLOWED_PARAM_KEYS is not None:
+        return _KILOSORT4_ALLOWED_PARAM_KEYS
+    try:
+        keys = set(ss.Kilosort4Sorter.default_params().keys()).union(_JOB_KWARG_KEYS)
+    except Exception:
+        keys = set()
+    _KILOSORT4_ALLOWED_PARAM_KEYS = keys
+    return keys
+
+
 def _get_active_channel_count(chanmap_mat_path: Path | None, num_channels: int) -> int:
     if chanmap_mat_path is None or not chanmap_mat_path.exists():
         return int(num_channels)
@@ -398,6 +417,207 @@ def _normalize_kilosort_params(
         normalized = {k: v for k, v in normalized.items() if k in allowed_keys}
 
     return normalized
+
+
+def _normalize_kilosort4_params(params: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(params)
+
+    for key in _KILOSORT4_BOOL_PARAMS:
+        if key in normalized:
+            normalized[key] = _coerce_bool(normalized[key])
+
+    allowed_keys = _get_kilosort4_allowed_param_keys()
+    if allowed_keys:
+        dropped = sorted(k for k in normalized.keys() if k not in allowed_keys)
+        if dropped:
+            print("Dropped unsupported Kilosort4 params: " + ", ".join(dropped))
+        normalized = {k: v for k, v in normalized.items() if k in allowed_keys}
+    return normalized
+
+
+def _pop_kilosort4_auto_geom_options(
+    params: dict[str, Any],
+) -> tuple[dict[str, Any], bool, dict[str, Any]]:
+    cleaned = dict(params)
+    enabled = _coerce_bool(cleaned.pop("auto_geom_from_probe", False))
+    options = {
+        "nearest_chans_target": int(float(cleaned.pop("auto_geom_nearest_chans_target", 16))),
+        "whitening_range_target": int(float(cleaned.pop("auto_geom_whitening_range_target", 32))),
+        "max_channel_distance_factor": float(cleaned.pop("auto_geom_max_channel_distance_factor", 1.25)),
+        "gap_factor": float(cleaned.pop("auto_geom_gap_factor", 2.5)),
+        "max_xcenters_cap": int(float(cleaned.pop("auto_geom_max_xcenters_cap", 12))),
+    }
+    return cleaned, enabled, options
+
+
+def _collect_probe_contact_positions(probe_like: Any) -> np.ndarray:
+    positions: list[np.ndarray] = []
+    if hasattr(probe_like, "probes"):
+        probes = getattr(probe_like, "probes")
+        for probe in probes:
+            pos = np.asarray(getattr(probe, "contact_positions", []), dtype=float)
+            if pos.ndim == 2 and pos.shape[0] > 0 and pos.shape[1] >= 2:
+                positions.append(pos[:, :2])
+    else:
+        pos = np.asarray(getattr(probe_like, "contact_positions", []), dtype=float)
+        if pos.ndim == 2 and pos.shape[0] > 0 and pos.shape[1] >= 2:
+            positions.append(pos[:, :2])
+    if not positions:
+        return np.zeros((0, 2), dtype=float)
+    return np.vstack(positions)
+
+
+def auto_geom_params_from_probe(
+    probe: Any,
+    *,
+    nearest_chans_target: int = 16,
+    whitening_range_target: int = 32,
+    max_channel_distance_factor: float = 1.25,
+    gap_factor: float = 2.5,
+    max_xcenters_cap: int = 12,
+) -> dict[str, Any]:
+    """
+    Derive Kilosort4 geometry parameters from probe contact positions.
+    Works for Probe and ProbeGroup-like objects exposing contact positions.
+    """
+    pos = _collect_probe_contact_positions(probe)
+    if pos.shape[0] == 0:
+        return {}
+
+    n_ch = int(pos.shape[0])
+    if n_ch == 1:
+        return {
+            "dmin": None,
+            "dminx": 32.0,
+            "max_channel_distance": 20.0,
+            "x_centers": None,
+            "nearest_chans": 1,
+            "whitening_range": 1,
+        }
+
+    try:
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(pos)
+        dists, _ = tree.query(pos, k=2)
+        nn = np.asarray(dists[:, 1], dtype=float)
+    except Exception:
+        diff = pos[:, None, :] - pos[None, :, :]
+        D = np.sqrt(np.sum(diff**2, axis=-1))
+        np.fill_diagonal(D, np.inf)
+        nn = np.asarray(D.min(axis=1), dtype=float)
+
+    finite_nn = nn[np.isfinite(nn) & (nn > 0)]
+    nn_med_raw = float(np.median(finite_nn)) if finite_nn.size > 0 else 20.0
+
+    if nn_med_raw < 1e-3:
+        scale = 1e6
+    elif nn_med_raw < 1.0:
+        scale = 1e3
+    else:
+        scale = 1.0
+
+    pos = pos * scale
+    x = pos[:, 0]
+    y = pos[:, 1]
+    nn_med = nn_med_raw * scale
+
+    r = 1.6 * nn_med
+    try:
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(pos)
+        neighbors = tree.query_ball_point(pos, r=r)
+    except Exception:
+        diff = pos[:, None, :] - pos[None, :, :]
+        D = np.sqrt(np.sum(diff**2, axis=-1))
+        neighbors = [list(np.where(D[i] <= r)[0]) for i in range(n_ch)]
+
+    visited = np.zeros(n_ch, dtype=bool)
+    comps: list[np.ndarray] = []
+    for i in range(n_ch):
+        if visited[i]:
+            continue
+        stack = [i]
+        visited[i] = True
+        comp = []
+        while stack:
+            u = int(stack.pop())
+            comp.append(u)
+            for v in neighbors[u]:
+                vv = int(v)
+                if not visited[vv]:
+                    visited[vv] = True
+                    stack.append(vv)
+        comps.append(np.asarray(comp, dtype=int))
+
+    min_inter = np.inf
+    if len(comps) > 1:
+        centroids = np.asarray([[float(x[c].mean()), float(y[c].mean())] for c in comps], dtype=float)
+        Dc = np.sqrt(np.sum((centroids[:, None, :] - centroids[None, :, :]) ** 2, axis=-1))
+        np.fill_diagonal(Dc, np.inf)
+        min_inter = float(np.min(Dc))
+
+    xuniq = np.unique(np.round(x, 6))
+    dx = float(np.median(np.diff(np.sort(xuniq)))) if xuniq.size > 1 else 0.0
+    dminx = 32.0 if dx == 0.0 else max(16.0, dx)
+
+    max_channel_distance = max(20.0, float(max_channel_distance_factor) * nn_med)
+    if np.isfinite(min_inter):
+        max_channel_distance = min(max_channel_distance, 0.45 * min_inter)
+
+    gap_thr = max(50.0, float(gap_factor) * nn_med)
+    x_sorted = np.sort(xuniq)
+    groups: list[list[float]] = []
+    if x_sorted.size > 0:
+        cur = [float(x_sorted[0])]
+        for xv in x_sorted[1:]:
+            xvf = float(xv)
+            if (xvf - cur[-1]) <= gap_thr:
+                cur.append(xvf)
+            else:
+                groups.append(cur)
+                cur = [xvf]
+        groups.append(cur)
+
+    kx = len(groups)
+    if kx <= 1 or kx > int(max_xcenters_cap):
+        x_centers = None
+    else:
+        x_centers = int(kx)
+
+    nearest_chans = int(max(1, min(int(nearest_chans_target), n_ch)))
+    whitening_range = int(max(nearest_chans, min(int(max(1, whitening_range_target)), n_ch)))
+
+    return {
+        "dmin": None,
+        "dminx": float(dminx),
+        "max_channel_distance": float(max_channel_distance),
+        "x_centers": x_centers,
+        "nearest_chans": nearest_chans,
+        "whitening_range": whitening_range,
+    }
+
+
+def _auto_geom_params_from_recording(recording: Any, **kwargs: Any) -> dict[str, Any]:
+    probe_like: Any | None = None
+    if hasattr(recording, "get_probegroup"):
+        try:
+            probe_like = recording.get_probegroup()
+        except Exception:
+            probe_like = None
+    if probe_like is None and hasattr(recording, "get_probe"):
+        try:
+            probe_like = recording.get_probe()
+        except Exception:
+            probe_like = None
+    if probe_like is None:
+        return {}
+    try:
+        return auto_geom_params_from_probe(probe_like, **kwargs)
+    except Exception as exc:
+        print(f"Warning: failed to derive Kilosort4 geometry params from probe: {exc}")
+        return {}
 
 
 def _merge_sorter_job_kwargs(
@@ -482,15 +702,23 @@ def _resolve_active_channels_0based(
     return active
 
 
-def _patch_params_py(params_path: Path, *, dat_path: Path, n_channels_dat: int) -> None:
+def _patch_params_py(
+    params_path: Path,
+    *,
+    dat_path: Path,
+    n_channels_dat: int,
+    hp_filtered: bool | None = None,
+) -> None:
     if not params_path.exists():
         return
-    dat_literal = repr(str(dat_path))
+    dat_relative = os.path.relpath(str(dat_path), start=str(params_path.parent))
+    dat_literal = repr(str(dat_relative))
     lines = params_path.read_text(encoding="utf-8").splitlines()
 
     out_lines: list[str] = []
     dat_set = False
     nch_set = False
+    hp_set = False
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("dat_path"):
@@ -499,6 +727,9 @@ def _patch_params_py(params_path: Path, *, dat_path: Path, n_channels_dat: int) 
         elif stripped.startswith("n_channels_dat"):
             out_lines.append(f"n_channels_dat = {int(n_channels_dat)}")
             nch_set = True
+        elif stripped.startswith("hp_filtered") and hp_filtered is not None:
+            out_lines.append(f"hp_filtered = {bool(hp_filtered)}")
+            hp_set = True
         else:
             out_lines.append(line)
 
@@ -506,6 +737,8 @@ def _patch_params_py(params_path: Path, *, dat_path: Path, n_channels_dat: int) 
         out_lines.append(f"dat_path = {dat_literal}")
     if not nch_set:
         out_lines.append(f"n_channels_dat = {int(n_channels_dat)}")
+    if hp_filtered is not None and not hp_set:
+        out_lines.append(f"hp_filtered = {bool(hp_filtered)}")
 
     params_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
@@ -535,29 +768,35 @@ def _patch_phy_outputs_for_raw_dat(
     raw_dat_path: Path,
     n_channels_dat: int,
     active_channels_0based: list[int],
+    hp_filtered: bool | None = None,
 ) -> None:
     for params_path in output_folder.rglob("params.py"):
-        _patch_params_py(params_path, dat_path=raw_dat_path, n_channels_dat=n_channels_dat)
+        _patch_params_py(
+            params_path,
+            dat_path=raw_dat_path,
+            n_channels_dat=n_channels_dat,
+            hp_filtered=hp_filtered,
+        )
 
     for channel_map_name in ("channel_map.npy", "channel_map_si.npy"):
         for p in output_folder.rglob(channel_map_name):
             _patch_channel_map_npy(p, active_channels_0based)
 
 
-def _slice_recording_channels(recording: Any, channel_ids: list[int]) -> Any:
-    if hasattr(recording, "channel_slice"):
-        return recording.channel_slice(channel_ids=channel_ids)
-    if hasattr(recording, "select_channels"):
-        return recording.select_channels(channel_ids=channel_ids)
-    if hasattr(recording, "remove_channels") and hasattr(recording, "get_channel_ids"):
-        existing = [int(ch) for ch in recording.get_channel_ids()]
-        keep = {int(ch) for ch in channel_ids}
-        remove = [ch for ch in existing if ch not in keep]
-        return recording.remove_channels(channel_ids=remove)
-    raise AttributeError(
-        "Recording object does not support channel slicing APIs "
-        "(channel_slice/select_channels/remove_channels)."
-    )
+def _flatten_sorter_output_folder(output_folder: Path) -> None:
+    sorter_output = output_folder / "sorter_output"
+    if not sorter_output.exists() or not sorter_output.is_dir():
+        return
+    entries = list(sorter_output.iterdir())
+    conflicts = [output_folder / e.name for e in entries if (output_folder / e.name).exists()]
+    if conflicts:
+        conflict_list = ", ".join(str(p.name) for p in conflicts[:5])
+        raise RuntimeError(
+            f"Cannot flatten sorter_output due to existing files in {output_folder}: {conflict_list}"
+        )
+    for e in entries:
+        shutil.move(str(e), str(output_folder / e.name))
+    sorter_output.rmdir()
 
 
 def execute_sorting_job(
@@ -579,6 +818,12 @@ def execute_sorting_job(
     job_kwargs: dict[str, Any] | None = None,
     remove_existing_folder: bool = True,
     docker_image: str | None = None,
+    preprocess_for_sorting: bool = False,
+    input_is_preprocessed: bool = False,
+    bandpass_min_hz: float = 500.0,
+    bandpass_max_hz: float = 8000.0,
+    reference: str = "local",
+    local_radius_um: tuple[float, float] = (50.0, 200.0),
 ) -> Path:
     sorter_input = sorter.lower()
     if sorter_input not in _SORTER_ALIASES:
@@ -588,6 +833,8 @@ def execute_sorting_job(
         )
     sorter_name = _SORTER_ALIASES[sorter_input]
     matlab_cmd: str | None = None
+    ks4_auto_geom_enabled = False
+    ks4_auto_geom_options: dict[str, Any] = {}
     output_folder = Path(output_folder).resolve()
 
     if sorter_input == "kilosort":
@@ -629,14 +876,19 @@ def execute_sorting_job(
 
     cfg_path = (config_path or _default_sorter_config_path(sorter_input)).resolve()
     params = _load_params(cfg_path)
+    if sorter_input == "kilosort4":
+        params, ks4_auto_geom_enabled, ks4_auto_geom_options = _pop_kilosort4_auto_geom_options(params)
     print(f"Loaded sorter params: {cfg_path}")
 
     sr, nch = _resolve_sr_nch(sampling_frequency, num_channels, xml_path)
-    active_channels_0based = _resolve_active_channels_0based(
-        num_channels=nch,
-        chanmap_mat_path=Path(chanmap_mat_path) if chanmap_mat_path is not None else None,
-        exclude_channels_0based=exclude_channels_0based,
-    )
+    if input_is_preprocessed:
+        active_channels_0based = list(range(int(nch)))
+    else:
+        active_channels_0based = _resolve_active_channels_0based(
+            num_channels=nch,
+            chanmap_mat_path=Path(chanmap_mat_path) if chanmap_mat_path is not None else None,
+            exclude_channels_0based=exclude_channels_0based,
+        )
 
     if sorter_input == "kilosort":
         params = _normalize_kilosort_params(
@@ -646,6 +898,9 @@ def execute_sorting_job(
             active_channel_count=len(active_channels_0based),
         )
         print(f"Resolved Kilosort params: NT={params.get('NT')} Nfilt={params.get('Nfilt')} ntbuff={params.get('ntbuff')}")
+    elif sorter_input == "kilosort4":
+        params = _normalize_kilosort4_params(params)
+        print("Resolved Kilosort4 params")
     params = _merge_sorter_job_kwargs(params, job_kwargs)
 
     dat_path = Path(dat_path).resolve()
@@ -662,11 +917,33 @@ def execute_sorting_job(
         recording = attach_probe_from_chanmap(recording, Path(chanmap_mat_path))
 
     if len(active_channels_0based) != int(nch):
-        recording = _slice_recording_channels(recording, active_channels_0based)
+        recording = select_recording_channels(recording, active_channels_0based)
         print(
             "Sorting with active channels only: "
             f"{len(active_channels_0based)}/{int(nch)}"
         )
+    effective_preprocess_for_sorting = bool(preprocess_for_sorting) and not bool(input_is_preprocessed)
+    if effective_preprocess_for_sorting:
+        recording = apply_preprocessing(
+            recording_raw=recording,
+            bandpass_min_hz=bandpass_min_hz,
+            bandpass_max_hz=bandpass_max_hz,
+            reference=reference,
+            local_radius_um=local_radius_um,
+        )
+        print("Applied preprocessing to sorter input recording")
+    elif input_is_preprocessed:
+        print("Skipping sorter-side preprocessing/channel exclusion: using preprocessed binary input as-is")
+    if sorter_input == "kilosort4" and ks4_auto_geom_enabled:
+        auto_geom_params = _auto_geom_params_from_recording(recording, **ks4_auto_geom_options)
+        if auto_geom_params:
+            params.update(auto_geom_params)
+            print(
+                "Applied Kilosort4 probe-geometry params: "
+                + ", ".join(f"{k}={auto_geom_params[k]}" for k in sorted(auto_geom_params.keys()))
+            )
+        else:
+            print("Kilosort4 auto geometry params requested, but no probe geometry was available.")
 
     run_kwargs: dict[str, Any] = {
         "sorter_name": sorter_name,
@@ -684,6 +961,10 @@ def execute_sorting_job(
     try:
         _ = ss.run_sorter(**run_kwargs)
     except Exception as err:
+        if sorter_input != "kilosort":
+            raise RuntimeError(
+                f"Sorting failed for sorter={sorter_name}. Original error: {err}"
+            ) from err
         # GPU initialization can fail transiently on first MATLAB call.
         # Check the MATLAB log for details, then re-run the cell.
         matlab_log = _repo_root() / ".matlab_shim" / "matlab_run.log"
@@ -702,17 +983,18 @@ def execute_sorting_job(
             f"Kilosort failed (possible GPU initialization error). "
             f"Check the MATLAB log above, then re-run the cell.{hint}\nOriginal error: {err}"
         ) from err
-    if len(active_channels_0based) != int(nch):
-        _patch_phy_outputs_for_raw_dat(
-            output_folder=output_folder,
-            raw_dat_path=dat_path,
-            n_channels_dat=int(nch),
-            active_channels_0based=active_channels_0based,
-        )
-        print(
-            "Patched output metadata for full raw.dat compatibility: "
-            f"n_channels_dat={int(nch)}, active={len(active_channels_0based)}"
-        )
+    _flatten_sorter_output_folder(output_folder)
+    _patch_phy_outputs_for_raw_dat(
+        output_folder=output_folder,
+        raw_dat_path=dat_path,
+        n_channels_dat=int(nch),
+        active_channels_0based=active_channels_0based,
+        hp_filtered=bool(input_is_preprocessed),
+    )
+    print(
+        "Patched output metadata for raw.dat compatibility: "
+        f"n_channels_dat={int(nch)}, active={len(active_channels_0based)}"
+    )
     print("Sorter finished")
     return output_folder
 
@@ -740,14 +1022,23 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
         job_kwargs=None,
         remove_existing_folder=args.remove_existing_folder,
         docker_image=args.docker_image,
+        preprocess_for_sorting=False,
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run spike sorting from config file (YAML/JSON)")
     p.add_argument("--sorter", default="kilosort", help="Sorter name (kilosort or kilosort4)")
-    p.add_argument("--config", default="sorter/Kilosort1_config.yaml", help="Config path (.yaml/.yml/.json)")
-    p.add_argument("--kilosort1-path", default="sorter/Kilosort1", help="Kilosort1 folder path")
+    p.add_argument(
+        "--config",
+        default=None,
+        help="Config path (.yaml/.yml/.json). If omitted, uses sorter-specific default config.",
+    )
+    p.add_argument(
+        "--kilosort1-path",
+        default="sorter/Kilosort1",
+        help="Kilosort1 folder path (used only when --sorter kilosort).",
+    )
     p.add_argument(
         "--matlab-path",
         default=None,
