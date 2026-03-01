@@ -3,8 +3,11 @@
 from datetime import datetime
 from pathlib import Path
 
-from scipy.io import loadmat
+import numpy as np
+from scipy.io import loadmat, savemat
+import spikeinterface.extractors as se
 
+from .artifact_removal import detect_high_amplitude_artifacts, remove_artifacts
 from .events import export_analog_digital_events, materialize_intermediate_dat
 from .io import (
     build_acquisition_catalog,
@@ -21,7 +24,9 @@ from .io import (
 from .intan_rhd import read_intan_rhd_header
 from .mergepoints import compute_mergepoints, save_mergepoints_events_mat
 from .recording import (
+    apply_preprocessing,
     attach_probe_and_remove_bad_channels,
+    apply_transform_to_selected_channels_preserve_shape,
     concatenate_recordings_si,
     load_subsession_recordings,
     preprocess_selected_channels_preserve_shape,
@@ -45,7 +50,48 @@ def _sorter_output_prefix(sorter_name: str) -> str:
     return sorter_name[:1].upper() + sorter_name[1:].lower()
 
 
+def _normalize_artifact_ttl_channel(channel: int) -> int:
+    ch = int(channel)
+    if ch == 0:
+        return 0
+    if 1 <= ch <= 16:
+        return ch - 1
+    if 0 <= ch < 16:
+        return ch
+    raise ValueError(
+        "artifact_TTL_channel must be within digital bit range [0, 15] "
+        "(or [1, 16] for 1-based input)."
+    )
+
+
+def _save_artifact_events_mat(
+    *,
+    output_path: Path,
+    struct_name: str,
+    timestamps_sec: np.ndarray,
+    duration_sec: np.ndarray,
+    extra_fields: dict[str, np.ndarray | float | int | str] | None = None,
+) -> Path:
+    payload: dict[str, np.ndarray | float | int | str] = {
+        "timestamps": np.asarray(timestamps_sec, dtype=np.float64).reshape(-1, 1),
+        "duration": np.asarray(duration_sec, dtype=np.float64).reshape(-1, 1),
+    }
+    if extra_fields:
+        payload.update(extra_fields)
+    savemat(output_path, {struct_name: payload}, do_compression=True)
+    return output_path
+
+
 def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
+    step_idx = 0
+    total_steps = 17
+
+    def _step(label: str) -> None:
+        nonlocal step_idx
+        step_idx += 1
+        print(f"[Step {step_idx}/{total_steps}] {label}")
+
+    _step("Make session metafile context")
     basepath, basename = resolve_basepath_and_basename(config.basepath)
     output_dir = resolve_local_output_dir(basepath, basename, config)
 
@@ -69,6 +115,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         analog_sr = float(intan_header.board_adc_sample_rate)
         digital_sr = float(intan_header.board_dig_in_sample_rate)
 
+    _step("Discover input recordings")
     amplifier_paths = discover_subsessions(
         basepath=basepath,
         sort_files=config.sort_files,
@@ -86,26 +133,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     )
     print_catalog_summary(catalog)
 
-    recordings = load_subsession_recordings(
-        dat_paths=catalog.amplifier_paths,
-        sampling_frequency=effective_sr,
-        num_channels=effective_n_channels,
-        dtype=config.dtype,
-        gain_to_uV=config.gain_to_uV,
-        offset_to_uV=config.offset_to_uV,
-    )
-    recording_concat = concatenate_recordings_si(recordings)
-
-    raw_dat_path: Path | None = None
-    if config.save_raw:
-        raw_dat_path = output_dir / f"{basename}_raw.dat"
-        write_concatenated_dat(
-            recording=recording_concat,
-            output_dat_path=raw_dat_path,
-            overwrite=config.overwrite,
-            job_kwargs=config.job_kwargs,
-        )
-
+    _step("Build merge points")
     merge_data = compute_mergepoints(
         dat_paths=catalog.amplifier_paths,
         n_channels=effective_n_channels,
@@ -116,51 +144,18 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     mergepoints_path = output_dir / f"{basename}.MergePoints.events.mat"
     save_mergepoints_events_mat(mergepoints_path, merge_data)
 
-    recording_base = recording_concat
+    ttl_channel_0based: int | None = None
+    if config.remove_artifact_TTL:
+        if config.artifact_TTL_channel is None:
+            raise ValueError("remove_artifact_TTL=True requires artifact_TTL_channel to be specified.")
+        ttl_channel_0based = _normalize_artifact_ttl_channel(config.artifact_TTL_channel)
 
-    recording_raw, bad_0, bad_1 = attach_probe_and_remove_bad_channels(
-        recording=recording_base,
-        chanmap_mat_path=config.chanmap_mat_path,
-        reject_channels_0based=sorted(set(config.reject_channels + xml_meta.skipped_channels_0based)),
-    )
-
-    good_channels_0based = [
-        int(ch)
-        for ch in recording_raw.get_channel_ids()
-        if int(ch) not in set(bad_0)
-    ]
-    recording_preprocessed = recording_raw
-    if config.do_preprocess:
-        recording_preprocessed = preprocess_selected_channels_preserve_shape(
-            recording_raw=recording_raw,
-            selected_channel_ids=good_channels_0based,
-            bandpass_min_hz=config.bandpass_min_hz,
-            bandpass_max_hz=config.bandpass_max_hz,
-            reference=config.reference,
-            local_radius_um=config.local_radius_um,
-        )
-    dat_path: Path | None = output_dir / f"{basename}.dat"
-    write_concatenated_dat(
-        recording=recording_preprocessed,
-        output_dat_path=dat_path,
-        overwrite=config.overwrite,
-        job_kwargs=config.job_kwargs,
-    )
-
-    lfp_path: Path | None = None
-    if config.make_lfp:
-        lfp_path = output_dir / f"{basename}.lfp"
-        write_lfp(
-            recording_raw=recording_base,
-            lfp_path=lfp_path,
-            lfp_fs=config.lfp_fs,
-            dtype=config.dtype,
-            overwrite=config.overwrite,
-            job_kwargs=config.job_kwargs,
-        )
-
+    # Build sidecar dat/events early so TTL artifact removal can reuse digitalIn.events.mat
+    # instead of re-parsing digitalin binary separately.
+    _step("Prepare sidecar dat files")
     intermediate_dat_paths: dict[str, Path] = {}
-    if config.export_intermediate_dat:
+    need_sidecar_for_events = bool(config.analog_inputs or config.digital_inputs or config.remove_artifact_TTL)
+    if config.export_intermediate_dat or need_sidecar_for_events:
         analog_ch = (
             int(catalog.board_adc_channels)
             if int(catalog.board_adc_channels) > 0
@@ -194,6 +189,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         if digital_concat is not None:
             intermediate_dat_paths["digitalin"] = digital_concat
 
+    if config.export_intermediate_dat:
         sidecar_paths = materialize_intermediate_dat(
             output_dir=output_dir,
             basename=basename,
@@ -217,7 +213,16 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         if int(catalog.board_digital_word_channels) > 0
         else 1
     )
+    digital_inputs_for_export = bool(config.digital_inputs or config.remove_artifact_TTL)
+    digital_channels_for_export = list(config.digital_channels) if config.digital_channels else None
+    if ttl_channel_0based is not None:
+        ttl_ch_1based = int(ttl_channel_0based) + 1
+        if digital_channels_for_export is None:
+            digital_channels_for_export = [ttl_ch_1based]
+        elif ttl_ch_1based not in digital_channels_for_export:
+            digital_channels_for_export = [*digital_channels_for_export, ttl_ch_1based]
 
+    _step("Export analog/digital events")
     analog_event_paths, digital_event_paths = export_analog_digital_events(
         output_dir=output_dir,
         basename=basename,
@@ -229,8 +234,8 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             if catalog.board_adc_native_orders
             else None
         ),
-        digital_inputs=config.digital_inputs,
-        digital_channels=config.digital_channels,
+        digital_inputs=digital_inputs_for_export,
+        digital_channels=digital_channels_for_export,
         digital_word_channels=digital_word_channels,
         digital_active_channels_1based=(
             [int(ch) + 1 for ch in catalog.board_digital_input_native_orders]
@@ -246,6 +251,233 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         overwrite=config.overwrite,
     )
 
+    _step("Load and concatenate amplifier dat")
+    recordings = load_subsession_recordings(
+        dat_paths=catalog.amplifier_paths,
+        sampling_frequency=effective_sr,
+        num_channels=effective_n_channels,
+        dtype=config.dtype,
+        gain_to_uV=config.gain_to_uV,
+        offset_to_uV=config.offset_to_uV,
+    )
+    recording_concat = concatenate_recordings_si(recordings)
+
+    _step("Save raw dat (optional)")
+    raw_dat_path: Path | None = None
+    if config.save_raw:
+        raw_dat_path = output_dir / f"{basename}_raw.dat"
+        write_concatenated_dat(
+            recording=recording_concat,
+            output_dat_path=raw_dat_path,
+            overwrite=config.overwrite,
+            job_kwargs=config.job_kwargs,
+    )
+
+    recording_base = recording_concat
+
+    _step("Attach probe and mark bad channels")
+    recording_raw, bad_0, bad_1 = attach_probe_and_remove_bad_channels(
+        recording=recording_base,
+        chanmap_mat_path=config.chanmap_mat_path,
+        reject_channels_0based=sorted(set(config.reject_channels + xml_meta.skipped_channels_0based)),
+    )
+
+    if hasattr(recording_raw, "get_channel_ids"):
+        channel_ids_for_processing = [int(ch) for ch in recording_raw.get_channel_ids()]
+    else:
+        channel_ids_for_processing = list(range(effective_n_channels))
+
+    good_channels_0based = [int(ch) for ch in channel_ids_for_processing if int(ch) not in set(bad_0)]
+    recording_preprocessed = recording_raw
+    artifact_ttl_timestamps_sec = np.empty(0, dtype=np.float64)
+    artifact_high_timestamps_sec = np.empty(0, dtype=np.float64)
+    artifact_high_group_ids = np.empty(0, dtype=np.int64)
+    _step("Run CMR preprocess (optional)")
+    if config.do_preprocess:
+        if hasattr(recording_raw, "get_channel_ids"):
+            recording_preprocessed = preprocess_selected_channels_preserve_shape(
+                recording_raw=recording_raw,
+                selected_channel_ids=good_channels_0based,
+                bandpass_min_hz=config.bandpass_min_hz,
+                bandpass_max_hz=config.bandpass_max_hz,
+                reference=config.reference,
+                local_radius_um=config.local_radius_um,
+            )
+        else:
+            recording_preprocessed = apply_preprocessing(
+                recording_raw=recording_raw,
+                bandpass_min_hz=config.bandpass_min_hz,
+                bandpass_max_hz=config.bandpass_max_hz,
+                reference=config.reference,
+                local_radius_um=config.local_radius_um,
+            )
+    if (config.remove_artifact_TTL or config.remove_highamp_artifact) and not config.do_preprocess:
+        raise ValueError(
+            "Artifact removal requires CMR output. Set do_preprocess=True when "
+            "remove_artifact_TTL or remove_highamp_artifact is enabled."
+        )
+    _step("Run TTL artifact removal (optional)")
+    if config.remove_artifact_TTL:
+        ttl_events_path = next((p for p in digital_event_paths if "digitalIn.events.mat" in p.name), None)
+        if ttl_events_path is None:
+            raise ValueError(
+                "remove_artifact_TTL=True but digitalIn.events.mat was not generated. "
+                "Check digitalin availability and TTL channel settings."
+            )
+        loaded_digital = loadmat(ttl_events_path, simplify_cells=True)
+        digital_in = loaded_digital.get("digitalIn")
+        if not isinstance(digital_in, dict):
+            raise ValueError(f"Invalid digitalIn structure in {ttl_events_path}")
+
+        timestamps_on = digital_in.get("timestampsOn")
+        if timestamps_on is None:
+            raise ValueError(f"timestampsOn is missing in {ttl_events_path}")
+        timestamps_off = digital_in.get("timestampsOff")
+        if ttl_channel_0based is None:
+            raise ValueError("Internal error: TTL channel was not initialized.")
+
+        ttl_ch_1based = int(ttl_channel_0based) + 1
+        try:
+            ttl_sec_on = np.asarray(timestamps_on[ttl_ch_1based - 1], dtype=np.float64).reshape(-1)
+        except Exception as exc:
+            raise ValueError(
+                f"Failed to read timestampsOn for TTL channel {ttl_ch_1based} from {ttl_events_path}"
+            ) from exc
+        ttl_sec = ttl_sec_on[np.isfinite(ttl_sec_on)]
+        source_label = "digitalIn.timestampsOn"
+        if config.artifact_TTL_include_offset:
+            if timestamps_off is None:
+                raise ValueError(
+                    "artifact_TTL_include_offset=True but timestampsOff is missing in "
+                    f"{ttl_events_path}."
+                )
+            try:
+                ttl_sec_off = np.asarray(timestamps_off[ttl_ch_1based - 1], dtype=np.float64).reshape(-1)
+            except Exception as exc:
+                raise ValueError(
+                    f"Failed to read timestampsOff for TTL channel {ttl_ch_1based} from {ttl_events_path}"
+                ) from exc
+            ttl_sec = np.concatenate((ttl_sec, ttl_sec_off[np.isfinite(ttl_sec_off)])).astype(np.float64, copy=False)
+            source_label = "digitalIn.timestampsOn+timestampsOff"
+        if ttl_sec.size == 0:
+            raise ValueError(
+                "remove_artifact_TTL=True but no TTL events were detected for "
+                f"artifact_TTL_channel={ttl_channel_0based} "
+                f"(include_offset={bool(config.artifact_TTL_include_offset)})."
+            )
+        artifact_ttl_timestamps_sec = np.unique(ttl_sec.astype(np.float64))
+        artifact_ttl = np.unique(np.rint(ttl_sec * float(effective_sr)).astype(np.int64)).tolist()
+
+        recording_preprocessed = apply_transform_to_selected_channels_preserve_shape(
+            recording_raw=recording_preprocessed,
+            selected_channel_ids=good_channels_0based,
+            transform_fn=lambda rec_sel: remove_artifacts(
+                recording_in=rec_sel,
+                artifact_per_group=artifact_ttl,
+                by_group=config.artifact_TTL_by_group,
+                ms_before=config.artifact_TTL_ms_before,
+                ms_after=config.artifact_TTL_ms_after,
+                mode=config.artifact_TTL_mode,
+            )[0],
+        )
+        ttl_duration_sec = np.full(
+            artifact_ttl_timestamps_sec.shape,
+            (float(config.artifact_TTL_ms_before) + float(config.artifact_TTL_ms_after)) / 1000.0,
+            dtype=np.float64,
+        )
+        ttl_events_path = _save_artifact_events_mat(
+            output_path=output_dir / f"{basename}.artifactTTL.events.mat",
+            struct_name="artifactTTL",
+            timestamps_sec=artifact_ttl_timestamps_sec,
+            duration_sec=ttl_duration_sec,
+            extra_fields={
+                "channel": float(int(ttl_ch_1based)),
+                "source": source_label,
+            },
+        )
+        intermediate_dat_paths["artifact_ttl_events"] = ttl_events_path
+
+    _step("Run high-amplitude artifact removal (optional)")
+    if config.remove_highamp_artifact:
+        highamp_frames_by_group: dict[int, list[int]] = {}
+
+        def _apply_highamp_artifacts(rec_sel):
+            detected = detect_high_amplitude_artifacts(
+                rec_sel,
+                by_group=config.highamp_detect_by_group,
+                estimate_windows=config.highamp_estimate_windows,
+                estimate_window_s=config.highamp_estimate_window_s,
+                threshold_sigma=config.highamp_threshold_sigma,
+                seed=config.highamp_seed,
+                chunk_s=config.highamp_chunk_s,
+                dead_time_ms=config.highamp_dead_time_ms,
+                n_jobs=config.highamp_n_jobs,
+            )
+            for gid, frames in detected.items():
+                highamp_frames_by_group[int(gid)] = [int(x) for x in frames]
+            return remove_artifacts(
+                recording_in=rec_sel,
+                artifact_per_group=detected,
+                by_group=config.highamp_remove_by_group,
+                ms_before=config.highamp_ms_before,
+                ms_after=config.highamp_ms_after,
+                mode=config.highamp_mode,
+            )[0]
+
+        recording_preprocessed = apply_transform_to_selected_channels_preserve_shape(
+            recording_raw=recording_preprocessed,
+            selected_channel_ids=good_channels_0based,
+            transform_fn=_apply_highamp_artifacts,
+        )
+        if highamp_frames_by_group:
+            pairs = sorted(
+                (frame, gid)
+                for gid, frames in highamp_frames_by_group.items()
+                for frame in frames
+            )
+            if pairs:
+                artifact_high_frames = np.asarray([p[0] for p in pairs], dtype=np.int64)
+                artifact_high_group_ids = np.asarray([p[1] for p in pairs], dtype=np.int64)
+                artifact_high_timestamps_sec = artifact_high_frames.astype(np.float64) / float(effective_sr)
+        high_duration_sec = np.full(
+            artifact_high_timestamps_sec.shape,
+            (float(config.highamp_ms_before) + float(config.highamp_ms_after)) / 1000.0,
+            dtype=np.float64,
+        )
+        high_events_path = _save_artifact_events_mat(
+            output_path=output_dir / f"{basename}.artifactHigh.events.mat",
+            struct_name="artifactHigh",
+            timestamps_sec=artifact_high_timestamps_sec,
+            duration_sec=high_duration_sec,
+            extra_fields={
+                "group_id": artifact_high_group_ids.reshape(-1, 1),
+                "source": "detect_high_amplitude_artifacts",
+            },
+        )
+        intermediate_dat_paths["artifact_high_events"] = high_events_path
+
+    _step("Write final dat output")
+    dat_path: Path | None = output_dir / f"{basename}.dat"
+    write_concatenated_dat(
+        recording=recording_preprocessed,
+        output_dat_path=dat_path,
+        overwrite=config.overwrite,
+        job_kwargs=config.job_kwargs,
+    )
+
+    _step("Write LFP output (optional)")
+    lfp_path: Path | None = None
+    if config.make_lfp:
+        lfp_path = output_dir / f"{basename}.lfp"
+        write_lfp(
+            recording_raw=recording_base,
+            lfp_path=lfp_path,
+            lfp_fs=config.lfp_fs,
+            dtype=config.dtype,
+            overwrite=config.overwrite,
+            job_kwargs=config.job_kwargs,
+        )
+
     session_dat_path = output_dir / f"{basename}.dat"
     if not session_dat_path.exists():
         raise FileNotFoundError(
@@ -253,6 +485,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             "Enable save_raw or sorter, or ensure basename.dat exists in output_dir."
         )
 
+    _step("Build session.mat")
     session_struct = build_session_struct(
         source_basepath=basepath,
         local_basepath=output_dir,
@@ -291,6 +524,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
 
     state_score_paths: list[Path] = []
     state_score_figure_paths: list[Path] = []
+    _step("Run state scoring (optional)")
     if config.state_score:
         pulses_struct = _load_pulses_struct(analog_event_paths, basename)
         state_score_result = run_state_scoring(
@@ -308,6 +542,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         ]
         state_score_figure_paths = list(state_score_result.figure_paths)
 
+    _step("Run spike sorter (optional)")
     sorter_output_dir: Path | None = None
     if config.sorter:
         sorter_dat_path = output_dir / f"{basename}.dat"
@@ -345,8 +580,10 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             bandpass_max_hz=config.bandpass_max_hz,
             reference=config.reference,
             local_radius_um=config.local_radius_um,
+            sorter_verbose=bool(config.sorter_verbose),
         )
 
+    _step("Save manifest and return")
     result = PreprocessResult(
         basepath=basepath,
         basename=basename,

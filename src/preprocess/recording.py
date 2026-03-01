@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import warnings
 
 import numpy as np
@@ -366,10 +366,24 @@ def preprocess_selected_channels_preserve_shape(
         reference=reference,
         local_radius_um=local_radius_um,
     )
+    return _merge_selected_with_bypass_preserve_order(
+        recording_raw=recording_raw,
+        recording_selected_processed=rec_selected_pre,
+        selected_set=selected_set,
+        all_channel_ids=all_channel_ids,
+    )
 
+
+def _merge_selected_with_bypass_preserve_order(
+    *,
+    recording_raw: Any,
+    recording_selected_processed: Any,
+    selected_set: set[int],
+    all_channel_ids: list[int],
+) -> Any:
     bypass_ids = [ch for ch in all_channel_ids if int(ch) not in selected_set]
     if not bypass_ids:
-        return rec_selected_pre
+        return recording_selected_processed
 
     # Build channel runs in original order and aggregate run-by-run.
     # This avoids re-slicing ChannelsAggregationRecording with interleaved
@@ -382,7 +396,7 @@ def preprocess_selected_channels_preserve_shape(
         nonlocal run_ids, run_is_selected
         if not run_ids:
             return
-        src = rec_selected_pre if bool(run_is_selected) else recording_raw
+        src = recording_selected_processed if bool(run_is_selected) else recording_raw
         run_recordings.append(select_recording_channels(src, run_ids))
         run_ids = []
 
@@ -400,6 +414,31 @@ def preprocess_selected_channels_preserve_shape(
     if len(run_recordings) == 1:
         return run_recordings[0]
     return si.aggregate_channels(run_recordings)
+
+
+def apply_transform_to_selected_channels_preserve_shape(
+    *,
+    recording_raw: Any,
+    selected_channel_ids: list[int],
+    transform_fn: Callable[[Any], Any],
+) -> Any:
+    all_channel_ids = list(recording_raw.get_channel_ids())
+    if not all_channel_ids:
+        return recording_raw
+
+    selected_set = {int(ch) for ch in selected_channel_ids}
+    selected_ids_in_order = [ch for ch in all_channel_ids if int(ch) in selected_set]
+    if not selected_ids_in_order:
+        return recording_raw
+
+    rec_selected = select_recording_channels(recording_raw, selected_ids_in_order)
+    rec_selected_processed = transform_fn(rec_selected)
+    return _merge_selected_with_bypass_preserve_order(
+        recording_raw=recording_raw,
+        recording_selected_processed=rec_selected_processed,
+        selected_set=selected_set,
+        all_channel_ids=all_channel_ids,
+    )
 
 
 def write_lfp(
