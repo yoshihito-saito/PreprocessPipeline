@@ -27,7 +27,7 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
 - [x] Analog/Digital input processing (`analogin.dat`, `digitalin.dat`, `*.events.mat`) (needs double-check)
 - [x] LFP extraction (exact sample-level parity)
 - [x] Bad-channel handling (sorting target channels and output channel maps)
-- [ ] Artifact removal (`cleanArtifacts`, pulse-based cleaning)
+- [x] Artifact removal (`remove_artifact_TTL`, `remove_highamp_artifact`)
 - [ ] Denoise (`removeNoise`)
 - [x] State scoring
 - [ ] Spike sorting
@@ -57,3 +57,17 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
 15. Run state scoring (optional)
 16. Run spike sorter (optional)
 17. Save manifest and return
+
+## Artifact Removal Options (Current)
+
+- TTL artifact removal: `remove_artifact_TTL=True`
+- TTL channel selection: `artifact_TTL_channel` (0-based `[0..15]` or 1-based `[1..16]`)
+- TTL edge behavior:
+  - default: rising edges (`digitalIn.timestampsOn`)
+  - include falling edges: `artifact_TTL_include_offset=True` (`timestampsOn + timestampsOff`)
+- TTL cleaning params: `artifact_TTL_ms_before`, `artifact_TTL_ms_after`, `artifact_TTL_mode`, `artifact_TTL_by_group`
+- High-amplitude artifact removal: `remove_highamp_artifact=True`
+- High-amplitude params: `highamp_*`, `highamp_ms_before`, `highamp_ms_after`, `highamp_mode`, `highamp_remove_by_group`
+- Output files:
+  - `basename.artifactTTL.events.mat`
+  - `basename.artifactHigh.events.mat`
