@@ -36,5 +36,6 @@ Thumbs.db
 neurocode
 .matlab_shim
 sorter/KiloSort1
+sorter/Kilosort-2.5.2
 tests
 PreprocessPipeline.code-workspace
