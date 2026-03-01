@@ -824,6 +824,7 @@ def execute_sorting_job(
     bandpass_max_hz: float = 8000.0,
     reference: str = "local",
     local_radius_um: tuple[float, float] = (50.0, 200.0),
+    sorter_verbose: bool = False,
 ) -> Path:
     sorter_input = sorter.lower()
     if sorter_input not in _SORTER_ALIASES:
@@ -949,7 +950,7 @@ def execute_sorting_job(
         "sorter_name": sorter_name,
         "recording": recording,
         "folder": output_folder,
-        "verbose": True,
+        "verbose": bool(sorter_verbose),
         "with_output": True,
         "remove_existing_folder": remove_existing_folder,
         **params,
@@ -1023,6 +1024,7 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
         remove_existing_folder=args.remove_existing_folder,
         docker_image=args.docker_image,
         preprocess_for_sorting=False,
+        sorter_verbose=bool(args.sorter_verbose),
     )
 
 
@@ -1058,6 +1060,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-folder", required=True, help="Sorter output folder")
     p.add_argument("--remove-existing-folder", action="store_true", help="Delete existing output folder")
     p.add_argument("--docker-image", default=None, help="Optional docker image")
+    p.add_argument("--sorter-verbose", action="store_true", help="Enable verbose sorter logs")
     return p
 
 
