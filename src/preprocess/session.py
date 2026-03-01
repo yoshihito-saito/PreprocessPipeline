@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -340,6 +341,27 @@ def build_session_struct(
     return session
 
 
+def _coerce_numeric_to_float64(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _coerce_numeric_to_float64(v) for k, v in value.items()}
+    if isinstance(value, np.ndarray):
+        if value.dtype == object:
+            out = np.empty(value.shape, dtype=object)
+            for idx in np.ndindex(value.shape):
+                out[idx] = _coerce_numeric_to_float64(value[idx])
+            return out
+        if value.dtype.kind in {"b", "i", "u", "f"} and value.dtype != np.float64:
+            return value.astype(np.float64, copy=False)
+        return value
+    if isinstance(value, (np.integer, int, np.floating, float, bool, np.bool_)):
+        return float(value)
+    return value
+
+
 def save_session_mat(path: Path, session_struct: dict[str, Any]) -> Path:
-    savemat(path, {"session": session_struct}, do_compression=True)
+    session_to_save = copy.deepcopy(session_struct)
+    extracellular = session_to_save.get("extracellular")
+    if isinstance(extracellular, dict):
+        session_to_save["extracellular"] = _coerce_numeric_to_float64(extracellular)
+    savemat(path, {"session": session_to_save}, do_compression=True)
     return path
