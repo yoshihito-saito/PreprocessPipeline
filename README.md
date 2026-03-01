@@ -37,3 +37,23 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
 - [ ] Concatenation option (`fillMissingDatFiles`)
 - [ ] Regression tests for MATLAB vs Python output
 - [ ] End-to-end comparison notebook updates and documentation cleanup
+
+## Preprocess Pipeline Steps
+
+1. Make session metafile context
+2. Discover input recordings
+3. Build merge points
+4. Prepare sidecar dat files
+5. Export analog/digital events
+6. Load and concatenate amplifier dat
+7. Save raw dat (optional)
+8. Attach probe and mark bad channels
+9. Run CMR preprocess (optional)
+10. Run TTL artifact removal (optional)
+11. Run high-amplitude artifact removal (optional)
+12. Write final dat output
+13. Write LFP output (optional)
+14. Build session.mat
+15. Run state scoring (optional)
+16. Run spike sorter (optional)
+17. Save manifest and return
