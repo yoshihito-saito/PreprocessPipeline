@@ -174,12 +174,23 @@ def _inject_matlab_shim(matlab_cmd: str, matlab_log: Path) -> Path:
             "monitor_pid=\"\"\n"
             "(\n"
             "  shutdown_seen_at=0\n"
+            "  final_pass_seen=0\n"
+            "  all_batches_done=0\n"
             "  while kill -0 \"$matlab_pid\" 2>/dev/null; do\n"
             "    if IFS= read -r -t 1 line; then\n"
-            "      if [[ \"$line\" == *\"batch \"* ]] || [[ \"$line\" == *\"Running the final template matching pass\"* ]]; then\n"
+            "      if [[ \"$line\" =~ batch[[:space:]]([0-9]+)/([0-9]+) ]]; then\n"
+            "        if [[ \"${BASH_REMATCH[1]}\" == \"${BASH_REMATCH[2]}\" ]]; then\n"
+            "          all_batches_done=1\n"
+            "        fi\n"
+            "      fi\n"
+            "      if [[ \"$line\" == *\"Running the final template matching pass\"* ]]; then\n"
+            "        final_pass_seen=1\n"
             "        shutdown_seen_at=0\n"
             "      fi\n"
-            "      if [[ \"$line\" == *\"Parallel pool using the 'Processes' profile is shutting down.\"* ]]; then\n"
+            "      if [[ \"$line\" == *\"batch \"* ]]; then\n"
+            "        shutdown_seen_at=0\n"
+            "      fi\n"
+            "      if (( final_pass_seen == 1 || all_batches_done == 1 )) && [[ \"$line\" == *\"Parallel pool using the 'Processes' profile is shutting down.\"* ]]; then\n"
             "        shutdown_seen_at=$(date +%s)\n"
             "      fi\n"
             "    fi\n"
@@ -1009,16 +1020,11 @@ def execute_sorting_job(
         else:
             print("Kilosort4 auto geometry params requested, but no probe geometry was available.")
 
-    effective_sorter_verbose = bool(sorter_verbose)
-    # Kilosort1 via MATLAB can flood notebook/stdout; keep it quiet by default.
-    if sorter_input == "kilosort":
-        effective_sorter_verbose = False
-
     run_kwargs: dict[str, Any] = {
         "sorter_name": sorter_name,
         "recording": recording,
         "folder": output_folder,
-        "verbose": effective_sorter_verbose,
+        "verbose": bool(sorter_verbose),
         "with_output": True,
         "remove_existing_folder": remove_existing_folder,
         **params,
@@ -1036,23 +1042,34 @@ def execute_sorting_job(
             raise RuntimeError(
                 f"Sorting failed for sorter={sorter_name}. Original error: {err}"
             ) from err
-        # GPU initialization can fail transiently on first MATLAB call.
-        # Check the MATLAB log for details, then re-run the cell.
+        # Surface MATLAB-side failure reasons (GPU, license/service, etc).
         matlab_log = _repo_root() / ".matlab_shim" / "matlab_run.log"
         hint = ""
+        cause = "MATLAB runtime error"
         if matlab_log.exists():
             log_tail = matlab_log.read_text(encoding="utf-8", errors="replace")[-3000:]
             if bool(sorter_verbose):
                 print(f"\n[MATLAB log: {matlab_log}]")
                 print(log_tail)
             if "higher compute capability" in log_tail:
+                cause = "possible GPU initialization error"
                 hint = (
                     "\nDetected MATLAB CUDA compatibility error. "
                     "Try updating NVIDIA driver/CUDA runtime visible to MATLAB, "
                     "or use a MATLAB release with support for your GPU architecture."
                 )
+            elif (
+                "Unable to communicate with required MathWorks services (error 5001)" in log_tail
+                or "support/lme/5001" in log_tail
+            ):
+                cause = "MATLAB license/service communication error (5001)"
+                hint = (
+                    "\nDetected MATLAB licensing/service error 5001. "
+                    "Check MathWorks login/license activation for this host and outbound connectivity, "
+                    "or configure a valid offline/network license (e.g., MLM_LICENSE_FILE)."
+                )
         raise RuntimeError(
-            f"Kilosort failed (possible GPU initialization error). "
+            f"Kilosort failed ({cause}). "
             f"Check MATLAB log at: {matlab_log}, then re-run the cell.{hint}\nOriginal error: {err}"
         ) from err
     _flatten_sorter_output_folder(output_folder)
