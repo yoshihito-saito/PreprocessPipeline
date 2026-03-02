@@ -30,6 +30,7 @@ from .recording import (
     concatenate_recordings_si,
     load_subsession_recordings,
     preprocess_selected_channels_preserve_shape,
+    zero_selected_channels_preserve_shape,
     write_concatenated_dat_analogin,
     write_concatenated_dat_digitalin,
     write_concatenated_dat,
@@ -48,6 +49,23 @@ def _sorter_output_prefix(sorter_name: str) -> str:
     if sorter_normalized == "kilosort4":
         return "Kilosort4"
     return sorter_name[:1].upper() + sorter_name[1:].lower()
+
+
+def _make_tree_world_rw(root: Path) -> None:
+    if not root.exists():
+        return
+    paths = [root, *root.rglob("*")]
+    for p in paths:
+        try:
+            if p.is_symlink():
+                continue
+            mode = p.stat().st_mode
+            if p.is_dir():
+                p.chmod(mode | 0o777)
+            elif p.is_file():
+                p.chmod(mode | 0o666)
+        except Exception as exc:
+            print(f"Warning: failed to update permissions for {p}: {exc}")
 
 
 def _normalize_artifact_ttl_channel(channel: int) -> int:
@@ -69,17 +87,41 @@ def _save_artifact_events_mat(
     output_path: Path,
     struct_name: str,
     timestamps_sec: np.ndarray,
+    peaks_sec: np.ndarray,
     duration_sec: np.ndarray,
     extra_fields: dict[str, np.ndarray | float | int | str] | None = None,
 ) -> Path:
     payload: dict[str, np.ndarray | float | int | str] = {
-        "timestamps": np.asarray(timestamps_sec, dtype=np.float64).reshape(-1, 1),
+        "timestamps": np.asarray(timestamps_sec, dtype=np.float64).reshape(-1, 2),
+        "peaks": np.asarray(peaks_sec, dtype=np.float64).reshape(-1, 1),
         "duration": np.asarray(duration_sec, dtype=np.float64).reshape(-1, 1),
     }
     if extra_fields:
         payload.update(extra_fields)
     savemat(output_path, {struct_name: payload}, do_compression=True)
     return output_path
+
+
+def _artifact_windows_from_peaks(
+    peaks_sec: np.ndarray,
+    *,
+    ms_before: float,
+    ms_after: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    peaks = np.asarray(peaks_sec, dtype=np.float64).reshape(-1)
+    if peaks.size == 0:
+        return (
+            np.empty((0, 2), dtype=np.float64),
+            np.empty((0,), dtype=np.float64),
+            np.empty((0,), dtype=np.float64),
+        )
+    before_s = float(ms_before) / 1000.0
+    after_s = float(ms_after) / 1000.0
+    starts = np.maximum(peaks - before_s, 0.0)
+    ends = peaks + after_s
+    timestamps = np.column_stack((starts, ends))
+    duration = ends - starts
+    return timestamps, peaks, duration
 
 
 def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
@@ -318,145 +360,164 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         )
     _step("Run TTL artifact removal (optional)")
     if config.remove_artifact_TTL:
-        ttl_events_path = next((p for p in digital_event_paths if "digitalIn.events.mat" in p.name), None)
-        if ttl_events_path is None:
-            raise ValueError(
-                "remove_artifact_TTL=True but digitalIn.events.mat was not generated. "
-                "Check digitalin availability and TTL channel settings."
-            )
-        loaded_digital = loadmat(ttl_events_path, simplify_cells=True)
-        digital_in = loaded_digital.get("digitalIn")
-        if not isinstance(digital_in, dict):
-            raise ValueError(f"Invalid digitalIn structure in {ttl_events_path}")
-
-        timestamps_on = digital_in.get("timestampsOn")
-        if timestamps_on is None:
-            raise ValueError(f"timestampsOn is missing in {ttl_events_path}")
-        timestamps_off = digital_in.get("timestampsOff")
-        if ttl_channel_0based is None:
-            raise ValueError("Internal error: TTL channel was not initialized.")
-
-        ttl_ch_1based = int(ttl_channel_0based) + 1
-        try:
-            ttl_sec_on = np.asarray(timestamps_on[ttl_ch_1based - 1], dtype=np.float64).reshape(-1)
-        except Exception as exc:
-            raise ValueError(
-                f"Failed to read timestampsOn for TTL channel {ttl_ch_1based} from {ttl_events_path}"
-            ) from exc
-        ttl_sec = ttl_sec_on[np.isfinite(ttl_sec_on)]
-        source_label = "digitalIn.timestampsOn"
-        if config.artifact_TTL_include_offset:
-            if timestamps_off is None:
+        existing_ttl_events_path = output_dir / f"{basename}.artifactTTL.events.mat"
+        if existing_ttl_events_path.exists() and not config.overwrite:
+            print(f"Skipping TTL artifact removal: existing file found ({existing_ttl_events_path})")
+            intermediate_dat_paths["artifact_ttl_events"] = existing_ttl_events_path
+        else:
+            ttl_events_path = next((p for p in digital_event_paths if "digitalIn.events.mat" in p.name), None)
+            if ttl_events_path is None:
                 raise ValueError(
-                    "artifact_TTL_include_offset=True but timestampsOff is missing in "
-                    f"{ttl_events_path}."
+                    "remove_artifact_TTL=True but digitalIn.events.mat was not generated. "
+                    "Check digitalin availability and TTL channel settings."
                 )
+            loaded_digital = loadmat(ttl_events_path, simplify_cells=True)
+            digital_in = loaded_digital.get("digitalIn")
+            if not isinstance(digital_in, dict):
+                raise ValueError(f"Invalid digitalIn structure in {ttl_events_path}")
+
+            timestamps_on = digital_in.get("timestampsOn")
+            if timestamps_on is None:
+                raise ValueError(f"timestampsOn is missing in {ttl_events_path}")
+            timestamps_off = digital_in.get("timestampsOff")
+            if ttl_channel_0based is None:
+                raise ValueError("Internal error: TTL channel was not initialized.")
+
+            ttl_ch_1based = int(ttl_channel_0based) + 1
             try:
-                ttl_sec_off = np.asarray(timestamps_off[ttl_ch_1based - 1], dtype=np.float64).reshape(-1)
+                ttl_sec_on = np.asarray(timestamps_on[ttl_ch_1based - 1], dtype=np.float64).reshape(-1)
             except Exception as exc:
                 raise ValueError(
-                    f"Failed to read timestampsOff for TTL channel {ttl_ch_1based} from {ttl_events_path}"
+                    f"Failed to read timestampsOn for TTL channel {ttl_ch_1based} from {ttl_events_path}"
                 ) from exc
-            ttl_sec = np.concatenate((ttl_sec, ttl_sec_off[np.isfinite(ttl_sec_off)])).astype(np.float64, copy=False)
-            source_label = "digitalIn.timestampsOn+timestampsOff"
-        if ttl_sec.size == 0:
-            raise ValueError(
-                "remove_artifact_TTL=True but no TTL events were detected for "
-                f"artifact_TTL_channel={ttl_channel_0based} "
-                f"(include_offset={bool(config.artifact_TTL_include_offset)})."
-            )
-        artifact_ttl_timestamps_sec = np.unique(ttl_sec.astype(np.float64))
-        artifact_ttl = np.unique(np.rint(ttl_sec * float(effective_sr)).astype(np.int64)).tolist()
+            ttl_sec = ttl_sec_on[np.isfinite(ttl_sec_on)]
+            source_label = "digitalIn.timestampsOn"
+            if config.artifact_TTL_include_offset:
+                if timestamps_off is None:
+                    raise ValueError(
+                        "artifact_TTL_include_offset=True but timestampsOff is missing in "
+                        f"{ttl_events_path}."
+                    )
+                try:
+                    ttl_sec_off = np.asarray(timestamps_off[ttl_ch_1based - 1], dtype=np.float64).reshape(-1)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Failed to read timestampsOff for TTL channel {ttl_ch_1based} from {ttl_events_path}"
+                    ) from exc
+                ttl_sec = np.concatenate((ttl_sec, ttl_sec_off[np.isfinite(ttl_sec_off)])).astype(
+                    np.float64, copy=False
+                )
+                source_label = "digitalIn.timestampsOn+timestampsOff"
+            if ttl_sec.size == 0:
+                raise ValueError(
+                    "remove_artifact_TTL=True but no TTL events were detected for "
+                    f"artifact_TTL_channel={ttl_channel_0based} "
+                    f"(include_offset={bool(config.artifact_TTL_include_offset)})."
+                )
+            artifact_ttl_timestamps_sec = np.unique(ttl_sec.astype(np.float64))
+            artifact_ttl = np.unique(np.rint(ttl_sec * float(effective_sr)).astype(np.int64)).tolist()
 
-        recording_preprocessed = apply_transform_to_selected_channels_preserve_shape(
-            recording_raw=recording_preprocessed,
-            selected_channel_ids=good_channels_0based,
-            transform_fn=lambda rec_sel: remove_artifacts(
-                recording_in=rec_sel,
-                artifact_per_group=artifact_ttl,
-                by_group=config.artifact_TTL_by_group,
+            recording_preprocessed = apply_transform_to_selected_channels_preserve_shape(
+                recording_raw=recording_preprocessed,
+                selected_channel_ids=good_channels_0based,
+                transform_fn=lambda rec_sel: remove_artifacts(
+                    recording_in=rec_sel,
+                    artifact_per_group=artifact_ttl,
+                    by_group=config.artifact_TTL_by_group,
+                    ms_before=config.artifact_TTL_ms_before,
+                    ms_after=config.artifact_TTL_ms_after,
+                    mode=config.artifact_TTL_mode,
+                )[0],
+            )
+            ttl_timestamps, ttl_peaks, ttl_duration_sec = _artifact_windows_from_peaks(
+                artifact_ttl_timestamps_sec,
                 ms_before=config.artifact_TTL_ms_before,
                 ms_after=config.artifact_TTL_ms_after,
-                mode=config.artifact_TTL_mode,
-            )[0],
-        )
-        ttl_duration_sec = np.full(
-            artifact_ttl_timestamps_sec.shape,
-            (float(config.artifact_TTL_ms_before) + float(config.artifact_TTL_ms_after)) / 1000.0,
-            dtype=np.float64,
-        )
-        ttl_events_path = _save_artifact_events_mat(
-            output_path=output_dir / f"{basename}.artifactTTL.events.mat",
-            struct_name="artifactTTL",
-            timestamps_sec=artifact_ttl_timestamps_sec,
-            duration_sec=ttl_duration_sec,
-            extra_fields={
-                "channel": float(int(ttl_ch_1based)),
-                "source": source_label,
-            },
-        )
-        intermediate_dat_paths["artifact_ttl_events"] = ttl_events_path
+            )
+            ttl_events_path = _save_artifact_events_mat(
+                output_path=output_dir / f"{basename}.artifactTTL.events.mat",
+                struct_name="artifactTTL",
+                timestamps_sec=ttl_timestamps,
+                peaks_sec=ttl_peaks,
+                duration_sec=ttl_duration_sec,
+                extra_fields={
+                    "channel": float(int(ttl_ch_1based)),
+                    "source": source_label,
+                },
+            )
+            intermediate_dat_paths["artifact_ttl_events"] = ttl_events_path
 
     _step("Run high-amplitude artifact removal (optional)")
     if config.remove_highamp_artifact:
-        highamp_frames_by_group: dict[int, list[int]] = {}
+        existing_high_events_path = output_dir / f"{basename}.artifactHigh.events.mat"
+        if existing_high_events_path.exists() and not config.overwrite:
+            print(f"Skipping high-amplitude artifact removal: existing file found ({existing_high_events_path})")
+            intermediate_dat_paths["artifact_high_events"] = existing_high_events_path
+        else:
+            highamp_frames_by_group: dict[int, list[int]] = {}
 
-        def _apply_highamp_artifacts(rec_sel):
-            detected = detect_high_amplitude_artifacts(
-                rec_sel,
-                by_group=config.highamp_detect_by_group,
-                estimate_windows=config.highamp_estimate_windows,
-                estimate_window_s=config.highamp_estimate_window_s,
-                threshold_sigma=config.highamp_threshold_sigma,
-                seed=config.highamp_seed,
-                chunk_s=config.highamp_chunk_s,
-                dead_time_ms=config.highamp_dead_time_ms,
-                n_jobs=config.highamp_n_jobs,
+            def _apply_highamp_artifacts(rec_sel):
+                detected = detect_high_amplitude_artifacts(
+                    rec_sel,
+                    by_group=config.highamp_detect_by_group,
+                    estimate_windows=config.highamp_estimate_windows,
+                    estimate_window_s=config.highamp_estimate_window_s,
+                    threshold_sigma=config.highamp_threshold_sigma,
+                    seed=config.highamp_seed,
+                    chunk_s=config.highamp_chunk_s,
+                    dead_time_ms=config.highamp_dead_time_ms,
+                    n_jobs=config.highamp_n_jobs,
+                )
+                for gid, frames in detected.items():
+                    highamp_frames_by_group[int(gid)] = [int(x) for x in frames]
+                return remove_artifacts(
+                    recording_in=rec_sel,
+                    artifact_per_group=detected,
+                    by_group=config.highamp_remove_by_group,
+                    ms_before=config.highamp_ms_before,
+                    ms_after=config.highamp_ms_after,
+                    mode=config.highamp_mode,
+                )[0]
+
+            recording_preprocessed = apply_transform_to_selected_channels_preserve_shape(
+                recording_raw=recording_preprocessed,
+                selected_channel_ids=good_channels_0based,
+                transform_fn=_apply_highamp_artifacts,
             )
-            for gid, frames in detected.items():
-                highamp_frames_by_group[int(gid)] = [int(x) for x in frames]
-            return remove_artifacts(
-                recording_in=rec_sel,
-                artifact_per_group=detected,
-                by_group=config.highamp_remove_by_group,
+            if highamp_frames_by_group:
+                pairs = sorted(
+                    (frame, gid)
+                    for gid, frames in highamp_frames_by_group.items()
+                    for frame in frames
+                )
+                if pairs:
+                    artifact_high_frames = np.asarray([p[0] for p in pairs], dtype=np.int64)
+                    artifact_high_group_ids = np.asarray([p[1] for p in pairs], dtype=np.int64)
+                    artifact_high_timestamps_sec = artifact_high_frames.astype(np.float64) / float(effective_sr)
+            high_timestamps, high_peaks, high_duration_sec = _artifact_windows_from_peaks(
+                artifact_high_timestamps_sec,
                 ms_before=config.highamp_ms_before,
                 ms_after=config.highamp_ms_after,
-                mode=config.highamp_mode,
-            )[0]
-
-        recording_preprocessed = apply_transform_to_selected_channels_preserve_shape(
-            recording_raw=recording_preprocessed,
-            selected_channel_ids=good_channels_0based,
-            transform_fn=_apply_highamp_artifacts,
-        )
-        if highamp_frames_by_group:
-            pairs = sorted(
-                (frame, gid)
-                for gid, frames in highamp_frames_by_group.items()
-                for frame in frames
             )
-            if pairs:
-                artifact_high_frames = np.asarray([p[0] for p in pairs], dtype=np.int64)
-                artifact_high_group_ids = np.asarray([p[1] for p in pairs], dtype=np.int64)
-                artifact_high_timestamps_sec = artifact_high_frames.astype(np.float64) / float(effective_sr)
-        high_duration_sec = np.full(
-            artifact_high_timestamps_sec.shape,
-            (float(config.highamp_ms_before) + float(config.highamp_ms_after)) / 1000.0,
-            dtype=np.float64,
-        )
-        high_events_path = _save_artifact_events_mat(
-            output_path=output_dir / f"{basename}.artifactHigh.events.mat",
-            struct_name="artifactHigh",
-            timestamps_sec=artifact_high_timestamps_sec,
-            duration_sec=high_duration_sec,
-            extra_fields={
-                "group_id": artifact_high_group_ids.reshape(-1, 1),
-                "source": "detect_high_amplitude_artifacts",
-            },
-        )
-        intermediate_dat_paths["artifact_high_events"] = high_events_path
+            high_events_path = _save_artifact_events_mat(
+                output_path=output_dir / f"{basename}.artifactHigh.events.mat",
+                struct_name="artifactHigh",
+                timestamps_sec=high_timestamps,
+                peaks_sec=high_peaks,
+                duration_sec=high_duration_sec,
+                extra_fields={
+                    "group_id": artifact_high_group_ids.reshape(-1, 1),
+                    "source": "detect_high_amplitude_artifacts",
+                },
+            )
+            intermediate_dat_paths["artifact_high_events"] = high_events_path
 
     _step("Write final dat output")
+    if config.zero_bad and bad_0 and hasattr(recording_preprocessed, "get_channel_ids"):
+        recording_preprocessed = zero_selected_channels_preserve_shape(
+            recording_raw=recording_preprocessed,
+            selected_channel_ids=bad_0,
+        )
     dat_path: Path | None = output_dir / f"{basename}.dat"
     write_concatenated_dat(
         recording=recording_preprocessed,
@@ -548,7 +609,10 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         sorter_dat_path = output_dir / f"{basename}.dat"
         sorter_preprocess_for_sorting = False
         sorter_input_is_preprocessed = bool(config.do_preprocess)
-        sorter_exclude_channels_0based = None if sorter_input_is_preprocessed else bad_0
+        if config.bad_channels and bad_0 and not sorter_input_is_preprocessed:
+            sorter_exclude_channels_0based = bad_0
+        else:
+            sorter_exclude_channels_0based = None
 
         sorter_label = str(config.sorter).strip()
         sorter_name_for_folder = _sorter_output_prefix(sorter_label)
@@ -581,6 +645,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             reference=config.reference,
             local_radius_um=config.local_radius_um,
             sorter_verbose=bool(config.sorter_verbose),
+            cleanup_temp_wh=bool(config.cleanup_temp_wh),
         )
 
     _step("Save manifest and return")
@@ -616,4 +681,5 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         output_dir=output_dir,
         script_path=Path(__file__).resolve(),
     )
+    _make_tree_world_rw(output_dir)
     return result
