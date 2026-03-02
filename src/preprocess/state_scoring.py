@@ -1842,13 +1842,13 @@ def _compute_sleep_state(
     statenames = np.asarray(statename_list, dtype=object).reshape(1, -1)
     idx_struct = {
         "states": states.astype(np.uint8, copy=False).reshape(-1, 1),
-        "timestamps": _to_uint_vector(np.rint(idx_timestamps)).reshape(-1, 1),
+        "timestamps": np.asarray(idx_timestamps, dtype=np.float64).reshape(-1, 1),
         "statenames": statenames,
     }
     ints_struct = {
-        "WAKEstate": _to_uint_intervals(ints.get("WAKEstate", np.empty((0, 2)))),
-        "NREMstate": _to_uint_intervals(ints.get("NREMstate", np.empty((0, 2)))),
-        "REMstate": _to_uint_intervals(ints.get("REMstate", np.empty((0, 2)))),
+        "WAKEstate": np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2),
+        "NREMstate": np.asarray(ints.get("NREMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2),
+        "REMstate": np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2),
     }
 
     hists = {
@@ -2269,12 +2269,12 @@ def _states_to_episodes(sleep_state: dict[str, Any], basepath: Path, basename: s
     }
     episodes = {
         "ints": {
-            "NREMepisode": _to_uint_intervals(nrem_episode),
-            "REMepisode": _to_uint_intervals(rem_episode),
-            "WAKEepisode": _to_uint_intervals(wake_episode),
-            "NREMpacket": _to_uint_intervals(packet),
-            "MA": _to_uint_intervals(ma),
-            "MA_REM": _to_uint_intervals(ma_rem),
+            "NREMepisode": np.asarray(nrem_episode, dtype=np.float64).reshape(-1, 2),
+            "REMepisode": np.asarray(rem_episode, dtype=np.float64).reshape(-1, 2),
+            "WAKEepisode": np.asarray(wake_episode, dtype=np.float64).reshape(-1, 2),
+            "NREMpacket": np.asarray(packet, dtype=np.float64).reshape(-1, 2),
+            "MA": np.asarray(ma, dtype=np.float64).reshape(-1, 2),
+            "MA_REM": np.asarray(ma_rem, dtype=np.float64).reshape(-1, 2),
         },
         "detectorinfo": det,
     }
@@ -2310,8 +2310,10 @@ def _append_theta_epochs(sleep_state: dict[str, Any], basepath: Path, basename: 
 
     theta_ints = _idx_to_int(theta_states, timestamps, list(statenames))
     sleep_state["idx"]["theta_epochs"] = theta_idx
-    sleep_state["ints"]["THETA"] = _to_uint_intervals(theta_ints.get("THETAstate", np.empty((0, 2))))
-    sleep_state["ints"]["nonTHETA"] = _to_uint_intervals(theta_ints.get("nonTHETAstate", np.empty((0, 2))))
+    sleep_state["ints"]["THETA"] = np.asarray(theta_ints.get("THETAstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
+    sleep_state["ints"]["nonTHETA"] = np.asarray(
+        theta_ints.get("nonTHETAstate", np.empty((0, 2))), dtype=np.float64
+    ).reshape(-1, 2)
 
     out_path = basepath / f"{basename}.SleepState.states.mat"
     savemat(out_path, {"SleepState": sleep_state}, do_compression=True)
