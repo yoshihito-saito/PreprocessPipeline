@@ -70,12 +70,15 @@ class PreprocessConfig:
 
     save_raw: bool = False
     export_intermediate_dat: bool = True
+    zero_bad: bool = True
+    bad_channels: bool = True
 
     sorter: str | None = None
     sorter_path: Path | None = None
     sorter_config_path: Path | None = None
     matlab_path: Path | None = None
     sorter_verbose: bool = False
+    cleanup_temp_wh: bool = True
 
     save_params_json: bool = True
     save_manifest_json: bool = True
