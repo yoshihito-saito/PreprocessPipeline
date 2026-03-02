@@ -441,6 +441,26 @@ def apply_transform_to_selected_channels_preserve_shape(
     )
 
 
+def zero_selected_channels_preserve_shape(
+    *,
+    recording_raw: Any,
+    selected_channel_ids: list[int],
+) -> Any:
+    target_dtype = recording_raw.get_dtype() if hasattr(recording_raw, "get_dtype") else None
+
+    def _zero_and_cast(rec_sel: Any) -> Any:
+        rec_zero = spre.scale(rec_sel, gain=0.0, offset=0.0)
+        if target_dtype is not None:
+            rec_zero = spre.astype(rec_zero, dtype=target_dtype)
+        return rec_zero
+
+    return apply_transform_to_selected_channels_preserve_shape(
+        recording_raw=recording_raw,
+        selected_channel_ids=selected_channel_ids,
+        transform_fn=_zero_and_cast,
+    )
+
+
 def write_lfp(
     recording_raw: Any,
     lfp_path: Path,

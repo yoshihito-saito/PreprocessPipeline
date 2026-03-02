@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ import numpy as np
 import spikeinterface.extractors as se
 import spikeinterface.sorters as ss
 import yaml
-from scipy.io import loadmat
+from scipy.io import loadmat, savemat
 from spikeinterface.core.job_tools import job_keys as _SI_JOB_KEYS
 
 from .io import load_xml_metadata
@@ -743,31 +744,11 @@ def _patch_params_py(
     params_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
 
-def _patch_channel_map_npy(channel_map_path: Path, active_channels_0based: list[int]) -> None:
-    if not channel_map_path.exists():
-        return
-    try:
-        arr = np.load(channel_map_path)
-    except Exception:
-        return
-
-    mapped = np.asarray(active_channels_0based, dtype=np.int32)
-    if arr.ndim == 2 and arr.shape[1] == 1:
-        mapped = mapped.reshape(-1, 1)
-    elif arr.ndim == 2 and arr.shape[0] == 1:
-        mapped = mapped.reshape(1, -1)
-    elif arr.ndim != 1:
-        return
-
-    np.save(channel_map_path, mapped)
-
-
 def _patch_phy_outputs_for_raw_dat(
     *,
     output_folder: Path,
     raw_dat_path: Path,
     n_channels_dat: int,
-    active_channels_0based: list[int],
     hp_filtered: bool | None = None,
 ) -> None:
     for params_path in output_folder.rglob("params.py"):
@@ -777,11 +758,6 @@ def _patch_phy_outputs_for_raw_dat(
             n_channels_dat=n_channels_dat,
             hp_filtered=hp_filtered,
         )
-
-    for channel_map_name in ("channel_map.npy", "channel_map_si.npy"):
-        for p in output_folder.rglob(channel_map_name):
-            _patch_channel_map_npy(p, active_channels_0based)
-
 
 def _flatten_sorter_output_folder(output_folder: Path) -> None:
     sorter_output = output_folder / "sorter_output"
@@ -797,6 +773,88 @@ def _flatten_sorter_output_folder(output_folder: Path) -> None:
     for e in entries:
         shutil.move(str(e), str(output_folder / e.name))
     sorter_output.rmdir()
+
+
+def _rewrite_kilosort_ops_nchan_from_chanmap(
+    *,
+    sorter_output_folder: Path,
+    n_channels_total: int | None = None,
+    criterion_noise_channels_default: float = 0.2,
+) -> None:
+    chanmap_path = Path(sorter_output_folder) / "chanMap.mat"
+    ops_path = Path(sorter_output_folder) / "ops.mat"
+    if not chanmap_path.exists() or not ops_path.exists():
+        return
+    try:
+        chanmap = loadmat(str(chanmap_path), simplify_cells=True)
+        ops = loadmat(str(ops_path), simplify_cells=True).get("ops")
+        if not isinstance(ops, dict):
+            return
+        connected = chanmap.get("connected", None)
+        if connected is not None:
+            connected_arr = np.asarray(connected).reshape(-1)
+            n_active = int(np.count_nonzero(connected_arr > 0))
+        else:
+            chan_map = np.asarray(chanmap.get("chanMap", [])).reshape(-1)
+            n_active = int(chan_map.size)
+        if n_active <= 0:
+            return
+        ops["Nchan"] = float(n_active)
+        if n_channels_total is not None and int(n_channels_total) > 0:
+            ops["NchanTOT"] = float(int(n_channels_total))
+        # Some Kilosort1 forks require this field in ops.
+        if "criterionNoiseChannels" not in ops or ops.get("criterionNoiseChannels") is None:
+            ops["criterionNoiseChannels"] = float(criterion_noise_channels_default)
+        savemat(str(ops_path), {"ops": ops})
+    except Exception as exc:
+        print(f"Warning: failed to rewrite Kilosort ops Nchan from chanMap: {exc}")
+
+
+@contextmanager
+def _kilosort1_chanmap_override(chanmap_mat_path: Path | None):
+    if chanmap_mat_path is None or not Path(chanmap_mat_path).exists():
+        yield
+        return
+
+    original = getattr(ss.KilosortSorter, "_generate_channel_map_file", None)
+    original_ops = getattr(ss.KilosortSorter, "_generate_ops_file", None)
+
+    def _copy_channel_map(_recording, sorter_output_folder):
+        dst = Path(sorter_output_folder) / "chanMap.mat"
+        shutil.copy2(str(Path(chanmap_mat_path).resolve()), str(dst))
+
+    def _patched_generate_ops_file(_cls, recording, params, sorter_output_folder, binary_file_path):
+        original_ops(recording, params, sorter_output_folder, binary_file_path)
+        _rewrite_kilosort_ops_nchan_from_chanmap(
+            sorter_output_folder=Path(sorter_output_folder),
+            n_channels_total=int(recording.get_num_channels()),
+        )
+
+    ss.KilosortSorter._generate_channel_map_file = staticmethod(_copy_channel_map)
+    ss.KilosortSorter._generate_ops_file = classmethod(_patched_generate_ops_file)
+    try:
+        yield
+    finally:
+        if original is not None:
+            ss.KilosortSorter._generate_channel_map_file = original
+        if original_ops is not None:
+            ss.KilosortSorter._generate_ops_file = original_ops
+
+
+def _cleanup_temp_wh_dat(output_folder: Path) -> None:
+    candidates = [
+        output_folder / "temp_wh.dat",
+        output_folder / "sorter_output" / "temp_wh.dat",
+    ]
+    for p in candidates:
+        if not p.exists() or not p.is_file():
+            continue
+        try:
+            size_bytes = p.stat().st_size
+            p.unlink()
+            print(f"Removed Kilosort temporary file: {p} ({size_bytes} bytes)")
+        except Exception as exc:
+            print(f"Warning: failed to remove Kilosort temporary file {p}: {exc}")
 
 
 def execute_sorting_job(
@@ -825,6 +883,7 @@ def execute_sorting_job(
     reference: str = "local",
     local_radius_um: tuple[float, float] = (50.0, 200.0),
     sorter_verbose: bool = False,
+    cleanup_temp_wh: bool = True,
 ) -> Path:
     sorter_input = sorter.lower()
     if sorter_input not in _SORTER_ALIASES:
@@ -882,25 +941,29 @@ def execute_sorting_job(
     print(f"Loaded sorter params: {cfg_path}")
 
     sr, nch = _resolve_sr_nch(sampling_frequency, num_channels, xml_path)
-    if input_is_preprocessed:
-        active_channels_0based = list(range(int(nch)))
-    else:
-        active_channels_0based = _resolve_active_channels_0based(
-            num_channels=nch,
-            chanmap_mat_path=Path(chanmap_mat_path) if chanmap_mat_path is not None else None,
-            exclude_channels_0based=exclude_channels_0based,
-        )
+    resolved_active_channels_0based = _resolve_active_channels_0based(
+        num_channels=nch,
+        chanmap_mat_path=Path(chanmap_mat_path) if chanmap_mat_path is not None else None,
+        exclude_channels_0based=exclude_channels_0based,
+    )
+    ignored_channels_0based = sorted(set(range(int(nch))) - set(resolved_active_channels_0based))
+    # Keep channel count unchanged when the sorter input is already preprocessed.
+    active_channels_0based = (
+        list(range(int(nch))) if input_is_preprocessed else resolved_active_channels_0based
+    )
 
     if sorter_input == "kilosort":
         params = _normalize_kilosort_params(
             params,
             num_channels=nch,
             chanmap_mat_path=Path(chanmap_mat_path) if chanmap_mat_path is not None else None,
-            active_channel_count=len(active_channels_0based),
+            active_channel_count=len(resolved_active_channels_0based),
         )
         print(f"Resolved Kilosort params: NT={params.get('NT')} Nfilt={params.get('Nfilt')} ntbuff={params.get('ntbuff')}")
     elif sorter_input == "kilosort4":
         params = _normalize_kilosort4_params(params)
+        if ignored_channels_0based:
+            params["bad_channels"] = ignored_channels_0based
         print("Resolved Kilosort4 params")
     params = _merge_sorter_job_kwargs(params, job_kwargs)
 
@@ -946,11 +1009,16 @@ def execute_sorting_job(
         else:
             print("Kilosort4 auto geometry params requested, but no probe geometry was available.")
 
+    effective_sorter_verbose = bool(sorter_verbose)
+    # Kilosort1 via MATLAB can flood notebook/stdout; keep it quiet by default.
+    if sorter_input == "kilosort":
+        effective_sorter_verbose = False
+
     run_kwargs: dict[str, Any] = {
         "sorter_name": sorter_name,
         "recording": recording,
         "folder": output_folder,
-        "verbose": bool(sorter_verbose),
+        "verbose": effective_sorter_verbose,
         "with_output": True,
         "remove_existing_folder": remove_existing_folder,
         **params,
@@ -960,7 +1028,9 @@ def execute_sorting_job(
 
     print(f"Running sorter={sorter_name} -> {output_folder}")
     try:
-        _ = ss.run_sorter(**run_kwargs)
+        chanmap_override_path = Path(chanmap_mat_path) if (sorter_input == "kilosort" and chanmap_mat_path is not None) else None
+        with _kilosort1_chanmap_override(chanmap_override_path):
+            _ = ss.run_sorter(**run_kwargs)
     except Exception as err:
         if sorter_input != "kilosort":
             raise RuntimeError(
@@ -972,8 +1042,9 @@ def execute_sorting_job(
         hint = ""
         if matlab_log.exists():
             log_tail = matlab_log.read_text(encoding="utf-8", errors="replace")[-3000:]
-            print(f"\n[MATLAB log: {matlab_log}]")
-            print(log_tail)
+            if bool(sorter_verbose):
+                print(f"\n[MATLAB log: {matlab_log}]")
+                print(log_tail)
             if "higher compute capability" in log_tail:
                 hint = (
                     "\nDetected MATLAB CUDA compatibility error. "
@@ -982,19 +1053,20 @@ def execute_sorting_job(
                 )
         raise RuntimeError(
             f"Kilosort failed (possible GPU initialization error). "
-            f"Check the MATLAB log above, then re-run the cell.{hint}\nOriginal error: {err}"
+            f"Check MATLAB log at: {matlab_log}, then re-run the cell.{hint}\nOriginal error: {err}"
         ) from err
     _flatten_sorter_output_folder(output_folder)
     _patch_phy_outputs_for_raw_dat(
         output_folder=output_folder,
         raw_dat_path=dat_path,
         n_channels_dat=int(nch),
-        active_channels_0based=active_channels_0based,
         hp_filtered=bool(input_is_preprocessed),
     )
+    if sorter_input == "kilosort" and cleanup_temp_wh:
+        _cleanup_temp_wh_dat(output_folder)
     print(
         "Patched output metadata for raw.dat compatibility: "
-        f"n_channels_dat={int(nch)}, active={len(active_channels_0based)}"
+        f"n_channels_dat={int(nch)}, active={len(resolved_active_channels_0based)}"
     )
     print("Sorter finished")
     return output_folder
@@ -1025,6 +1097,7 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
         docker_image=args.docker_image,
         preprocess_for_sorting=False,
         sorter_verbose=bool(args.sorter_verbose),
+        cleanup_temp_wh=not bool(args.keep_temp_wh_dat),
     )
 
 
@@ -1061,6 +1134,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--remove-existing-folder", action="store_true", help="Delete existing output folder")
     p.add_argument("--docker-image", default=None, help="Optional docker image")
     p.add_argument("--sorter-verbose", action="store_true", help="Enable verbose sorter logs")
+    p.add_argument(
+        "--keep-temp-wh-dat",
+        action="store_true",
+        help="Keep Kilosort1 temp_wh.dat (default behavior removes it after sorting).",
+    )
     return p
 
 
