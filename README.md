@@ -30,7 +30,7 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
 - [x] Artifact removal (`remove_artifact_TTL`, `remove_highamp_artifact`)
 - [ ] Denoise (`removeNoise`)
 - [x] State scoring
-- [ ] Spike sorting
+- [x] Spike sorting
 - [ ] Acceleration extraction (`getAcceleration` / `computeIntanAccel`)
 - [ ] Tracking/DLC (`getPos`, `path_to_dlc_bat_file`, `general_behavior_file`)
 - [ ] Session summary (`runSummary` / `sessionSummary`)
