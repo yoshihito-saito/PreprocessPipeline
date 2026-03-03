@@ -19,8 +19,7 @@ class PostprocessConfig:
     chanmap_mat_path: Path | None = None
     reject_channels: list[int] = field(default_factory=list)
 
-    apply_preprocessing_if_dat: bool = True
-    preprocess_recording_object: bool = False
+    apply_preprocess: bool = False
     bandpass_min_hz: float = 500.0
     bandpass_max_hz: float = 8000.0
     reference: str = "local"
@@ -64,14 +63,10 @@ class PostprocessConfig:
     )
     skip_pc_metrics: bool = True
 
-    output_folder_name: str = "sorter_output_postprocessed"
     remove_if_exists: bool = True
     copy_binary: bool = False
-    phy_hp_filtered: bool = True
     use_relative_path: bool = False
     metrics_csv_name: str = "quality_metrics.csv"
-    write_preprocessed_dat_for_phy: bool = False
-    force_params_dat_path: Path | None = None
 
     noise_thresholds: dict[str, float] = field(
         default_factory=lambda: {
