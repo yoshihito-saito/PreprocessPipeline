@@ -7,6 +7,7 @@ import shutil
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import spikeinterface as si
 import spikeinterface.curation as scur
@@ -14,14 +15,14 @@ import spikeinterface.extractors as se
 import spikeinterface.qualitymetrics as sqm
 from spikeinterface.exporters import export_to_phy
 
-from utils.unit_classify import mark_noise_clusters_from_metrics
-from utils.unit_split import autosplit_outliers_pca
+from .unit_classify import mark_noise_clusters_from_metrics
+from .unit_split import autosplit_outliers_pca
 
 from ..preprocess.metafile import PreprocessConfig, PreprocessResult
 from ..preprocess.recording import (
     apply_preprocessing,
     attach_probe_and_remove_bad_channels,
-    write_concatenated_dat,
+    preprocess_selected_channels_preserve_shape,
 )
 from .metafile import PostprocessConfig, PostprocessResult
 
@@ -39,6 +40,160 @@ def _find_sorting_output_dirs(root: Path) -> list[Path]:
     )
 
 
+def search_sorter_paths(local_output_dir: str | Path) -> list[Path]:
+    root = Path(local_output_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"local output dir not found: {root}")
+    return [p.resolve() for p in _find_sorting_output_dirs(root)]
+
+
+def _resolve_sorting_run_root(sorting_phy_folder: Path) -> Path:
+    # Legacy layouts may point to <Kilosort_xxx>/sorter_output.
+    # Current layouts use <Kilosort_xxx> directly.
+    return sorting_phy_folder.parent if sorting_phy_folder.name == "sorter_output" else sorting_phy_folder
+
+
+def _resolve_postprocess_output_folder(sorting_phy_folder: Path) -> Path:
+    sorting_run_root = _resolve_sorting_run_root(sorting_phy_folder)
+    spi_root = (sorting_run_root.parent / f"{sorting_run_root.name}_spi").resolve()
+    return spi_root
+
+
+def _resolve_sorting_root_from_result(
+    result: PreprocessResult,
+    *,
+    kilosort_path: str | None = None,
+) -> Path:
+    root = Path(result.local_output_dir)
+    if kilosort_path is not None:
+        name = str(kilosort_path).strip()
+        folder = Path(name)
+        if (
+            not name
+            or folder.is_absolute()
+            or len(folder.parts) != 1
+            or folder.name in {".", ".."}
+        ):
+            raise ValueError(
+                "kilosort_path must be a single folder name under result.local_output_dir "
+                f"(got: {kilosort_path!r})"
+            )
+        resolved = (root / folder.name).resolve()
+        if not resolved.exists():
+            raise FileNotFoundError(f"Kilosort folder not found: {resolved}")
+        if not resolved.is_dir():
+            raise NotADirectoryError(f"Kilosort path is not a directory: {resolved}")
+        return resolved
+
+    candidates = _find_sorting_output_dirs(root)
+    if not candidates:
+        raise FileNotFoundError(f"No Kilosort result found under {root}.")
+    if len(candidates) > 1:
+        names = ", ".join(p.name for p in candidates)
+        raise ValueError(
+            "Multiple Kilosort folders found under "
+            f"{root}. Specify kilosort_path explicitly. Candidates: {names}"
+        )
+    return candidates[0]
+
+
+def _resolve_bad_channels_for_postprocess(
+    result: PreprocessResult, preprocess_config: PreprocessConfig
+) -> list[int]:
+    if result.bad_channels_0based:
+        return sorted(set(int(ch) for ch in result.bad_channels_0based))
+    return sorted(set(int(ch) for ch in preprocess_config.reject_channels))
+
+
+def _resolve_phy_sample_rate(phy_dir: Path, fallback_sample_rate: float | None = None) -> float:
+    params_path = phy_dir / "params.py"
+    if params_path.exists():
+        text = params_path.read_text(encoding="utf-8", errors="replace")
+        match = re.search(r"(?m)^\s*sample_rate\s*=\s*([0-9eE+\-.]+)", text)
+        if match is not None:
+            return float(match.group(1))
+    if fallback_sample_rate is not None:
+        return float(fallback_sample_rate)
+    raise ValueError(
+        f"Could not resolve sample_rate from {params_path} and no fallback sampling_frequency was provided."
+    )
+
+
+def _mark_low_firing_rate_clusters_as_noise(
+    *,
+    phy_dir: Path,
+    threshold_hz: float,
+    fallback_sample_rate: float | None,
+) -> tuple[int, int]:
+    spike_times_path = phy_dir / "spike_times.npy"
+    spike_clusters_path = phy_dir / "spike_clusters.npy"
+    if not spike_times_path.exists() or not spike_clusters_path.exists():
+        raise FileNotFoundError(
+            "Missing Phy spike files. Expected both spike_times.npy and spike_clusters.npy under "
+            f"{phy_dir}."
+        )
+
+    spike_times = np.asarray(np.load(spike_times_path, mmap_mode="r")).reshape(-1)
+    spike_clusters = np.asarray(np.load(spike_clusters_path, mmap_mode="r")).reshape(-1)
+    if spike_times.size != spike_clusters.size:
+        raise ValueError(
+            "spike_times.npy and spike_clusters.npy have mismatched lengths: "
+            f"{spike_times.size} vs {spike_clusters.size}"
+        )
+
+    sample_rate = _resolve_phy_sample_rate(phy_dir, fallback_sample_rate=fallback_sample_rate)
+    if sample_rate <= 0:
+        raise ValueError(f"Invalid sample_rate resolved for {phy_dir}: {sample_rate}")
+
+    if spike_clusters.size == 0:
+        unique_clusters = np.asarray([], dtype=np.int64)
+        low_rate_clusters = np.asarray([], dtype=np.int64)
+    else:
+        unique_clusters, counts = np.unique(spike_clusters.astype(np.int64), return_counts=True)
+        duration_sec = float(np.max(spike_times.astype(np.int64)) + 1) / float(sample_rate)
+        if duration_sec <= 0:
+            low_rate_clusters = np.asarray([], dtype=np.int64)
+        else:
+            firing_rates = counts.astype(np.float64) / duration_sec
+            low_rate_clusters = unique_clusters[firing_rates < float(threshold_hz)]
+
+    cg_path = phy_dir / "cluster_group.tsv"
+    if cg_path.exists():
+        cg = pd.read_csv(cg_path, sep="\t")
+        cols_lut = {str(col).strip().lower(): col for col in cg.columns}
+        cluster_col = cols_lut.get("cluster_id", cg.columns[0] if cg.shape[1] >= 1 else None)
+        group_col = cols_lut.get("group") or cols_lut.get("kslabel") or cols_lut.get("label")
+        if group_col is None and cg.shape[1] >= 2:
+            group_col = cg.columns[1]
+        if cluster_col is None or group_col is None:
+            raise ValueError(f"Invalid cluster_group.tsv format: {cg_path}")
+        cg = cg[[cluster_col, group_col]].copy()
+        cg.columns = ["cluster_id", "group"]
+        cg["cluster_id"] = pd.to_numeric(cg["cluster_id"], errors="coerce")
+        cg = cg.dropna(subset=["cluster_id"]).copy()
+        cg["cluster_id"] = cg["cluster_id"].astype(np.int64)
+        cg["group"] = cg["group"].astype(str)
+    else:
+        cg = pd.DataFrame(columns=["cluster_id", "group"])
+
+    existing_ids = cg["cluster_id"].to_numpy(dtype=np.int64) if not cg.empty else np.asarray([], dtype=np.int64)
+    all_ids = np.unique(np.concatenate((existing_ids, unique_clusters))).astype(np.int64, copy=False)
+    if all_ids.size == 0:
+        out_df = pd.DataFrame(columns=["cluster_id", "group"])
+    else:
+        out_df = pd.DataFrame({"cluster_id": all_ids, "group": "unsorted"})
+        if not cg.empty:
+            group_map = dict(zip(cg["cluster_id"].tolist(), cg["group"].tolist()))
+            out_df["group"] = out_df["cluster_id"].map(group_map).fillna("unsorted")
+        if low_rate_clusters.size > 0:
+            low_set = {int(x) for x in low_rate_clusters.tolist()}
+            out_df.loc[out_df["cluster_id"].isin(low_set), "group"] = "noise"
+        out_df = out_df.sort_values("cluster_id").reset_index(drop=True)
+
+    out_df.to_csv(cg_path, sep="\t", index=False)
+    return int(out_df.shape[0]), int(low_rate_clusters.size)
+
+
 def _safe_rmtree(path: Path, *, retries: int = 3, delay: float = 1.0) -> None:
     """shutil.rmtree with retry for Windows memory-mapped file locks."""
     for attempt in range(retries):
@@ -51,6 +206,19 @@ def _safe_rmtree(path: Path, *, retries: int = 3, delay: float = 1.0) -> None:
                 time.sleep(delay)
             else:
                 raise
+
+
+def _clear_folder_contents(folder: Path, *, keep_names: set[str] | None = None) -> None:
+    keep = keep_names or set()
+    if not folder.exists():
+        return
+    for child in folder.iterdir():
+        if child.name in keep:
+            continue
+        if child.is_dir():
+            _safe_rmtree(child)
+        else:
+            child.unlink(missing_ok=True)
 
 
 def _count_units_and_spikes(sorting) -> tuple[int, int]:
@@ -104,16 +272,7 @@ def _resolve_recording_for_postprocess(config: PostprocessConfig):
         raise ValueError("Either recording or dat_path must be provided")
 
     if config.recording is not None:
-        rec = config.recording
-        if config.preprocess_recording_object:
-            rec = apply_preprocessing(
-                recording_raw=rec,
-                bandpass_min_hz=config.bandpass_min_hz,
-                bandpass_max_hz=config.bandpass_max_hz,
-                reference=config.reference,
-                local_radius_um=config.local_radius_um,
-            )
-        return rec
+        return config.recording
 
     if config.sampling_frequency is None or config.num_channels is None:
         raise ValueError("sampling_frequency and num_channels are required when dat_path is used")
@@ -126,12 +285,26 @@ def _resolve_recording_for_postprocess(config: PostprocessConfig):
         gain_to_uV=config.gain_to_uV,
         offset_to_uV=config.offset_to_uV,
     )
-    rec_with_probe, _, _ = attach_probe_and_remove_bad_channels(
+    rec_with_probe, bad_0, _ = attach_probe_and_remove_bad_channels(
         recording=rec_raw,
         chanmap_mat_path=config.chanmap_mat_path,
         reject_channels_0based=sorted(set(config.reject_channels)),
     )
-    if config.apply_preprocessing_if_dat:
+    if config.apply_preprocess:
+        if hasattr(rec_with_probe, "get_channel_ids"):
+            bad_set = {int(ch) for ch in bad_0}
+            all_channels = [int(ch) for ch in rec_with_probe.get_channel_ids()]
+            good_channels = [ch for ch in all_channels if ch not in bad_set]
+            if not good_channels:
+                return rec_with_probe
+            return preprocess_selected_channels_preserve_shape(
+                recording_raw=rec_with_probe,
+                selected_channel_ids=good_channels,
+                bandpass_min_hz=config.bandpass_min_hz,
+                bandpass_max_hz=config.bandpass_max_hz,
+                reference=config.reference,
+                local_radius_um=config.local_radius_um,
+            )
         return apply_preprocessing(
             recording_raw=rec_with_probe,
             bandpass_min_hz=config.bandpass_min_hz,
@@ -172,30 +345,22 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
         raise FileNotFoundError(f"sorting_phy_folder not found: {sorting_phy_folder}")
     _log(f"sorting_phy_folder={sorting_phy_folder}")
 
-    output_folder = sorting_phy_folder.parent / config.output_folder_name
+    output_folder = _resolve_postprocess_output_folder(sorting_phy_folder)
     if output_folder.exists() and config.remove_if_exists and not config.skip_curation:
         _safe_rmtree(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
     _log(f"output_folder={output_folder}")
     analyzer_cache_root: Path | None = None
     if config.analyzer_format == "binary_folder":
-        # Place cache OUTSIDE output_folder to avoid PermissionError on Windows
-        # when export_to_phy removes output_folder while .npy files are memory-mapped.
         analyzer_cache_root = (
             Path(config.analyzer_cache_dir).resolve()
             if config.analyzer_cache_dir is not None
-            else (sorting_phy_folder.parent / (config.output_folder_name + "_analyzer_cache")).resolve()
+            else (output_folder / "analyzer_cache").resolve()
         )
         if analyzer_cache_root.exists() and config.remove_if_exists and not config.skip_curation:
             _safe_rmtree(analyzer_cache_root)
         analyzer_cache_root.mkdir(parents=True, exist_ok=True)
         _log(f"analyzer_cache_dir={analyzer_cache_root}")
-
-    # Clean up stale old-location cache inside output_folder (from runs before cache was moved outside)
-    old_cache_inside_output = output_folder / "analyzer_cache"
-    if old_cache_inside_output.exists():
-        _log("removing stale analyzer_cache inside output_folder")
-        _safe_rmtree(old_cache_inside_output)
 
     # Container to track intermediate analyzers for cleanup before export
     _intermediate_analyzers: list = []
@@ -224,17 +389,21 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
     recording_for_post = _resolve_recording_for_postprocess(config)
     _log("recording resolved")
     preprocessed_dat_path: Path | None = None
-    params_dat_path_override: Path | None = None
-    if config.write_preprocessed_dat_for_phy:
-        _log("writing preprocessed DAT for Phy")
-        preprocessed_dat_path = output_folder / "preprocessed_for_phy.dat"
-        write_concatenated_dat(
-            recording=recording_for_post,
-            output_dat_path=preprocessed_dat_path,
-            overwrite=True,
-            job_kwargs=config.job_kwargs,
-        )
-        params_dat_path_override = preprocessed_dat_path
+
+    low_rate_threshold_hz = float(config.noise_thresholds.get("firing_rate_lt", 0.01))
+    _log(
+        "marking low firing-rate clusters as noise before Phy load "
+        f"(threshold={low_rate_threshold_hz:g} Hz)"
+    )
+    n_clusters_total, n_clusters_low_rate = _mark_low_firing_rate_clusters_as_noise(
+        phy_dir=sorting_phy_folder,
+        threshold_hz=low_rate_threshold_hz,
+        fallback_sample_rate=config.sampling_frequency,
+    )
+    _log(
+        "updated cluster_group.tsv before Phy load: "
+        f"total_clusters={n_clusters_total}, low_rate_noise={n_clusters_low_rate}"
+    )
 
     _log("loading Phy sorting")
     sorting = se.read_phy(str(sorting_phy_folder), exclude_cluster_groups=config.exclude_cluster_groups)
@@ -395,13 +564,28 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
     metrics_out_df.to_csv(metrics_csv_path, index=True)
 
     _log("exporting to Phy")
+    keep_names: set[str] = set()
+    if analyzer_cache_root is not None and analyzer_cache_root.parent == output_folder:
+        keep_names.add(analyzer_cache_root.name)
+    if config.remove_if_exists:
+        _clear_folder_contents(output_folder, keep_names=keep_names)
+
+    # export_to_phy requires output_folder not to exist. Since we keep output_folder
+    # (and optionally analyzer_cache) around, export into a temporary child folder and
+    # then move exported files to output_folder root.
+    phy_export_tmp = output_folder / "__phy_export_tmp__"
+    if analyzer_cache_root is not None and phy_export_tmp.resolve() == analyzer_cache_root.resolve():
+        raise ValueError("analyzer_cache_dir cannot be '__phy_export_tmp__' under output_folder.")
+    if phy_export_tmp.exists():
+        _safe_rmtree(phy_export_tmp)
+
     export_to_phy(
         sorting_analyzer=analyzer_split,
-        output_folder=output_folder,
+        output_folder=phy_export_tmp,
         compute_pc_features=True,
         compute_amplitudes=True,
         copy_binary=config.copy_binary,
-        remove_if_exists=config.remove_if_exists,
+        remove_if_exists=False,
         template_mode="average",
         add_quality_metrics=True,
         add_template_metrics=True,
@@ -410,18 +594,23 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
         verbose=True,
         **config.job_kwargs,
     )
+    for child in phy_export_tmp.iterdir():
+        destination = output_folder / child.name
+        if destination.exists():
+            if destination.is_dir():
+                _safe_rmtree(destination)
+            else:
+                destination.unlink(missing_ok=True)
+        shutil.move(str(child), str(destination))
+    _safe_rmtree(phy_export_tmp)
+
     params_file = output_folder / "params.py"
-    if config.force_params_dat_path is not None:
-        params_dat_path_override = Path(config.force_params_dat_path)
-    # Default: use the input dat_path (concatenated recording) when nothing else is set
-    if params_dat_path_override is None and config.dat_path is not None:
-        params_dat_path_override = Path(config.dat_path)
-    if params_dat_path_override is not None:
+    if config.dat_path is not None:
         _log("fixing params.py dat_path/hp_filtered")
         _fix_phy_params_file(
             params_file=params_file,
-            dat_path=params_dat_path_override,
-            hp_filtered=config.phy_hp_filtered,
+            dat_path=Path(config.dat_path),
+            hp_filtered=(not bool(config.apply_preprocess)),
         )
 
     # export_to_phy can recreate output_folder when remove_if_exists=True.
@@ -477,7 +666,7 @@ def attach_existing_sorting_result(
     if existing_sorting_dir is not None:
         sorting_dir = Path(existing_sorting_dir)
     else:
-        root = Path(sorting_temp_root) if sorting_temp_root is not None else (Path("sorting_temp") / result.basename)
+        root = Path(sorting_temp_root) if sorting_temp_root is not None else Path(result.local_output_dir)
         candidates = _find_sorting_output_dirs(root)
         if not candidates:
             raise FileNotFoundError(f"No sorting result found under {root}.")
@@ -511,7 +700,7 @@ def build_preprocessed_recording_from_result(
     rec_with_probe, _, _ = attach_probe_and_remove_bad_channels(
         recording=rec_raw,
         chanmap_mat_path=preprocess_config.chanmap_mat_path,
-        reject_channels_0based=preprocess_config.reject_channels,
+        reject_channels_0based=_resolve_bad_channels_for_postprocess(result, preprocess_config),
     )
     return apply_preprocessing(
         recording_raw=rec_with_probe,
@@ -527,39 +716,70 @@ def run_postprocess_from_preprocess(
     preprocess_config: PreprocessConfig,
     *,
     recording=None,
-    output_folder_name: str = "sorter_output_postprocessed",
+    kilosort_path: str | None = None,
+    apply_preprocess: bool | None = None,
     analyzer_format: str = "binary_folder",
     analyzer_cache_dir: str | Path | None = None,
     delete_analyzer_cache: bool = False,
-    phy_hp_filtered: bool = True,
 ) -> PostprocessResult:
-    if result.sorter_output_dir is None:
-        raise RuntimeError("No sorter output found in result.sorter_output_dir")
-
-    sorting_root = Path(result.sorter_output_dir)
-    sorter_output_subdir = sorting_root / "sorter_output"
-    sorting_phy_folder = sorter_output_subdir if sorter_output_subdir.exists() else sorting_root
+    sorting_root = _resolve_sorting_root_from_result(result, kilosort_path=kilosort_path)
+    sorting_phy_folder = sorting_root
     use_recording_object = recording is not None
+    apply_preprocess_effective = (
+        (not bool(preprocess_config.do_preprocess))
+        if apply_preprocess is None
+        else bool(apply_preprocess)
+    )
+    reject_channels = _resolve_bad_channels_for_postprocess(result, preprocess_config)
 
     post_cfg = PostprocessConfig(
         sorting_phy_folder=sorting_phy_folder,
         recording=recording if use_recording_object else None,
-        dat_path=None if use_recording_object else result.dat_path,
+        dat_path=result.dat_path,
         sampling_frequency=result.sr,
         num_channels=result.n_channels,
         dtype=preprocess_config.dtype,
         gain_to_uV=preprocess_config.gain_to_uV,
         offset_to_uV=preprocess_config.offset_to_uV,
         chanmap_mat_path=preprocess_config.chanmap_mat_path,
-        reject_channels=preprocess_config.reject_channels,
-        apply_preprocessing_if_dat=True,
-        output_folder_name=output_folder_name,
+        reject_channels=reject_channels,
+        apply_preprocess=apply_preprocess_effective,
         analyzer_format=analyzer_format,
         analyzer_cache_dir=Path(analyzer_cache_dir) if analyzer_cache_dir is not None else None,
         delete_analyzer_cache=delete_analyzer_cache,
-        phy_hp_filtered=phy_hp_filtered,
     )
     return run_postprocess_session(post_cfg)
+
+
+def run_postprocess_many_from_preprocess(
+    result: PreprocessResult,
+    preprocess_config: PreprocessConfig,
+    *,
+    kilosort_paths: list[str],
+    recording=None,
+    apply_preprocess: bool | None = None,
+    analyzer_format: str = "binary_folder",
+    analyzer_cache_dir: str | Path | None = None,
+    delete_analyzer_cache: bool = False,
+) -> list[PostprocessResult]:
+    if not kilosort_paths:
+        raise ValueError("kilosort_paths must contain at least one folder name.")
+
+    results: list[PostprocessResult] = []
+    for folder_name in kilosort_paths:
+        results.append(
+            run_postprocess_from_preprocess(
+                result=result,
+                preprocess_config=preprocess_config,
+                recording=recording,
+                kilosort_path=folder_name,
+                apply_preprocess=apply_preprocess,
+                analyzer_format=analyzer_format,
+                analyzer_cache_dir=analyzer_cache_dir,
+                delete_analyzer_cache=delete_analyzer_cache,
+            )
+        )
+    return results
 
 
 # Short aliases for notebook use
@@ -587,19 +807,42 @@ def run_postprocess(
     preprocess_config: PreprocessConfig,
     *,
     recording=None,
-    output_folder_name: str = "sorter_output_postprocessed",
+    kilosort_path: str | None = None,
+    apply_preprocess: bool | None = None,
     analyzer_format: str = "binary_folder",
     analyzer_cache_dir: str | Path | None = None,
     delete_analyzer_cache: bool = False,
-    phy_hp_filtered: bool = True,
 ) -> PostprocessResult:
     return run_postprocess_from_preprocess(
         result,
         preprocess_config,
         recording=recording,
-        output_folder_name=output_folder_name,
+        kilosort_path=kilosort_path,
+        apply_preprocess=apply_preprocess,
         analyzer_format=analyzer_format,
         analyzer_cache_dir=analyzer_cache_dir,
         delete_analyzer_cache=delete_analyzer_cache,
-        phy_hp_filtered=phy_hp_filtered,
+    )
+
+
+def run_postprocess_many(
+    result: PreprocessResult,
+    preprocess_config: PreprocessConfig,
+    *,
+    kilosort_paths: list[str],
+    recording=None,
+    apply_preprocess: bool | None = None,
+    analyzer_format: str = "binary_folder",
+    analyzer_cache_dir: str | Path | None = None,
+    delete_analyzer_cache: bool = False,
+) -> list[PostprocessResult]:
+    return run_postprocess_many_from_preprocess(
+        result=result,
+        preprocess_config=preprocess_config,
+        kilosort_paths=kilosort_paths,
+        recording=recording,
+        apply_preprocess=apply_preprocess,
+        analyzer_format=analyzer_format,
+        analyzer_cache_dir=analyzer_cache_dir,
+        delete_analyzer_cache=delete_analyzer_cache,
     )
