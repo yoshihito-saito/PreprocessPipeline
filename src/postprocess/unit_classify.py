@@ -106,7 +106,8 @@ def mark_noise_clusters_from_metrics(
         - "isi_violations_count_gt": int    # mark noise if count > value
         - "presence_ratio_lt": float        # mark noise if presence < value
         - "snr_lt": float                   # mark noise if snr < value
-        - "amplitude_median_lt": float    # mark noise if abs(amplitude_median) < value
+        - "amplitude_median_lt": float      # mark noise if abs(amplitude_median) < value
+        - "firing_rate_lt": float           # mark noise if firing rate < value (Hz)
     backup : bool
         If True, make a timestamped backup of the original TSV before overwriting.
     reset_to_unsorted : bool
@@ -165,6 +166,8 @@ def mark_noise_clusters_from_metrics(
         conds.append(df["snr"] < thresholds["snr_lt"])
     if "amplitude_median_lt" in thresholds and "_amp_abs_" in df.columns:
         conds.append(df["_amp_abs_"] < thresholds["amplitude_median_lt"])
+    if "firing_rate_lt" in thresholds and "firing_rate" in df.columns:
+        conds.append(df["firing_rate"] < thresholds["firing_rate_lt"])
 
     noise_mask = pd.concat(conds, axis=1).any(axis=1) if conds else pd.Series(False, index=df.index)
 
@@ -200,6 +203,8 @@ def mark_noise_clusters_from_metrics(
     if update_cluster_info:
         # Merge all metrics with updated group labels
         df_with_group = df.drop(columns=["_amp_abs_"], errors="ignore")
+        # Avoid column name collision when input metrics already include "group"
+        df_with_group = df_with_group.drop(columns=["group"], errors="ignore")
         df_with_group = df_with_group.join(cg[["group"]], how="left")
         df_with_group["group"] = df_with_group["group"].fillna("unsorted")
         
