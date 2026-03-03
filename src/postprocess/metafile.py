@@ -65,7 +65,7 @@ class PostprocessConfig:
 
     remove_if_exists: bool = True
     copy_binary: bool = False
-    use_relative_path: bool = False
+    use_relative_path: bool = True
     metrics_csv_name: str = "quality_metrics.csv"
 
     noise_thresholds: dict[str, float] = field(

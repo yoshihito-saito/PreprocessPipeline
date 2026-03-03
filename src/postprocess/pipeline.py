@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import gc
+import os
 import re
 import shutil
 import time
@@ -315,9 +316,24 @@ def _resolve_recording_for_postprocess(config: PostprocessConfig):
     return rec_with_probe
 
 
-def _fix_phy_params_file(params_file: Path, dat_path: Path, hp_filtered: bool) -> None:
+def _fix_phy_params_file(
+    params_file: Path,
+    dat_path: Path,
+    hp_filtered: bool,
+    *,
+    use_relative_path: bool,
+) -> None:
     content = params_file.read_text(encoding="utf-8")
-    dat_line = f"dat_path = r'{str(dat_path)}'"
+    dat_path_obj = Path(dat_path)
+    dat_value = str(dat_path_obj)
+    if use_relative_path:
+        try:
+            dat_value = Path(
+                os.path.relpath(dat_path_obj.resolve(), start=params_file.parent.resolve())
+            ).as_posix()
+        except Exception:
+            dat_value = str(dat_path_obj)
+    dat_line = f"dat_path = r'{dat_value}'"
     if re.search(r"(?m)^dat_path\s*=", content):
         content = re.sub(r"(?m)^dat_path\s*=.*$", lambda _: dat_line, content)
     else:
@@ -611,6 +627,7 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
             params_file=params_file,
             dat_path=Path(config.dat_path),
             hp_filtered=(not bool(config.apply_preprocess)),
+            use_relative_path=bool(config.use_relative_path),
         )
 
     # export_to_phy can recreate output_folder when remove_if_exists=True.
