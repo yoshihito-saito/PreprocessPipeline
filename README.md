@@ -19,41 +19,28 @@ e.g. for cuda 11.8
 pip3 install torch --index-url https://download.pytorch.org/whl/cu118
 ```
 
-## Pipeline Steps (Preprocess + Postprocess)
+## Pipeline Workflow
 
-### Preprocess (`run_preprocess_session`)
+### 1. Setup & Configuration ⚙️
+- Select Data: Choose the folder containing raw recording files.
+- Map Channels: Define probe geometry and exclude known bad channels.
+- Set Parameters: Configure filtering, artifact removal rules, and spike sorting options.
 
-1. Make session context: resolve `basepath/basename/output_dir`, ensure `.xml/.rhd`, and load metadata.
-2. Discover recordings: find input `amplifier.dat` files and build acquisition catalog.
-3. Build merge points: compute cumulative sample boundaries and save `basename.MergePoints.events.mat`.
-4. Prepare sidecar DATs: concatenate `analogin/digitalin/auxiliary/time` binaries when needed.
-5. Export analog/digital events: generate `*.events.mat` from sidecar signals.
-6. Load and concatenate amplifier DATs: read each subsession and combine into one recording.
-7. Save raw DAT (optional): write `basename_raw.dat` when `save_raw=True`.
-8. Attach probe and mark bad channels: apply `chanMap` and bad-channel masks.
-9. Run CMR preprocess (optional): bandpass + referencing on good channels (shape-preserving).
-10. Run TTL artifact removal (optional): detect TTL windows and clean waveform segments.
-11. Run high-amplitude artifact removal (optional): detect large transients and clean segments.
-12. Write final DAT output: save `basename.dat` (preprocessed if enabled).
-13. Write LFP output (optional): generate and save `basename.lfp`.
-14. Build `session.mat`: write Neurocode-compatible session metadata.
-15. Run state scoring (optional): generate sleep-state outputs and figures.
-16. Run spike sorter (optional): run configured sorter (e.g., Kilosort/Kilosort4).
-17. Save manifest and return: persist params/manifest and return `PreprocessResult`.
+### 2. Data Preparation 📂
+- Merge Files: Discover and concatenate raw `.dat` files across subsessions.
+- Extract Events: Export analog, digital, and TTL event timestamps.
 
-### Postprocess (`run_postprocess_session` / `run_postprocess_from_preprocess`)
+### 3. Signal Processing (Cleaning) 🧹
+- Filter: Apply bandpass filtering and Common Median Reference (CMR).
+- Remove Artifacts: Detect and remove TTL stimulation artifacts and high-amplitude noise windows.
 
-1. Resolve inputs: decide Kilosort folder, recording source (`recording` or `dat_path`), and bad channels.
-2. Prepare output folders: create `<KilosortFolder>_spi` and `analyzer_cache` (binary analyzer mode).
-3. Build postprocess recording: attach probe and optionally preprocess good channels only.
-4. Pre-filter low-rate units: mark units with firing rate `< 0.01 Hz` as `noise` in `cluster_group.tsv`.
-5. Load sorting from Phy: read non-noise clusters (`exclude_cluster_groups` applied).
-6. Run core curation: remove duplicated spikes and redundant units.
-7. Merge and split units: merge similar units, then auto-split outliers.
-8. Compute final features/metrics: calculate quality features and save `quality_metrics.csv`.
-9. Export Phy output: export into `<KilosortFolder>_spi` and fix `params.py` (`dat_path`, `hp_filtered`).
-10. Relabel noise from metrics: update `cluster_group.tsv` based on quality thresholds.
-11. Return result: output paths + unit/spike summary in `PostprocessResult`.
+### 4. Output & Analysis 📊
+- Save Clean Data: Export the cleaned continuous `.dat` and downsampled `LFP` files.
+- State Scoring: Optionally run sleep/wake state scoring.
+- Spike Sorting: Run Kilosort (or another sorter) to extract unit candidates.
+
+### 5. Post-Processing 🛠️
+- Refine Sorting: Clean sorting outputs by removing duplicate spikes, merging fragmented units, splitting outliers, and labeling noisy units.
 
 ## Artifact Removal Options (Current)
 
