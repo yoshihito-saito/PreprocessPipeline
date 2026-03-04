@@ -3,6 +3,7 @@
 from dataclasses import asdict
 from datetime import datetime
 import os
+import shutil
 from pathlib import Path
 from shutil import copy2
 import json
@@ -827,3 +828,191 @@ def save_params_and_manifest(
         savemat(output_dir / "preprocessSession_params.mat", {"results": cfg_for_mat}, do_compression=True)
         if script_path is not None and Path(script_path).exists():
             copy2(script_path, output_dir / "preprocessSession.log")
+
+
+def convert_dual_side_map(
+    chan_map_file: str | Path,
+    x_shift: float = 6.0,
+    pairs_to_merge: list[tuple[int, int]] | None = None,
+    custom_shank_positions: dict[int, float] | None = None,
+) -> None:
+    """Merge paired front/back shanks in chanMap and apply optional x-offset overrides."""
+    p = Path(chan_map_file)
+    if not p.exists():
+        print(f"File not found: {p}")
+        return
+
+    data = loadmat(p)
+    x = np.asarray(data["xcoords"]).flatten()
+    k = np.asarray(data["kcoords"]).flatten()
+    x_shape = data["xcoords"].shape
+    k_shape = data["kcoords"].shape
+
+    unique_shanks = np.unique(k)
+    unique_shanks.sort()
+    if pairs_to_merge is None:
+        n_pairs = len(unique_shanks) // 2
+        pairs_to_merge = [(int(unique_shanks[2 * i]), int(unique_shanks[2 * i + 1])) for i in range(n_pairs)]
+        print(f"Auto-detected {len(pairs_to_merge)} pairs to merge.")
+    else:
+        print(f"Using provided list of {len(pairs_to_merge)} pairs to merge.")
+
+    for s_back, s_front in pairs_to_merge:
+        idx_back = k == s_back
+        idx_front = k == s_front
+        if not np.any(idx_back) or not np.any(idx_front):
+            print(f"Warning: Missing channels for pair ({s_back}, {s_front}).")
+            continue
+
+        k[idx_front] = s_back
+        mean_x_back = float(np.mean(x[idx_back]))
+        mean_x_front = float(np.mean(x[idx_front]))
+        current_offset = mean_x_front - mean_x_back
+        x[idx_front] = x[idx_front] - current_offset + x_shift
+        print(f"Merged Shank {s_front} into {s_back}. Shifted X by {-current_offset + x_shift:.2f} um.")
+
+    if custom_shank_positions:
+        print(f"Applying custom positions to {len(custom_shank_positions)} shanks.")
+        for s_id, target_x in custom_shank_positions.items():
+            idx_group = k == s_id
+            if np.any(idx_group):
+                start_mean = float(np.mean(x[idx_group]))
+                x[idx_group] += target_x - start_mean
+                print(f"  Shank {s_id}: Moved to {target_x:.1f} (shift {target_x - start_mean:.1f})")
+
+    data["xcoords"] = x.reshape(x_shape)
+    data["kcoords"] = k.reshape(k_shape)
+    savemat(p, data)
+    print(f"Updated {p} with dual-side conversion.")
+
+
+def load_rez(rez_path: str | Path):
+    """
+    Load MATLAB v7.3 rez.mat via h5py and convert nested groups to dicts.
+
+    For multi-dimensional arrays, reverse axes to recover MATLAB ordering.
+    """
+    import h5py
+
+    def h5_to_dict(obj):
+        if isinstance(obj, h5py.Group):
+            return {k: h5_to_dict(obj[k]) for k in obj.keys()}
+        if isinstance(obj, h5py.Dataset):
+            data = obj[()]
+            if isinstance(data, np.ndarray):
+                if data.ndim > 1:
+                    data = np.ascontiguousarray(np.transpose(data, axes=range(data.ndim - 1, -1, -1)))
+                data = np.squeeze(data)
+            return data
+        return obj
+
+    with h5py.File(rez_path, "r") as f:
+        if "rez" in f:
+            return h5_to_dict(f["rez"])
+        return h5_to_dict(f)
+
+
+def rezToPhy(rez: dict, save_path: str | Path) -> None:
+    """Extract Kilosort rez fields and write Phy-compatible .npy files."""
+    save_dir = Path(save_path)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    outputs = [
+        "amplitudes.npy",
+        "channel_map.npy",
+        "channel_positions.npy",
+        "pc_features.npy",
+        "pc_feature_ind.npy",
+        "similar_templates.npy",
+        "spike_clusters.npy",
+        "spike_templates.npy",
+        "spike_times.npy",
+        "templates.npy",
+        "templates_ind.npy",
+        "template_features.npy",
+        "template_feature_ind.npy",
+        "whitening_mat.npy",
+        "whitening_mat_inv.npy",
+    ]
+    for filename in outputs:
+        fp = save_dir / filename
+        if fp.exists():
+            fp.unlink()
+    phy_dir = save_dir / ".phy"
+    if phy_dir.exists():
+        shutil.rmtree(phy_dir)
+
+    st3 = np.asarray(rez["st3"])
+    spike_times = st3[:, 0].astype(np.uint64)
+    spike_templates = (st3[:, 1] - 1).astype(np.uint32)
+    spike_clusters = (st3[:, 4] - 1).astype(np.int32) if st3.shape[1] > 4 else spike_templates.astype(np.int32)
+    amplitudes = st3[:, 2]
+
+    ops = rez["ops"]
+    chan_map = np.atleast_1d(ops["chanMap"]).flatten()
+    chan_map_0ind = (chan_map - 1).astype(np.int32)
+
+    connected = np.atleast_1d(rez["connected"]).flatten().astype(bool)
+    xcoords = np.atleast_1d(rez["xcoords"]).flatten()
+    ycoords = np.atleast_1d(rez["ycoords"]).flatten()
+
+    U = np.asarray(rez["U"])
+    W = np.asarray(rez["W"])
+    templates = np.einsum("cfr, tfr -> ftc", U, W)
+    n_templates = templates.shape[0]
+    n_chan = U.shape[0]
+    templates_inds = np.tile(np.arange(n_chan), (n_templates, 1)).astype(np.int32)
+
+    pc_features = np.asarray(rez["cProjPC"])
+    pc_feature_inds = (np.atleast_2d(rez["iNeighPC"]) - 1).astype(np.int32)
+    template_features = np.asarray(rez["cProj"])
+    template_feature_inds = (np.atleast_2d(rez["iNeigh"]) - 1).astype(np.int32)
+
+    if pc_feature_inds.shape[0] != n_templates:
+        pc_feature_inds = pc_feature_inds.T
+    if template_feature_inds.shape[0] != n_templates:
+        template_feature_inds = template_feature_inds.T
+
+    np.save(save_dir / "spike_times.npy", np.ascontiguousarray(spike_times))
+    np.save(save_dir / "spike_templates.npy", np.ascontiguousarray(spike_templates))
+    np.save(save_dir / "spike_clusters.npy", np.ascontiguousarray(spike_clusters))
+    np.save(save_dir / "amplitudes.npy", np.ascontiguousarray(amplitudes))
+    np.save(save_dir / "templates.npy", np.ascontiguousarray(templates.astype(np.float32)))
+    np.save(save_dir / "templates_ind.npy", np.ascontiguousarray(templates_inds))
+
+    np.save(save_dir / "channel_map.npy", np.ascontiguousarray(chan_map_0ind[connected]))
+    channel_positions = np.column_stack((xcoords[connected], ycoords[connected]))
+    np.save(save_dir / "channel_positions.npy", np.ascontiguousarray(channel_positions))
+
+    np.save(save_dir / "template_features.npy", np.ascontiguousarray(template_features.astype(np.float32)))
+    np.save(save_dir / "template_feature_ind.npy", np.ascontiguousarray(template_feature_inds))
+    np.save(save_dir / "pc_features.npy", np.ascontiguousarray(pc_features.astype(np.float32)))
+    np.save(save_dir / "pc_feature_ind.npy", np.ascontiguousarray(pc_feature_inds))
+
+    whitening_matrix = np.asarray(rez["Wrot"]) / 200
+    whitening_matrix_inv = np.linalg.pinv(whitening_matrix)
+    np.save(save_dir / "whitening_mat.npy", np.ascontiguousarray(whitening_matrix.astype(np.float32)))
+    np.save(save_dir / "whitening_mat_inv.npy", np.ascontiguousarray(whitening_matrix_inv.astype(np.float32)))
+
+    if "simScore" in rez:
+        np.save(save_dir / "similar_templates.npy", np.ascontiguousarray(np.asarray(rez["simScore"]).astype(np.float32)))
+
+    params_path = save_dir / "params.py"
+    fb_val = ops.get("fbinary", "recording.dat")
+    if isinstance(fb_val, np.ndarray) and fb_val.dtype.kind in "ui":
+        fbinary = "".join([chr(int(c)) for c in fb_val.flatten()])
+    else:
+        fbinary = str(fb_val)
+
+    dat_path = "../" + os.path.basename(fbinary)
+    n_chan_tot = int(np.atleast_1d(ops["NchanTOT"]).flatten()[0])
+    fs = float(np.atleast_1d(ops["fs"]).flatten()[0])
+    with open(params_path, "w", encoding="utf-8") as f:
+        f.write(f"dat_path = r'{dat_path}'\n")
+        f.write(f"n_channels_dat = {n_chan_tot}\n")
+        f.write("dtype = 'int16'\n")
+        f.write("offset = 0\n")
+        f.write(f"sample_rate = {fs}\n")
+        f.write("hp_filtered = False\n")
+
+    print(f"Done! Phy files saved to {save_dir}")
