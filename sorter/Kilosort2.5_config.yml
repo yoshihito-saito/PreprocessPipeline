@@ -1,0 +1,41 @@
+# Kilosort2.5 core parameters
+GPU: true
+fshigh: 500
+Th:
+  - 10
+  - 4
+lam: 10
+AUCsplit: 0.9
+minFR: 0.01
+
+# Templates are learned more slowly than the upstream Kilosort2.5 default.
+momentum:
+  - 20
+  - 16000
+
+sigmaMask: 30
+ThPre: 8
+spkTh: -4
+reorder: 1
+nskip: 10
+nfilt_factor: 10
+ntbuff: 64
+NT: 64*1024+ntbuff
+whiteningRange: 32
+nSkipCov: 25
+scaleproc: 200
+nPCs: 6
+useRAM: false
+
+# Kilosort2.5 drift-correction parameters
+sig: 20
+nblocks: 0 # without drift correction
+
+# Merge controls
+mergeTemplateSimilarityThreshold: 0.5
+
+# Local optional merge shape gate added in this repo
+mergeShapeEnable: True
+mergeShapeMinCorr: 0.8
+mergeShapeExcludeMs: 2
+mergeShapeWindowMs: 50

@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import json
 import os
 from pathlib import Path
@@ -22,16 +22,26 @@ from .recording import apply_preprocessing, attach_probe_from_chanmap, select_re
 
 _SORTER_ALIASES = {
     "kilosort": "kilosort",
+    "kilosort2.5": "kilosort2_5",
+    "kilosort2_5": "kilosort2_5",
+    "kilosort25": "kilosort2_5",
     "kilosort4": "kilosort4",
 }
 
 _INSTALLED_SORTERS = tuple(_SORTER_ALIASES.keys())
+_MATLAB_SORTER_INPUTS = {"kilosort", "kilosort2.5", "kilosort2_5", "kilosort25"}
 
 _KILOSORT1_WRAPPER_ALIASES = {
     "GPU": "useGPU",
     "fshigh": "freq_min",
     "fslow": "freq_max",
     "spkTh": "detect_threshold",
+}
+_KILOSORT25_WRAPPER_ALIASES = {
+    "fshigh": "freq_min",
+    "Th": "projection_threshold",
+    "spkTh": "detect_threshold",
+    "ThPre": "preclust_threshold",
 }
 
 _KILOSORT1_BOOL_PARAMS = {
@@ -50,8 +60,34 @@ _KILOSORT1_FLOAT_VECTOR_PARAMS = {
     "lam",
     "momentum",
 }
+_KILOSORT25_BOOL_PARAMS = {
+    "car",
+    "delete_recording_dat",
+    "do_correction",
+    "keep_good_only",
+    "progress_bar",
+    "save_rez_to_mat",
+    "skip_kilosort_preprocessing",
+}
+_KILOSORT25_FLOAT_VECTOR_PARAMS = {
+    "projection_threshold",
+    "momentum",
+}
+_KILOSORT25_OPS_OVERRIDE_KEYS = {
+    "GPU",
+    "mergeShapeEnable",
+    "mergeShapeMinCorr",
+    "mergeShapeExcludeMs",
+    "mergeShapeWindowMs",
+    "mergeTemplateSimilarityThreshold",
+    "nSkipCov",
+    "nskip",
+    "reorder",
+    "useRAM",
+}
 
 _KILOSORT1_ALLOWED_PARAM_KEYS: set[str] | None = None
+_KILOSORT25_ALLOWED_PARAM_KEYS: set[str] | None = None
 _KILOSORT4_ALLOWED_PARAM_KEYS: set[str] | None = None
 _KILOSORT4_BOOL_PARAMS = {
     "do_CAR",
@@ -81,6 +117,8 @@ def _default_sorter_config_path(sorter: str) -> Path:
     s = sorter.lower()
     if s == "kilosort":
         return _repo_root() / "sorter" / "Kilosort1_config.yaml"
+    if s in {"kilosort2.5", "kilosort2_5", "kilosort25"}:
+        return _repo_root() / "sorter" / "Kilosort2.5_config.yml"
     if s == "kilosort4":
         return _repo_root() / "sorter" / "Kilosort4_config.yaml"
     raise ValueError(f"Unsupported sorter: {sorter}")
@@ -88,6 +126,10 @@ def _default_sorter_config_path(sorter: str) -> Path:
 
 def _default_kilosort1_path() -> Path:
     return _repo_root() / "sorter" / "Kilosort1"
+
+
+def _default_kilosort25_path() -> Path:
+    return _repo_root() / "sorter" / "Kilosort-2.5"
 
 
 def _resolve_matlab_cmd(matlab_path: Path | None) -> str | None:
@@ -355,6 +397,18 @@ def _get_kilosort4_allowed_param_keys() -> set[str]:
     return keys
 
 
+def _get_kilosort25_allowed_param_keys() -> set[str]:
+    global _KILOSORT25_ALLOWED_PARAM_KEYS
+    if _KILOSORT25_ALLOWED_PARAM_KEYS is not None:
+        return _KILOSORT25_ALLOWED_PARAM_KEYS
+    try:
+        keys = set(ss.Kilosort2_5Sorter.default_params().keys()).union(_JOB_KWARG_KEYS)
+    except Exception:
+        keys = set()
+    _KILOSORT25_ALLOWED_PARAM_KEYS = keys
+    return keys
+
+
 def _get_active_channel_count(chanmap_mat_path: Path | None, num_channels: int) -> int:
     if chanmap_mat_path is None or not chanmap_mat_path.exists():
         return int(num_channels)
@@ -445,6 +499,70 @@ def _normalize_kilosort4_params(params: dict[str, Any]) -> dict[str, Any]:
             print("Dropped unsupported Kilosort4 params: " + ", ".join(dropped))
         normalized = {k: v for k, v in normalized.items() if k in allowed_keys}
     return normalized
+
+
+def _normalize_kilosort25_params(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    normalized = {
+        _KILOSORT25_WRAPPER_ALIASES.get(key, key): value
+        for key, value in params.items()
+        if key not in _KILOSORT25_OPS_OVERRIDE_KEYS
+    }
+    ops_overrides = {k: params[k] for k in _KILOSORT25_OPS_OVERRIDE_KEYS if k in params}
+
+    if "detect_threshold" in normalized:
+        normalized["detect_threshold"] = abs(float(normalized["detect_threshold"]))
+
+    for key in _KILOSORT25_BOOL_PARAMS:
+        if key in normalized:
+            normalized[key] = _coerce_bool(normalized[key])
+
+    for key in _KILOSORT25_FLOAT_VECTOR_PARAMS:
+        if key not in normalized:
+            continue
+        value = normalized[key]
+        if isinstance(value, (list, tuple)):
+            normalized[key] = [float(v) for v in value]
+
+    normalized["ntbuff"] = int(float(normalized.get("ntbuff", 64)))
+
+    if "NT" in normalized:
+        nt_raw = normalized["NT"]
+        if isinstance(nt_raw, str):
+            normalized["NT"] = _safe_eval_int_expr(nt_raw.replace(" ", ""), {"ntbuff": int(normalized["ntbuff"])})
+        elif nt_raw is not None:
+            normalized["NT"] = int(float(nt_raw))
+
+    for key in {"nblocks", "nPCs", "nfilt_factor", "preclust_threshold", "wave_length"}:
+        if key in normalized and normalized[key] is not None:
+            normalized[key] = int(float(normalized[key]))
+
+    for key in {"AUCsplit", "freq_min", "lam", "minFR", "minfr_goodchannels", "scaleproc", "sig", "sigmaMask", "whiteningRange"}:
+        if key in normalized and normalized[key] is not None:
+            normalized[key] = float(normalized[key])
+
+    for key in {"GPU", "nSkipCov", "nskip", "reorder", "useRAM"}:
+        if key in ops_overrides and ops_overrides[key] is not None:
+            value = ops_overrides[key]
+            if isinstance(value, bool):
+                ops_overrides[key] = float(value)
+            elif isinstance(value, (int, float)):
+                ops_overrides[key] = float(value)
+
+    if "mergeShapeEnable" in ops_overrides:
+        ops_overrides["mergeShapeEnable"] = _coerce_bool(ops_overrides["mergeShapeEnable"])
+
+    for key in {"mergeShapeMinCorr", "mergeShapeExcludeMs", "mergeShapeWindowMs", "mergeTemplateSimilarityThreshold"}:
+        if key in ops_overrides and ops_overrides[key] is not None:
+            ops_overrides[key] = float(ops_overrides[key])
+
+    allowed_keys = _get_kilosort25_allowed_param_keys()
+    if allowed_keys:
+        dropped = sorted(k for k in normalized.keys() if k not in allowed_keys)
+        if dropped:
+            print("Dropped unsupported Kilosort2.5 params: " + ", ".join(dropped))
+        normalized = {k: v for k, v in normalized.items() if k in allowed_keys}
+
+    return normalized, ops_overrides
 
 
 def _pop_kilosort4_auto_geom_options(
@@ -821,14 +939,45 @@ def _rewrite_kilosort_ops_nchan_from_chanmap(
         print(f"Warning: failed to rewrite Kilosort ops Nchan from chanMap: {exc}")
 
 
+def _to_matlab_ops_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, int):
+        return float(value)
+    return value
+
+
+def _apply_kilosort_ops_overrides(*, sorter_output_folder: Path, ops_overrides: dict[str, Any]) -> None:
+    if not ops_overrides:
+        return
+    ops_path = Path(sorter_output_folder) / "ops.mat"
+    if not ops_path.exists():
+        return
+    try:
+        payload = loadmat(str(ops_path), simplify_cells=True)
+        ops = payload.get("ops")
+        if not isinstance(ops, dict):
+            return
+        for key, value in ops_overrides.items():
+            ops[key] = _to_matlab_ops_value(value)
+        savemat(str(ops_path), {"ops": ops})
+    except Exception as exc:
+        print(f"Warning: failed to apply Kilosort ops overrides: {exc}")
+
+
 @contextmanager
-def _kilosort1_chanmap_override(chanmap_mat_path: Path | None):
-    if chanmap_mat_path is None or not Path(chanmap_mat_path).exists():
+def _kilosort_chanmap_override(
+    sorter_cls: type,
+    *,
+    chanmap_mat_path: Path | None,
+    ops_overrides: dict[str, Any] | None = None,
+):
+    if (chanmap_mat_path is None or not Path(chanmap_mat_path).exists()) and not ops_overrides:
         yield
         return
 
-    original = getattr(ss.KilosortSorter, "_generate_channel_map_file", None)
-    original_ops = getattr(ss.KilosortSorter, "_generate_ops_file", None)
+    original = getattr(sorter_cls, "_generate_channel_map_file", None)
+    original_ops = getattr(sorter_cls, "_generate_ops_file", None)
 
     def _copy_channel_map(_recording, sorter_output_folder):
         dst = Path(sorter_output_folder) / "chanMap.mat"
@@ -836,20 +985,37 @@ def _kilosort1_chanmap_override(chanmap_mat_path: Path | None):
 
     def _patched_generate_ops_file(_cls, recording, params, sorter_output_folder, binary_file_path):
         original_ops(recording, params, sorter_output_folder, binary_file_path)
-        _rewrite_kilosort_ops_nchan_from_chanmap(
-            sorter_output_folder=Path(sorter_output_folder),
-            n_channels_total=int(recording.get_num_channels()),
-        )
+        if chanmap_mat_path is not None and Path(chanmap_mat_path).exists():
+            _rewrite_kilosort_ops_nchan_from_chanmap(
+                sorter_output_folder=Path(sorter_output_folder),
+                n_channels_total=int(recording.get_num_channels()),
+            )
+        if ops_overrides:
+            _apply_kilosort_ops_overrides(
+                sorter_output_folder=Path(sorter_output_folder),
+                ops_overrides=ops_overrides,
+            )
 
-    ss.KilosortSorter._generate_channel_map_file = staticmethod(_copy_channel_map)
-    ss.KilosortSorter._generate_ops_file = classmethod(_patched_generate_ops_file)
+    if chanmap_mat_path is not None and Path(chanmap_mat_path).exists():
+        sorter_cls._generate_channel_map_file = staticmethod(_copy_channel_map)
+    sorter_cls._generate_ops_file = classmethod(_patched_generate_ops_file)
     try:
         yield
     finally:
         if original is not None:
-            ss.KilosortSorter._generate_channel_map_file = original
+            sorter_cls._generate_channel_map_file = original
         if original_ops is not None:
-            ss.KilosortSorter._generate_ops_file = original_ops
+            sorter_cls._generate_ops_file = original_ops
+
+
+@contextmanager
+def _kilosort1_chanmap_override(chanmap_mat_path: Path | None):
+    with _kilosort_chanmap_override(
+        ss.KilosortSorter,
+        chanmap_mat_path=chanmap_mat_path,
+        ops_overrides=None,
+    ):
+        yield
 
 
 def _cleanup_temp_wh_dat(output_folder: Path) -> None:
@@ -876,6 +1042,7 @@ def execute_sorting_job(
     output_folder: Path,
     config_path: Path | None = None,
     kilosort1_path: Path | None = None,
+    kilosort25_path: Path | None = None,
     matlab_path: Path | None = None,
     chanmap_mat_path: Path | None = None,
     dtype: str = "int16",
@@ -906,12 +1073,18 @@ def execute_sorting_job(
     matlab_cmd: str | None = None
     ks4_auto_geom_enabled = False
     ks4_auto_geom_options: dict[str, Any] = {}
+    ks25_ops_overrides: dict[str, Any] = {}
     output_folder = Path(output_folder).resolve()
 
-    if sorter_input == "kilosort":
-        ks1_path = (kilosort1_path or _default_kilosort1_path()).resolve()
-        if not ks1_path.exists():
-            raise FileNotFoundError(f"KiloSort1 path not found: {ks1_path}")
+    if sorter_input in _MATLAB_SORTER_INPUTS:
+        if sorter_input == "kilosort":
+            ks_path = (kilosort1_path or _default_kilosort1_path()).resolve()
+            if not ks_path.exists():
+                raise FileNotFoundError(f"KiloSort1 path not found: {ks_path}")
+        else:
+            ks_path = (kilosort25_path or _default_kilosort25_path()).resolve()
+            if not ks_path.exists():
+                raise FileNotFoundError(f"Kilosort2.5 path not found: {ks_path}")
 
         matlab_cmd = _resolve_matlab_cmd(matlab_path)
 
@@ -942,8 +1115,12 @@ def execute_sorting_job(
             )
         print(f"Resolved matlab command: {matlab_resolved}")
 
-        ss.KilosortSorter.set_kilosort_path(str(ks1_path))
-        print(f"Kilosort path set to: {ks1_path}")
+        if sorter_input == "kilosort":
+            ss.KilosortSorter.set_kilosort_path(str(ks_path))
+            print(f"Kilosort path set to: {ks_path}")
+        else:
+            ss.Kilosort2_5Sorter.set_kilosort2_5_path(str(ks_path))
+            print(f"Kilosort2.5 path set to: {ks_path}")
 
     cfg_path = (config_path or _default_sorter_config_path(sorter_input)).resolve()
     params = _load_params(cfg_path)
@@ -971,6 +1148,9 @@ def execute_sorting_job(
             active_channel_count=len(resolved_active_channels_0based),
         )
         print(f"Resolved Kilosort params: NT={params.get('NT')} Nfilt={params.get('Nfilt')} ntbuff={params.get('ntbuff')}")
+    elif sorter_input in {"kilosort2.5", "kilosort2_5", "kilosort25"}:
+        params, ks25_ops_overrides = _normalize_kilosort25_params(params)
+        print("Resolved Kilosort2.5 params")
     elif sorter_input == "kilosort4":
         params = _normalize_kilosort4_params(params)
         if ignored_channels_0based:
@@ -1034,11 +1214,25 @@ def execute_sorting_job(
 
     print(f"Running sorter={sorter_name} -> {output_folder}")
     try:
-        chanmap_override_path = Path(chanmap_mat_path) if (sorter_input == "kilosort" and chanmap_mat_path is not None) else None
-        with _kilosort1_chanmap_override(chanmap_override_path):
+        chanmap_override_path = Path(chanmap_mat_path) if chanmap_mat_path is not None else None
+        if sorter_input == "kilosort":
+            override_ctx = _kilosort_chanmap_override(
+                ss.KilosortSorter,
+                chanmap_mat_path=chanmap_override_path,
+                ops_overrides=None,
+            )
+        elif sorter_input in {"kilosort2.5", "kilosort2_5", "kilosort25"}:
+            override_ctx = _kilosort_chanmap_override(
+                ss.Kilosort2_5Sorter,
+                chanmap_mat_path=chanmap_override_path,
+                ops_overrides=ks25_ops_overrides,
+            )
+        else:
+            override_ctx = nullcontext()
+        with override_ctx:
             _ = ss.run_sorter(**run_kwargs)
     except Exception as err:
-        if sorter_input != "kilosort":
+        if sorter_input not in _MATLAB_SORTER_INPUTS:
             raise RuntimeError(
                 f"Sorting failed for sorter={sorter_name}. Original error: {err}"
             ) from err
@@ -1079,7 +1273,7 @@ def execute_sorting_job(
         n_channels_dat=int(nch),
         hp_filtered=bool(input_is_preprocessed),
     )
-    if sorter_input == "kilosort" and cleanup_temp_wh:
+    if sorter_input in _MATLAB_SORTER_INPUTS and cleanup_temp_wh:
         _cleanup_temp_wh_dat(output_folder)
     print(
         "Patched output metadata for raw.dat compatibility: "
@@ -1101,6 +1295,7 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
         output_folder=Path(args.output_folder),
         config_path=Path(args.config) if args.config else None,
         kilosort1_path=Path(args.kilosort1_path) if args.kilosort1_path else None,
+        kilosort25_path=Path(args.kilosort25_path) if args.kilosort25_path else None,
         matlab_path=Path(args.matlab_path) if args.matlab_path else None,
         chanmap_mat_path=Path(args.chanmap) if args.chanmap else None,
         dtype=args.dtype,
@@ -1120,7 +1315,7 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run spike sorting from config file (YAML/JSON)")
-    p.add_argument("--sorter", default="kilosort", help="Sorter name (kilosort or kilosort4)")
+    p.add_argument("--sorter", default="kilosort", help="Sorter name (kilosort, kilosort2.5, or kilosort4)")
     p.add_argument(
         "--config",
         default=None,
@@ -1130,6 +1325,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--kilosort1-path",
         default="sorter/Kilosort1",
         help="Kilosort1 folder path (used only when --sorter kilosort).",
+    )
+    p.add_argument(
+        "--kilosort2-5-path",
+        dest="kilosort25_path",
+        default="sorter/Kilosort-2.5",
+        help="Kilosort2.5 folder path (used only when --sorter kilosort2.5).",
     )
     p.add_argument(
         "--matlab-path",
