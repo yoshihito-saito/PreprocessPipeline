@@ -79,7 +79,7 @@ _KILOSORT25_OPS_OVERRIDE_KEYS = {
     "mergeShapeMinCorr",
     "mergeShapeExcludeMs",
     "mergeShapeWindowMs",
-    "mergeTemplateSimilarityThreshold",
+    "mergeTemplateSimThr",
     "nSkipCov",
     "nskip",
     "reorder",
@@ -118,7 +118,7 @@ def _default_sorter_config_path(sorter: str) -> Path:
     if s == "kilosort":
         return _repo_root() / "sorter" / "Kilosort1_config.yaml"
     if s in {"kilosort2.5", "kilosort2_5", "kilosort25"}:
-        return _repo_root() / "sorter" / "Kilosort2.5_config.yml"
+        return _repo_root() / "sorter" / "Kilosort2.5_config.yaml"
     if s == "kilosort4":
         return _repo_root() / "sorter" / "Kilosort4_config.yaml"
     raise ValueError(f"Unsupported sorter: {sorter}")
@@ -551,7 +551,7 @@ def _normalize_kilosort25_params(params: dict[str, Any]) -> tuple[dict[str, Any]
     if "mergeShapeEnable" in ops_overrides:
         ops_overrides["mergeShapeEnable"] = _coerce_bool(ops_overrides["mergeShapeEnable"])
 
-    for key in {"mergeShapeMinCorr", "mergeShapeExcludeMs", "mergeShapeWindowMs", "mergeTemplateSimilarityThreshold"}:
+    for key in {"mergeShapeMinCorr", "mergeShapeExcludeMs", "mergeShapeWindowMs", "mergeTemplateSimThr"}:
         if key in ops_overrides and ops_overrides[key] is not None:
             ops_overrides[key] = float(ops_overrides[key])
 

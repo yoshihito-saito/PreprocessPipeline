@@ -18,7 +18,7 @@ ops.AUCsplit = 0.9;
 
 % optional merge veto based on CCG shape matching both clusters' ACG shapes
 % disabled by default for backward compatibility
-% ops.mergeTemplateSimilarityThreshold = 0.5;
+% ops.mergeTemplateSimThr = 0.5;
 % ops.mergeShapeEnable = false;
 % ops.mergeShapeMinCorr = 0.8;
 % ops.mergeShapeExcludeMs = 2;

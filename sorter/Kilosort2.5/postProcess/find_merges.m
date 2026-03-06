@@ -4,7 +4,7 @@ function rez = find_merges(rez, flag)
 
 ops = rez.ops;
 dt = 1/1000;
-mergeTemplateSimilarityThreshold = getOr(ops, 'mergeTemplateSimilarityThreshold', 0.5);
+mergeTemplateSimThr = getOr(ops, 'mergeTemplateSimThr', 0.5);
 mergeShapeEnable = getOr(ops, 'mergeShapeEnable', false);
 mergeShapeMinCorr = getOr(ops, 'mergeShapeMinCorr', 0.8);
 mergeShapeExcludeMs = getOr(ops, 'mergeShapeExcludeMs', 2);
@@ -35,7 +35,7 @@ for j = 1:Nk
     end
     % sort all the pairs of this neuron, discarding any that have fewer spikes
     [ccsort, ix] = sort(Xsim(isort(j),:) .* (nspk'>numel(s1)), 'descend');
-    ienu = find(ccsort<mergeTemplateSimilarityThreshold, 1) - 1; % find the first pair which has too low of a correlation
+    ienu = find(ccsort<mergeTemplateSimThr, 1) - 1; % find the first pair which has too low of a correlation
 
     % for all pairs above the configured template similarity threshold
     for k = 1:ienu
