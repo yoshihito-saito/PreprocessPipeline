@@ -3,6 +3,11 @@ import numpy as np
 import shutil
 from pathlib import Path
 
+
+def _prepare_cluster_info_df(df: pd.DataFrame) -> pd.DataFrame:
+    return df.drop(columns=["firing_rate"], errors="ignore")
+
+
 def create_cluster_info_tsv(
     phy_dir: str | Path,
     metrics_df: pd.DataFrame,
@@ -64,7 +69,7 @@ def create_cluster_info_tsv(
 
     # --- 4) Save unified cluster_info.tsv
     info_path = phy_dir / "cluster_info.tsv"
-    out_df = df.reset_index().sort_values("cluster_id")
+    out_df = _prepare_cluster_info_df(df.reset_index().sort_values("cluster_id"))
     
     if backup and info_path.exists():
         from datetime import datetime
@@ -107,7 +112,7 @@ def mark_noise_clusters_from_metrics(
         - "presence_ratio_lt": float        # mark noise if presence < value
         - "snr_lt": float                   # mark noise if snr < value
         - "amplitude_median_lt": float      # mark noise if abs(amplitude_median) < value
-        - "firing_rate_lt": float           # mark noise if firing rate < value (Hz)
+        - "firing_rate_lt": float           # mark noise if firing rate <= value (Hz)
     backup : bool
         If True, make a timestamped backup of the original TSV before overwriting.
     reset_to_unsorted : bool
@@ -167,7 +172,7 @@ def mark_noise_clusters_from_metrics(
     if "amplitude_median_lt" in thresholds and "_amp_abs_" in df.columns:
         conds.append(df["_amp_abs_"] < thresholds["amplitude_median_lt"])
     if "firing_rate_lt" in thresholds and "firing_rate" in df.columns:
-        conds.append(df["firing_rate"] < thresholds["firing_rate_lt"])
+        conds.append(df["firing_rate"] <= thresholds["firing_rate_lt"])
 
     noise_mask = pd.concat(conds, axis=1).any(axis=1) if conds else pd.Series(False, index=df.index)
 
@@ -209,7 +214,7 @@ def mark_noise_clusters_from_metrics(
         df_with_group["group"] = df_with_group["group"].fillna("unsorted")
         
         info_path = phy_dir / "cluster_info.tsv"
-        info_df = df_with_group.reset_index().sort_values("cluster_id")
+        info_df = _prepare_cluster_info_df(df_with_group.reset_index().sort_values("cluster_id"))
         
         if backup and info_path.exists():
             from datetime import datetime
@@ -283,7 +288,7 @@ def merge_individual_metric_tsvs(
         df["group"] = "unsorted"
     
     # Sort and save
-    df = df.sort_values("cluster_id")
+    df = _prepare_cluster_info_df(df.sort_values("cluster_id"))
     
     info_path = phy_dir / "cluster_info.tsv"
     if backup and info_path.exists():

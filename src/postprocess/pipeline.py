@@ -156,7 +156,7 @@ def _mark_low_firing_rate_clusters_as_noise(
             low_rate_clusters = np.asarray([], dtype=np.int64)
         else:
             firing_rates = counts.astype(np.float64) / duration_sec
-            low_rate_clusters = unique_clusters[firing_rates < float(threshold_hz)]
+            low_rate_clusters = unique_clusters[firing_rates <= float(threshold_hz)]
 
     cg_path = phy_dir / "cluster_group.tsv"
     if cg_path.exists():
