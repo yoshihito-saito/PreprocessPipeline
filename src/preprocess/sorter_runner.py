@@ -129,7 +129,7 @@ def _default_kilosort1_path() -> Path:
 
 
 def _default_kilosort25_path() -> Path:
-    return _repo_root() / "sorter" / "Kilosort-2.5"
+    return _repo_root() / "sorter" / "Kilosort2.5"
 
 
 def _resolve_matlab_cmd(matlab_path: Path | None) -> str | None:
@@ -1329,7 +1329,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--kilosort2-5-path",
         dest="kilosort25_path",
-        default="sorter/Kilosort-2.5",
+        default="sorter/Kilosort2.5",
         help="Kilosort2.5 folder path (used only when --sorter kilosort2.5).",
     )
     p.add_argument(
