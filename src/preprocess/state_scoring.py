@@ -79,6 +79,29 @@ class StateScoreResult:
     figure_paths: list[Path]
 
 
+def _expected_state_score_outputs(
+    *,
+    basepath: Path,
+    basename: str,
+    save_lfp_mat: bool,
+) -> tuple[Path, Path, Path, Path, list[Path]]:
+    emg_path = basepath / f"{basename}.EMGFromLFP.LFP.mat"
+    sleep_lfp_path = basepath / f"{basename}.SleepScoreLFP.LFP.mat"
+    sleep_state_path = basepath / f"{basename}.SleepState.states.mat"
+    episodes_path = basepath / f"{basename}.SleepStateEpisodes.states.mat"
+    fig_dir = basepath / "StateScoreFigures"
+    fig_paths = [
+        fig_dir / f"{basename}_SWTHChannels.jpg",
+        fig_dir / f"{basename}_SSResults.jpg",
+        fig_dir / f"{basename}_SSCluster2D.jpg",
+        fig_dir / f"{basename}_SSCluster3D.jpg",
+    ]
+    required = [emg_path, sleep_state_path, episodes_path, *fig_paths]
+    if save_lfp_mat:
+        required.append(sleep_lfp_path)
+    return emg_path, sleep_lfp_path, sleep_state_path, episodes_path, required
+
+
 def _basename_from_basepath(basepath: Path) -> str:
     return basepath.name
 
@@ -2349,6 +2372,27 @@ def run_state_scoring(
     if lfp_path is None:
         raise FileNotFoundError(
             f"State scoring requires {basename}.lfp/.eeg in {basepath}, but none found."
+        )
+
+    emg_path, sleep_lfp_path, sleep_state_path, episodes_path, required_outputs = _expected_state_score_outputs(
+        basepath=basepath,
+        basename=basename,
+        save_lfp_mat=bool(config.state_save_lfp_mat),
+    )
+    fig_paths = [
+        basepath / "StateScoreFigures" / f"{basename}_SWTHChannels.jpg",
+        basepath / "StateScoreFigures" / f"{basename}_SSResults.jpg",
+        basepath / "StateScoreFigures" / f"{basename}_SSCluster2D.jpg",
+        basepath / "StateScoreFigures" / f"{basename}_SSCluster3D.jpg",
+    ]
+    if not config.overwrite and all(path.exists() for path in required_outputs):
+        print("Skipping state scoring: existing outputs found and overwrite=False")
+        return StateScoreResult(
+            emg_mat_path=emg_path,
+            sleepscore_lfp_mat_path=sleep_lfp_path,
+            sleep_state_mat_path=sleep_state_path,
+            sleep_state_episodes_mat_path=episodes_path,
+            figure_paths=fig_paths,
         )
 
     ignoretime = _extract_ignoretime_from_pulses(pulses)

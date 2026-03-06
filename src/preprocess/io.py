@@ -489,6 +489,18 @@ def _first_path(paths) -> Path | None:
     return None
 
 
+def _direct_child_file_candidates(basepath: Path, *filenames: str) -> list[Path]:
+    candidates: list[Path] = []
+    for child in sorted(basepath.iterdir()):
+        if not child.is_dir():
+            continue
+        for name in filenames:
+            candidate = child / name
+            if candidate.exists():
+                candidates.append(candidate)
+    return candidates
+
+
 def ensure_xml(basepath: Path, local_output_dir: Path, basename: str) -> Path:
     target = local_output_dir / f"{basename}.xml"
     base_xml = basepath / f"{basename}.xml"
@@ -517,27 +529,34 @@ def ensure_xml(basepath: Path, local_output_dir: Path, basename: str) -> Path:
 
 def ensure_rhd(basepath: Path, local_output_dir: Path, basename: str) -> Path | None:
     target = local_output_dir / f"{basename}.rhd"
-    preferred = [
-        basepath / f"{basename}.rhd",
-        basepath / "info.rhd",
-        _first_path(basepath.rglob("info.rhd")),
-        _first_path(basepath.rglob(f"{basename}.rhd")),
-    ]
+    preferred = [basepath / f"{basename}.rhd", basepath / "info.rhd"]
 
     for src in preferred:
         if src is not None and src.exists():
             copy2(src, target)
             return target
 
-    local_rhd = _first_path(basepath.glob("*.rhd"))
-    if local_rhd is not None:
-        copy2(local_rhd, target)
+    child_matches = _direct_child_file_candidates(basepath, "info.rhd", f"{basename}.rhd")
+    if len(child_matches) == 1:
+        copy2(child_matches[0], target)
         return target
+    if len(child_matches) > 1:
+        names = ", ".join(str(p.relative_to(basepath)) for p in child_matches)
+        raise FileNotFoundError(
+            f"Multiple rhd files found in direct child folders under {basepath}: {names}. "
+            f"Keep exactly one match or place {basename}.rhd/info.rhd directly in {basepath}."
+        )
 
-    nested_rhd = _first_path(basepath.rglob("*.rhd"))
-    if nested_rhd is not None:
-        copy2(nested_rhd, target)
+    local_rhd = sorted(basepath.glob("*.rhd"))
+    if len(local_rhd) == 1:
+        copy2(local_rhd[0], target)
         return target
+    if len(local_rhd) > 1:
+        names = ", ".join(p.name for p in local_rhd)
+        raise FileNotFoundError(
+            f"Multiple rhd files found in {basepath}: {names}. "
+            f"Keep exactly one match or place {basename}.rhd/info.rhd directly in {basepath}."
+        )
 
     if target.exists():
         return target
@@ -601,27 +620,30 @@ def discover_subsessions(
 
     ignore_folders = ignore_folders or []
 
-    amp = list(basepath.rglob("amplifier.dat"))
-    cont = list(basepath.rglob("continuous.dat"))
-    paths = sorted(set(amp + cont))
-
-    filtered = []
-    for p in paths:
-        pstr = str(p).lower()
+    paths: list[Path] = []
+    for child in sorted(basepath.iterdir()):
+        if not child.is_dir():
+            continue
+        pstr = str(child).lower()
         if any(tok.lower() in pstr for tok in ignore_folders):
             continue
-        filtered.append(p)
+        amp = child / "amplifier.dat"
+        cont = child / "continuous.dat"
+        if amp.exists():
+            paths.append(amp)
+        elif cont.exists():
+            paths.append(cont)
 
-    if not filtered:
+    if not paths:
         return []
 
     if sort_files:
-        filtered = sorted(filtered, key=_subsession_sort_key)
+        paths = sorted(paths, key=_subsession_sort_key)
     elif alt_sort:
-        idx = _normalize_alt_sort_indices(alt_sort, len(filtered))
-        filtered = [filtered[i] for i in idx]
+        idx = _normalize_alt_sort_indices(alt_sort, len(paths))
+        paths = [paths[i] for i in idx]
 
-    return filtered
+    return paths
 
 
 def _normalize_alt_sort_indices(alt_sort: list[int], n: int) -> list[int]:
