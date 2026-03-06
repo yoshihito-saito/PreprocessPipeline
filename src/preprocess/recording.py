@@ -6,6 +6,7 @@ import warnings
 
 import numpy as np
 from scipy.io import loadmat
+from scipy import signal
 
 import spikeinterface as si
 import spikeinterface.extractors as se
@@ -479,7 +480,47 @@ def write_lfp(
     else:
         lfp_rate = int(lfp_fs)
 
-    rec_lfp = spre.resample(recording_raw, resample_rate=lfp_rate)
+    # MATLAB neurocode parity: apply explicit 450 Hz low-pass before downsampling.
+    lowpass_hz = 450.0
+    filt_order = 5
+    nyquist_out = float(lfp_rate) / 2.0
+    if lowpass_hz >= nyquist_out:
+        adjusted = max(nyquist_out - 1.0, 1.0)
+        warnings.warn(
+            f"Adjusting LFP low-pass from {lowpass_hz:.1f} Hz to {adjusted:.1f} Hz "
+            f"because it exceeds output Nyquist ({nyquist_out:.1f} Hz).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        lowpass_hz = adjusted
+
+    input_fs = float(recording_raw.get_sampling_frequency())
+    nyquist_in = input_fs / 2.0
+    if lowpass_hz >= nyquist_in:
+        adjusted = max(nyquist_in - 1.0, 1.0)
+        warnings.warn(
+            f"Adjusting LFP low-pass from {lowpass_hz:.1f} Hz to {adjusted:.1f} Hz "
+            f"because it exceeds input Nyquist ({nyquist_in:.1f} Hz).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        lowpass_hz = adjusted
+
+    lfp_sos = signal.iirfilter(
+        filt_order,
+        lowpass_hz,
+        btype="lowpass",
+        ftype="butter",
+        fs=input_fs,
+        output="sos",
+    )
+    rec_lfp_prefiltered = spre.filter(
+        recording_raw,
+        coeff=lfp_sos,
+        filter_mode="sos",
+        direction="forward-backward",
+    )
+    rec_lfp = spre.resample(rec_lfp_prefiltered, resample_rate=lfp_rate)
     si.write_binary_recording(
         rec_lfp,
         file_paths=str(lfp_path),
