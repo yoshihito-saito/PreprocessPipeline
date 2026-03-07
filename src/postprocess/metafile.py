@@ -87,7 +87,7 @@ class PostprocessConfig:
 
     job_kwargs: dict[str, Any] = field(
         default_factory=lambda: {
-            "n_jobs": 4,
+            "n_jobs": 256,
             "progress_bar": True,
         }
     )
