@@ -16,7 +16,7 @@ nblocks: 0
 # Samples per processing batch.
 # Larger values reduce batch boundaries but use more memory.
 # KS4 default: 60000
-batch_size: 180000
+batch_size: 240000
 
 # Single-channel threshold used to collect snippets for universal-template learning.
 # KS4 default: 6
