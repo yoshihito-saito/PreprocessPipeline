@@ -41,19 +41,11 @@ def _find_sorting_output_dirs(root: Path) -> list[Path]:
             p
             for pattern in _SORTING_OUTPUT_PATTERNS
             for p in root.glob(pattern)
-            if p.is_dir()
+            if p.is_dir() and not p.name.endswith("_spi")
         ],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
-
-
-def search_sorter_paths(local_output_dir: str | Path) -> list[Path]:
-    root = Path(local_output_dir)
-    if not root.exists():
-        raise FileNotFoundError(f"local output dir not found: {root}")
-    return [p.resolve() for p in _find_sorting_output_dirs(root)]
-
 
 def _resolve_sorting_run_root(sorting_phy_folder: Path) -> Path:
     # Legacy layouts may point to <Kilosort_xxx>/sorter_output.
@@ -67,42 +59,56 @@ def _resolve_postprocess_output_folder(sorting_phy_folder: Path) -> Path:
     return spi_root
 
 
-def _resolve_sorting_root_from_result(
-    result: PreprocessResult,
-    *,
-    kilosort_path: str | None = None,
-) -> Path:
-    root = Path(result.local_output_dir)
-    if kilosort_path is not None:
-        name = str(kilosort_path).strip()
-        folder = Path(name)
-        if (
-            not name
-            or folder.is_absolute()
-            or len(folder.parts) != 1
-            or folder.name in {".", ".."}
-        ):
-            raise ValueError(
-                "kilosort_path must be a single folder name under result.local_output_dir "
-                f"(got: {kilosort_path!r})"
-            )
-        resolved = (root / folder.name).resolve()
-        if not resolved.exists():
-            raise FileNotFoundError(f"Kilosort folder not found: {resolved}")
-        if not resolved.is_dir():
-            raise NotADirectoryError(f"Kilosort path is not a directory: {resolved}")
-        return resolved
+def _resolve_analyzer_cache_root(config: PostprocessConfig, output_folder: Path) -> Path | None:
+    if config.analyzer_format != "binary_folder":
+        return None
+    return (
+        Path(config.analyzer_cache_dir).resolve()
+        if config.analyzer_cache_dir is not None
+        else (output_folder / "analyzer_cache").resolve()
+    )
 
-    candidates = _find_sorting_output_dirs(root)
+
+def _should_skip_postprocess_target(
+    config: PostprocessConfig,
+    *,
+    output_folder: Path,
+    metrics_csv_path: Path,
+) -> bool:
+    overwrite = _postprocess_overwrite_enabled(config)
+    return (not overwrite) and metrics_csv_path.exists() and _phy_export_outputs_exist(output_folder)
+
+
+def _resolve_postprocess_search_root(config: PostprocessConfig) -> Path:
+    if config.sorting_search_root is not None:
+        root = Path(config.sorting_search_root).resolve()
+    elif config.dat_path is not None:
+        root = Path(config.dat_path).resolve().parent
+    else:
+        raise ValueError(
+            "sorting_phy_folder is None, but no sorting_search_root was provided and dat_path is unavailable."
+        )
+    if not root.exists():
+        raise FileNotFoundError(f"sorting search root not found: {root}")
+    if not root.is_dir():
+        raise NotADirectoryError(f"sorting search root is not a directory: {root}")
+    return root
+
+
+def _resolve_postprocess_targets(config: PostprocessConfig) -> list[Path]:
+    if config.sorting_phy_folder is not None:
+        sorting_phy_folder = Path(config.sorting_phy_folder).resolve()
+        if not sorting_phy_folder.exists():
+            raise FileNotFoundError(f"sorting_phy_folder not found: {sorting_phy_folder}")
+        if not sorting_phy_folder.is_dir():
+            raise NotADirectoryError(f"sorting_phy_folder is not a directory: {sorting_phy_folder}")
+        return [sorting_phy_folder]
+
+    root = _resolve_postprocess_search_root(config)
+    candidates = [p.resolve() for p in _find_sorting_output_dirs(root)]
     if not candidates:
         raise FileNotFoundError(f"No Kilosort result found under {root}.")
-    if len(candidates) > 1:
-        names = ", ".join(p.name for p in candidates)
-        raise ValueError(
-            "Multiple Kilosort folders found under "
-            f"{root}. Specify kilosort_path explicitly. Candidates: {names}"
-        )
-    return candidates[0]
+    return candidates
 
 
 def _resolve_bad_channels_for_postprocess(
@@ -338,7 +344,17 @@ def _compute_final_features(
         },
         **job_kwargs,
     )
+def _sorting_analyzer_sparsity_kwargs(config: PostprocessConfig) -> dict[str, Any]:
+    if not config.analyzer_sparse:
+        return {"sparse": False}
 
+    kwargs: dict[str, Any] = {
+        "sparse": True,
+        "method": config.sparsity_method,
+    }
+    if config.sparsity_method in {"best_channels", "closest_channels"}:
+        kwargs["num_channels"] = int(config.sparsity_num_channels)
+    return kwargs
 
 
 def _resolve_recording_for_postprocess(config: PostprocessConfig):
@@ -478,42 +494,42 @@ def _export_phy_to_output_folder(
         )
 
 
-def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
+def _config_for_sorting_target(
+    config: PostprocessConfig,
+    *,
+    sorting_phy_folder: Path,
+    multiple_targets: bool,
+) -> PostprocessConfig:
+    if not multiple_targets or config.analyzer_cache_dir is None:
+        return config
+    return replace(
+        config,
+        analyzer_cache_dir=(Path(config.analyzer_cache_dir).resolve() / _resolve_sorting_run_root(sorting_phy_folder).name),
+    )
+
+
+def _run_postprocess_single_session(
+    config: PostprocessConfig,
+    *,
+    sorting_phy_folder: Path,
+) -> PostprocessResult:
     def _log(message: str) -> None:
         if config.verbose:
             print(f"[postprocess] {message}")
 
-    _log("start run_postprocess_session()")
     # Release any stale memory-mapped arrays from a previous call in the same kernel
     gc.collect()
 
-    sorting_phy_folder = Path(config.sorting_phy_folder).resolve()
-    if not sorting_phy_folder.exists():
-        raise FileNotFoundError(f"sorting_phy_folder not found: {sorting_phy_folder}")
-    _log(f"sorting_phy_folder={sorting_phy_folder}")
     overwrite = _postprocess_overwrite_enabled(config)
-
     output_folder = _resolve_postprocess_output_folder(sorting_phy_folder)
-    if output_folder.exists() and overwrite and not config.skip_curation:
-        _safe_rmtree(output_folder)
-    output_folder.mkdir(parents=True, exist_ok=True)
-    _log(f"output_folder={output_folder}")
-    analyzer_cache_root: Path | None = None
-    if config.analyzer_format == "binary_folder":
-        analyzer_cache_root = (
-            Path(config.analyzer_cache_dir).resolve()
-            if config.analyzer_cache_dir is not None
-            else (output_folder / "analyzer_cache").resolve()
-        )
-        if analyzer_cache_root.exists() and overwrite and not config.skip_curation:
-            _safe_rmtree(analyzer_cache_root)
-        analyzer_cache_root.mkdir(parents=True, exist_ok=True)
-        _log(f"analyzer_cache_dir={analyzer_cache_root}")
-
     preprocessed_dat_path: Path | None = None
     metrics_csv_path = output_folder / config.metrics_csv_name
-    if not overwrite and metrics_csv_path.exists() and _phy_export_outputs_exist(output_folder):
-        _log("overwrite=False and postprocess outputs already exist; skipping postprocess")
+    analyzer_cache_root = _resolve_analyzer_cache_root(config, output_folder)
+    if _should_skip_postprocess_target(
+        config,
+        output_folder=output_folder,
+        metrics_csv_path=metrics_csv_path,
+    ):
         return _load_postprocess_result_from_existing_outputs(
             config=config,
             sorting_phy_folder=sorting_phy_folder,
@@ -522,6 +538,17 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
             metrics_csv_path=metrics_csv_path,
             preprocessed_dat_path=preprocessed_dat_path,
         )
+
+    _log(f"sorting_phy_folder={sorting_phy_folder}")
+    if output_folder.exists() and overwrite and not config.skip_curation:
+        _safe_rmtree(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    _log(f"output_folder={output_folder}")
+    if analyzer_cache_root is not None:
+        if analyzer_cache_root.exists() and overwrite and not config.skip_curation:
+            _safe_rmtree(analyzer_cache_root)
+        analyzer_cache_root.mkdir(parents=True, exist_ok=True)
+        _log(f"analyzer_cache_dir={analyzer_cache_root}")
 
     # Container to track intermediate analyzers for cleanup before export
     _intermediate_analyzers: list = []
@@ -536,22 +563,25 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
         return recording_for_post
 
     def _create_stage_analyzer(stage_name: str, sorting_obj):
+        analyzer_kwargs = {
+            "sorting": sorting_obj,
+            "recording": _ensure_recording_for_post(),
+            **_sorting_analyzer_sparsity_kwargs(config),
+        }
         if config.analyzer_format == "binary_folder":
             assert analyzer_cache_root is not None
             stage_folder = analyzer_cache_root / stage_name
             if stage_folder.exists():
                 _safe_rmtree(stage_folder)
             return si.create_sorting_analyzer(
-                sorting=sorting_obj,
-                recording=_ensure_recording_for_post(),
+                **analyzer_kwargs,
                 format="binary_folder",
                 folder=stage_folder,
                 overwrite=True,
                 **config.job_kwargs,
             )
         return si.create_sorting_analyzer(
-            sorting=sorting_obj,
-            recording=_ensure_recording_for_post(),
+            **analyzer_kwargs,
             format="memory",
             **config.job_kwargs,
         )
@@ -799,6 +829,54 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
     )
 
 
+def run_postprocess_session(config: PostprocessConfig) -> list[PostprocessResult]:
+    if config.verbose:
+        print("[postprocess] start run_postprocess_session()")
+
+    targets = _resolve_postprocess_targets(config)
+    if config.verbose and config.sorting_phy_folder is None:
+        search_root = _resolve_postprocess_search_root(config)
+        print(
+            f"[postprocess] auto-discovered {len(targets)} Kilosort folder(s) under {search_root}"
+        )
+
+    results: list[PostprocessResult] = []
+    multiple_targets = len(targets) > 1
+    skipped_count = 0
+    for sorting_phy_folder in targets:
+        target_config = _config_for_sorting_target(
+            config,
+            sorting_phy_folder=sorting_phy_folder,
+            multiple_targets=multiple_targets,
+        )
+        output_folder = _resolve_postprocess_output_folder(sorting_phy_folder)
+        metrics_csv_path = output_folder / target_config.metrics_csv_name
+        should_skip = _should_skip_postprocess_target(
+            target_config,
+            output_folder=output_folder,
+            metrics_csv_path=metrics_csv_path,
+        )
+        if config.verbose:
+            status = "skip" if should_skip else "run "
+            print(
+                f"[postprocess] [{status} {len(results) + 1}/{len(targets)}] "
+                f"{sorting_phy_folder.name} -> {output_folder.name}"
+            )
+        results.append(
+            _run_postprocess_single_session(
+                target_config,
+                sorting_phy_folder=sorting_phy_folder,
+            )
+        )
+        if should_skip:
+            skipped_count += 1
+    if config.verbose and len(targets) > 1:
+        print(
+            f"[postprocess] summary: total={len(targets)}, ran={len(targets) - skipped_count}, skipped={skipped_count}"
+        )
+    return results
+
+
 def attach_existing_sorting_result(
     result: PreprocessResult,
     *,
@@ -857,77 +935,6 @@ def build_preprocessed_recording_from_result(
     )
 
 
-def run_postprocess_from_preprocess(
-    result: PreprocessResult,
-    preprocess_config: PreprocessConfig,
-    *,
-    recording=None,
-    kilosort_path: str | None = None,
-    apply_preprocess: bool | None = None,
-    analyzer_format: str = "binary_folder",
-    analyzer_cache_dir: str | Path | None = None,
-    delete_analyzer_cache: bool = False,
-) -> PostprocessResult:
-    sorting_root = _resolve_sorting_root_from_result(result, kilosort_path=kilosort_path)
-    sorting_phy_folder = sorting_root
-    use_recording_object = recording is not None
-    apply_preprocess_effective = (
-        (not bool(preprocess_config.do_preprocess))
-        if apply_preprocess is None
-        else bool(apply_preprocess)
-    )
-    reject_channels = _resolve_bad_channels_for_postprocess(result, preprocess_config)
-
-    post_cfg = PostprocessConfig(
-        sorting_phy_folder=sorting_phy_folder,
-        recording=recording if use_recording_object else None,
-        dat_path=result.dat_path,
-        sampling_frequency=result.sr,
-        num_channels=result.n_channels,
-        dtype=preprocess_config.dtype,
-        gain_to_uV=preprocess_config.gain_to_uV,
-        offset_to_uV=preprocess_config.offset_to_uV,
-        chanmap_mat_path=preprocess_config.chanmap_mat_path,
-        reject_channels=reject_channels,
-        apply_preprocess=apply_preprocess_effective,
-        analyzer_format=analyzer_format,
-        analyzer_cache_dir=Path(analyzer_cache_dir) if analyzer_cache_dir is not None else None,
-        delete_analyzer_cache=delete_analyzer_cache,
-    )
-    return run_postprocess_session(post_cfg)
-
-
-def run_postprocess_many_from_preprocess(
-    result: PreprocessResult,
-    preprocess_config: PreprocessConfig,
-    *,
-    kilosort_paths: list[str],
-    recording=None,
-    apply_preprocess: bool | None = None,
-    analyzer_format: str = "binary_folder",
-    analyzer_cache_dir: str | Path | None = None,
-    delete_analyzer_cache: bool = False,
-) -> list[PostprocessResult]:
-    if not kilosort_paths:
-        raise ValueError("kilosort_paths must contain at least one folder name.")
-
-    results: list[PostprocessResult] = []
-    for folder_name in kilosort_paths:
-        results.append(
-            run_postprocess_from_preprocess(
-                result=result,
-                preprocess_config=preprocess_config,
-                recording=recording,
-                kilosort_path=folder_name,
-                apply_preprocess=apply_preprocess,
-                analyzer_format=analyzer_format,
-                analyzer_cache_dir=analyzer_cache_dir,
-                delete_analyzer_cache=delete_analyzer_cache,
-            )
-        )
-    return results
-
-
 # Short aliases for notebook use
 def use_existing_sorting(
     result: PreprocessResult,
@@ -946,49 +953,3 @@ def use_existing_sorting(
 
 def make_post_recording(result: PreprocessResult, preprocess_config: PreprocessConfig):
     return build_preprocessed_recording_from_result(result, preprocess_config)
-
-
-def run_postprocess(
-    result: PreprocessResult,
-    preprocess_config: PreprocessConfig,
-    *,
-    recording=None,
-    kilosort_path: str | None = None,
-    apply_preprocess: bool | None = None,
-    analyzer_format: str = "binary_folder",
-    analyzer_cache_dir: str | Path | None = None,
-    delete_analyzer_cache: bool = False,
-) -> PostprocessResult:
-    return run_postprocess_from_preprocess(
-        result,
-        preprocess_config,
-        recording=recording,
-        kilosort_path=kilosort_path,
-        apply_preprocess=apply_preprocess,
-        analyzer_format=analyzer_format,
-        analyzer_cache_dir=analyzer_cache_dir,
-        delete_analyzer_cache=delete_analyzer_cache,
-    )
-
-
-def run_postprocess_many(
-    result: PreprocessResult,
-    preprocess_config: PreprocessConfig,
-    *,
-    kilosort_paths: list[str],
-    recording=None,
-    apply_preprocess: bool | None = None,
-    analyzer_format: str = "binary_folder",
-    analyzer_cache_dir: str | Path | None = None,
-    delete_analyzer_cache: bool = False,
-) -> list[PostprocessResult]:
-    return run_postprocess_many_from_preprocess(
-        result=result,
-        preprocess_config=preprocess_config,
-        kilosort_paths=kilosort_paths,
-        recording=recording,
-        apply_preprocess=apply_preprocess,
-        analyzer_format=analyzer_format,
-        analyzer_cache_dir=analyzer_cache_dir,
-        delete_analyzer_cache=delete_analyzer_cache,
-    )

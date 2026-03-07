@@ -7,7 +7,8 @@ from typing import Any
 
 @dataclass
 class PostprocessConfig:
-    sorting_phy_folder: Path
+    sorting_phy_folder: Path | None = None
+    sorting_search_root: Path | None = None
 
     recording: Any | None = None
     dat_path: Path | None = None
@@ -34,9 +35,12 @@ class PostprocessConfig:
     analyzer_cache_dir: Path | None = None
     delete_analyzer_cache: bool = True
     skip_curation: bool = False
+    analyzer_sparse: bool = True
+    sparsity_method: str = "best_channels"
+    sparsity_num_channels: int = 16
     random_spikes_method: str = "all"
-    n_components: int = 5
-    pc_mode: str = "by_channel_local"
+    n_components: int = 3
+    pc_mode: str = "by_channel_global"
 
     merge_min_spikes: int = 100
     merge_corr_diff_thresh: float = 0.25
