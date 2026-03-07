@@ -588,8 +588,6 @@ def _pop_kilosort4_auto_geom_options(
     cleaned = dict(params)
     enabled = _coerce_bool(cleaned.pop("auto_geom_from_probe", False))
     options = {
-        "nearest_chans_target": int(float(cleaned.pop("auto_geom_nearest_chans_target", 16))),
-        "whitening_range_target": int(float(cleaned.pop("auto_geom_whitening_range_target", 32))),
         "max_channel_distance_factor": float(cleaned.pop("auto_geom_max_channel_distance_factor", 1.25)),
         "gap_factor": float(cleaned.pop("auto_geom_gap_factor", 2.5)),
         "max_xcenters_cap": int(float(cleaned.pop("auto_geom_max_xcenters_cap", 12))),
@@ -613,12 +611,53 @@ def _collect_probe_contact_positions(probe_like: Any) -> np.ndarray:
         return np.zeros((0, 2), dtype=float)
     return np.vstack(positions)
 
+def _pairwise_channel_distances(pos: np.ndarray) -> np.ndarray:
+    diff = pos[:, None, :] - pos[None, :, :]
+    D = np.sqrt(np.sum(diff**2, axis=-1))
+    np.fill_diagonal(D, np.inf)
+    return D
+
+
+def _estimate_contact_pitch(values: np.ndarray, *, fallback: float) -> float:
+    unique_values = np.unique(np.round(values.astype(float), 6))
+    if unique_values.size <= 1:
+        return float(fallback)
+    diffs = np.diff(np.sort(unique_values))
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if diffs.size == 0:
+        return float(fallback)
+    return float(np.median(diffs))
+
+
+def _estimate_shank_components(pos: np.ndarray, spacing_scale: float) -> list[np.ndarray]:
+    n_ch = int(pos.shape[0])
+    radius = max(1.6 * float(spacing_scale), 1.0)
+    D = _pairwise_channel_distances(pos)
+    neighbors = [list(np.where(D[i] <= radius)[0]) for i in range(n_ch)]
+
+    visited = np.zeros(n_ch, dtype=bool)
+    comps: list[np.ndarray] = []
+    for i in range(n_ch):
+        if visited[i]:
+            continue
+        stack = [i]
+        visited[i] = True
+        comp: list[int] = []
+        while stack:
+            u = int(stack.pop())
+            comp.append(u)
+            for v in neighbors[u]:
+                vv = int(v)
+                if not visited[vv]:
+                    visited[vv] = True
+                    stack.append(vv)
+        comps.append(np.asarray(comp, dtype=int))
+    return comps
+
 
 def auto_geom_params_from_probe(
     probe: Any,
     *,
-    nearest_chans_target: int = 16,
-    whitening_range_target: int = 32,
     max_channel_distance_factor: float = 1.25,
     gap_factor: float = 2.5,
     max_xcenters_cap: int = 12,
@@ -634,25 +673,13 @@ def auto_geom_params_from_probe(
     n_ch = int(pos.shape[0])
     if n_ch == 1:
         return {
-            "dmin": None,
+            "dmin": 20.0,
             "dminx": 32.0,
             "max_channel_distance": 20.0,
             "x_centers": None,
-            "nearest_chans": 1,
-            "whitening_range": 1,
         }
-
-    try:
-        from scipy.spatial import cKDTree
-
-        tree = cKDTree(pos)
-        dists, _ = tree.query(pos, k=2)
-        nn = np.asarray(dists[:, 1], dtype=float)
-    except Exception:
-        diff = pos[:, None, :] - pos[None, :, :]
-        D = np.sqrt(np.sum(diff**2, axis=-1))
-        np.fill_diagonal(D, np.inf)
-        nn = np.asarray(D.min(axis=1), dtype=float)
+    D = _pairwise_channel_distances(pos)
+    nn = np.asarray(D.min(axis=1), dtype=float)
 
     finite_nn = nn[np.isfinite(nn) & (nn > 0)]
     nn_med_raw = float(np.median(finite_nn)) if finite_nn.size > 0 else 20.0
@@ -668,35 +695,10 @@ def auto_geom_params_from_probe(
     x = pos[:, 0]
     y = pos[:, 1]
     nn_med = nn_med_raw * scale
-
-    r = 1.6 * nn_med
-    try:
-        from scipy.spatial import cKDTree
-
-        tree = cKDTree(pos)
-        neighbors = tree.query_ball_point(pos, r=r)
-    except Exception:
-        diff = pos[:, None, :] - pos[None, :, :]
-        D = np.sqrt(np.sum(diff**2, axis=-1))
-        neighbors = [list(np.where(D[i] <= r)[0]) for i in range(n_ch)]
-
-    visited = np.zeros(n_ch, dtype=bool)
-    comps: list[np.ndarray] = []
-    for i in range(n_ch):
-        if visited[i]:
-            continue
-        stack = [i]
-        visited[i] = True
-        comp = []
-        while stack:
-            u = int(stack.pop())
-            comp.append(u)
-            for v in neighbors[u]:
-                vv = int(v)
-                if not visited[vv]:
-                    visited[vv] = True
-                    stack.append(vv)
-        comps.append(np.asarray(comp, dtype=int))
+    D = _pairwise_channel_distances(pos)
+    dmin = max(1.0, _estimate_contact_pitch(y, fallback=nn_med))
+    dminx = max(16.0, _estimate_contact_pitch(x, fallback=32.0))
+    comps = _estimate_shank_components(pos, max(nn_med, dmin, dminx))
 
     min_inter = np.inf
     if len(comps) > 1:
@@ -705,44 +707,53 @@ def auto_geom_params_from_probe(
         np.fill_diagonal(Dc, np.inf)
         min_inter = float(np.min(Dc))
 
-    xuniq = np.unique(np.round(x, 6))
-    dx = float(np.median(np.diff(np.sort(xuniq)))) if xuniq.size > 1 else 0.0
-    dminx = 32.0 if dx == 0.0 else max(16.0, dx)
-
-    max_channel_distance = max(20.0, float(max_channel_distance_factor) * nn_med)
+    local_radius = max(1.75 * min(dmin, dminx), 1.75 * nn_med)
+    local_counts = np.sum(D <= local_radius, axis=1) + 1
+    neighborhood_order = int(np.median(local_counts)) if local_counts.size > 0 else 2
+    kth_index = max(1, min(n_ch - 1, max(2, neighborhood_order // 2))) - 1
+    sorted_distances = np.sort(D, axis=1)
+    kth_distances = sorted_distances[:, kth_index]
+    kth_distances = kth_distances[np.isfinite(kth_distances) & (kth_distances > 0)]
+    if kth_distances.size == 0:
+        base_distance = nn_med
+    else:
+        base_distance = float(np.median(kth_distances))
+    max_channel_distance = max(20.0, float(max_channel_distance_factor) * base_distance)
     if np.isfinite(min_inter):
         max_channel_distance = min(max_channel_distance, 0.45 * min_inter)
 
-    gap_thr = max(50.0, float(gap_factor) * nn_med)
-    x_sorted = np.sort(xuniq)
-    groups: list[list[float]] = []
-    if x_sorted.size > 0:
-        cur = [float(x_sorted[0])]
+    gap_thr = max(50.0, float(gap_factor) * max(nn_med, dminx))
+    x_centers_total = 0
+    for comp in comps:
+        x_comp = np.unique(np.round(x[comp], 6))
+        if x_comp.size == 0:
+            continue
+        if x_comp.size == 1:
+            x_centers_total += 1
+            continue
+        x_sorted = np.sort(x_comp)
+        groups: list[list[float]] = [[float(x_sorted[0])]]
         for xv in x_sorted[1:]:
             xvf = float(xv)
-            if (xvf - cur[-1]) <= gap_thr:
-                cur.append(xvf)
+            if (xvf - groups[-1][-1]) <= gap_thr:
+                groups[-1].append(xvf)
             else:
-                groups.append(cur)
-                cur = [xvf]
-        groups.append(cur)
+                groups.append([xvf])
 
-    kx = len(groups)
-    if kx <= 1 or kx > int(max_xcenters_cap):
+        for group in groups:
+            n_unique_x = len(group)
+            x_centers_total += max(1, int(np.ceil(n_unique_x / 2.0)))
+
+    if x_centers_total <= 1:
         x_centers = None
     else:
-        x_centers = int(kx)
-
-    nearest_chans = int(max(1, min(int(nearest_chans_target), n_ch)))
-    whitening_range = int(max(nearest_chans, min(int(max(1, whitening_range_target)), n_ch)))
+        x_centers = int(min(x_centers_total, int(max_xcenters_cap)))
 
     return {
-        "dmin": None,
+        "dmin": float(dmin),
         "dminx": float(dminx),
         "max_channel_distance": float(max_channel_distance),
         "x_centers": x_centers,
-        "nearest_chans": nearest_chans,
-        "whitening_range": whitening_range,
     }
 
 

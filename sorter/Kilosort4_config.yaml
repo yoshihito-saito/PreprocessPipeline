@@ -1,40 +1,138 @@
-# Kilosort4 core parameters (restored from original tuned config)
-nt: 41
+# Kilosort4 config for this pipeline.
+# Comment format:
+#   current value below
+#   KS4 default: <upstream default in kilosort 4.1.x>
+
+# Core data / detection / clustering parameters
+
+# Samples per waveform and filter padding.
+# KS4 default: 61 samples @ 30kHz = ~2.03ms
+nt: 41 # 41 samples @ 20kHz = ~2.05ms
+
+# Drift-correction blocks. 0 disables drift correction.
+# KS4 default: 1
 nblocks: 0
-batch_size: 120000
+
+# Samples per processing batch.
+# Larger values reduce batch boundaries but use more memory.
+# KS4 default: 60000
+batch_size: 180000
+
+# Single-channel threshold used to collect snippets for universal-template learning.
+# KS4 default: 6
 Th_single_ch: 4
+
+# Detection threshold for universal templates.
+# KS4 default: 9
 Th_universal: 8
+
+# Detection threshold for learned templates during re-extraction.
+# KS4 default: 8
 Th_learned: 8
-max_peels: 150
-nearest_templates: 150
+
+# Matching-pursuit peel iterations per batch.
+# Higher values can recover more overlaps at higher cost.
+# KS4 default: 100
+max_peels: 100
+
+# Number of nearby template locations checked during spike detection.
+# KS4 default: 100
+nearest_templates: 100
+
+# Number of 1D templates learned from data for universal-template detection.
+# KS4 default: 6
 n_templates: 6
+
+# Vertical spacing of template centers in um.
+# This may be overwritten by auto geometry.
+# KS4 default: null (auto)
 dmin: 20
+
+# Horizontal spacing of template centers in um.
+# This may be overwritten by auto geometry.
+# KS4 default: 32
 dminx: 32
-nearest_chans: 16
+
+# Number of nearby channels used for spike detection / features.
+# Fixed value; not changed by auto geometry.
+# KS4 default: 10
+nearest_chans: 10
+
+# Max channel/template comparison distance in um.
+# This may be overwritten by auto geometry.
+# KS4 default: 32
 max_channel_distance: 160
+
+# Number of x-axis grouping centers used in final clustering.
+# This may be overwritten by auto geometry.
+# KS4 default: null (auto)
 x_centers: 8
+
+# Nearby channels used to estimate whitening.
+# Fixed value; not changed by auto geometry.
+# KS4 default: 32
 whitening_range: 32
+
+# High-pass cutoff in Hz.
+# KS4 default: 300
 highpass_cutoff: 500
 
+# Graph neighbors used in final clustering.
+# Lower values tend to split more; higher values tend to merge more.
+# KS4 default: 10
+cluster_neighbors: 8
+
 # Wrapper / runtime options
+
+# Apply common-average reference inside Kilosort4 preprocessing.
+# SpikeInterface default: true
 do_CAR: false
+
+# ACG refractory threshold used for labeling "good" units.
+# KS4 default: 0.2
 acg_threshold: 0.5
+
+# CCG refractory threshold used for merge/split decisions.
+# Smaller values make final CCG merges stricter.
+# KS4 default: 0.25
 ccg_threshold: 0.0
-delete_recording_dat: false
+
+# Clear PyTorch cache between memory-heavy steps.
+# Faster to keep false unless memory pressure is an issue.
+# SpikeInterface default: false
 clear_cache: true
 
-# Auto-derive geometry-related params from attached probe (Probe/ProbeGroup)
+# Auto-derive geometry-sensitive parameters from the attached probe.
+# This overrides dmin/dminx/max_channel_distance/x_centers.
 auto_geom_from_probe: true
-auto_geom_nearest_chans_target: 16
-auto_geom_whitening_range_target: 32
-auto_geom_max_channel_distance_factor: 1.25
-auto_geom_gap_factor: 2.5
+
+# Scale factor applied to local geometric distance when deriving max_channel_distance.
+auto_geom_max_channel_distance_factor: 1.5
+
+# Gap threshold multiplier used when grouping x-columns into banks/components.
+auto_geom_gap_factor: 2.0
+
+# Hard cap for auto-derived x_centers.
 auto_geom_max_xcenters_cap: 12
 
 # SpikeInterface job kwargs (can be overridden by PreprocessConfig.job_kwargs)
+
+# Worker count for binary export / preprocessing tasks.
+# SpikeInterface default: 1
 n_jobs: -1
-chunk_duration: 1s
+
+# Show progress bars during export / sorting.
+# SpikeInterface default: false
 progress_bar: true
+
+# Parallel backend for SpikeInterface jobs.
+# SpikeInterface default: "thread"
 pool_engine: process
+
+# Multiprocessing start method.
+# SpikeInterface default: null
 mp_context: null
+
+# Limit per-worker threads to avoid oversubscription.
+# SpikeInterface default: 1
 max_threads_per_worker: 1
