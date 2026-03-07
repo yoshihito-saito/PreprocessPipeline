@@ -109,6 +109,16 @@ def _prepend_to_windows_path(path_to_add: str) -> None:
     os.environ["Path"] = path_to_add + os.pathsep + existing_path_alt
 
 
+def _ensure_matlab_shell_env() -> None:
+    if os.name == "nt":
+        return
+    current = os.environ.get("MATLAB_SHELL", "").strip()
+    if current:
+        return
+    bash_path = shutil.which("bash") or "/bin/bash"
+    os.environ["MATLAB_SHELL"] = bash_path
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -535,6 +545,13 @@ def _normalize_kilosort25_params(params: dict[str, Any]) -> tuple[dict[str, Any]
     for key in {"nblocks", "nPCs", "nfilt_factor", "preclust_threshold", "wave_length"}:
         if key in normalized and normalized[key] is not None:
             normalized[key] = int(float(normalized[key]))
+
+    # SpikeInterface defaults do_correction=True for Kilosort2.5. When nblocks=0,
+    # drift correction is effectively disabled and the generated master script can
+    # still try to save rez.dshift at the end, which crashes because that field was
+    # never created. Keep these settings consistent in the runner.
+    if int(normalized.get("nblocks", 5)) == 0:
+        normalized["do_correction"] = False
 
     for key in {"AUCsplit", "freq_min", "lam", "minFR", "minfr_goodchannels", "scaleproc", "sig", "sigmaMask", "whiteningRange"}:
         if key in normalized and normalized[key] is not None:
@@ -1100,6 +1117,7 @@ def execute_sorting_job(
             _prepend_to_windows_path(matlab_bin)
         else:
             _prepend_to_path(matlab_bin)
+            _ensure_matlab_shell_env()
         print(f"Prepended MATLAB bin to PATH for this run: {matlab_bin}")
 
         matlab_log = _repo_root() / ".matlab_shim" / "matlab_run.log"

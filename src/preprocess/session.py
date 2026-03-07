@@ -119,10 +119,16 @@ def _build_spike_sorting_entry(
 
 
 def _first_kilosort_folder(basepath: Path) -> Path | None:
+    patterns = (
+        "Kilosort_*",
+        "Kilosort2_5_*",
+        "Kilosort2.5_*",
+        "Kilosort4_*",
+    )
     kilo_folders = sorted(
         [
             p
-            for pattern in ("Kilosort_*", "Kilosort4_*")
+            for pattern in patterns
             for p in basepath.glob(pattern)
             if p.is_dir()
         ],

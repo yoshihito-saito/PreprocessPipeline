@@ -27,12 +27,19 @@ from ..preprocess.recording import (
 )
 from .metafile import PostprocessConfig, PostprocessResult
 
+_SORTING_OUTPUT_PATTERNS = (
+    "Kilosort_*",
+    "Kilosort2_5_*",
+    "Kilosort2.5_*",
+    "Kilosort4_*",
+)
+
 
 def _find_sorting_output_dirs(root: Path) -> list[Path]:
     return sorted(
         [
             p
-            for pattern in ("Kilosort_*", "Kilosort4_*")
+            for pattern in _SORTING_OUTPUT_PATTERNS
             for p in root.glob(pattern)
             if p.is_dir()
         ],
@@ -228,6 +235,72 @@ def _count_units_and_spikes(sorting) -> tuple[int, int]:
     return n_units, total_spikes
 
 
+def _postprocess_overwrite_enabled(config: PostprocessConfig) -> bool:
+    if config.remove_if_exists is not None:
+        return bool(config.remove_if_exists)
+    return bool(config.overwrite)
+
+
+def _phy_export_outputs_exist(output_folder: Path) -> bool:
+    required = (
+        "params.py",
+        "spike_times.npy",
+        "spike_clusters.npy",
+        "cluster_group.tsv",
+        "cluster_info.tsv",
+    )
+    return all((output_folder / name).exists() for name in required)
+
+
+def _count_noise_clusters_in_phy_dir(phy_dir: Path) -> int:
+    for filename in ("cluster_info.tsv", "cluster_group.tsv"):
+        path = phy_dir / filename
+        if not path.exists():
+            continue
+        df = pd.read_csv(path, sep="\t")
+        cols_lut = {str(col).strip().lower(): col for col in df.columns}
+        group_col = cols_lut.get("group") or cols_lut.get("kslabel") or cols_lut.get("label")
+        if group_col is None and df.shape[1] >= 2:
+            group_col = df.columns[1]
+        if group_col is None:
+            continue
+        groups = df[group_col].astype(str).str.lower()
+        return int((groups == "noise").sum())
+    return 0
+
+
+def _load_postprocess_result_from_existing_outputs(
+    *,
+    config: PostprocessConfig,
+    sorting_phy_folder: Path,
+    output_folder: Path,
+    analyzer_cache_root: Path | None,
+    metrics_csv_path: Path,
+    preprocessed_dat_path: Path | None,
+) -> PostprocessResult:
+    sorting_initial = se.read_phy(str(sorting_phy_folder), exclude_cluster_groups=config.exclude_cluster_groups)
+    sorting_final = se.read_phy(str(output_folder), exclude_cluster_groups=config.exclude_cluster_groups)
+    n_units_initial, total_spikes_initial = _count_units_and_spikes(sorting_initial)
+    n_units_final, total_spikes_final = _count_units_and_spikes(sorting_final)
+    analyzer_cache_for_result = (
+        analyzer_cache_root
+        if analyzer_cache_root is not None and analyzer_cache_root.exists() and not config.delete_analyzer_cache
+        else None
+    )
+    return PostprocessResult(
+        sorting_phy_folder=sorting_phy_folder,
+        output_folder=output_folder,
+        preprocessed_dat_path=preprocessed_dat_path,
+        metrics_csv_path=metrics_csv_path,
+        analyzer_cache_dir=analyzer_cache_for_result,
+        n_units_initial=n_units_initial,
+        n_units_final=n_units_final,
+        total_spikes_initial=total_spikes_initial,
+        total_spikes_final=total_spikes_final,
+        n_noise_clusters=_count_noise_clusters_in_phy_dir(output_folder),
+    )
+
+
 def _compute_merge_split_features(
     analyzer, *, n_components: int, pc_mode: str, job_kwargs: dict
 ) -> None:
@@ -347,6 +420,64 @@ def _fix_phy_params_file(
     params_file.write_text(content, encoding="utf-8")
 
 
+def _export_phy_to_output_folder(
+    *,
+    sorting_analyzer,
+    output_folder: Path,
+    analyzer_cache_root: Path | None,
+    dat_path: Path | None,
+    hp_filtered: bool,
+    copy_binary: bool,
+    use_relative_path: bool,
+    job_kwargs: dict[str, Any],
+) -> None:
+    # export_to_phy requires output_folder not to exist. Since we keep output_folder
+    # (and optionally analyzer_cache) around, export into a temporary child folder and
+    # then move exported files to output_folder root. Because the temp folder is a child
+    # of the final output folder, export_to_phy cannot safely compute a relative dat_path
+    # against it when the binary lives alongside the session output. Export absolute paths
+    # first, then rewrite params.py against the final folder.
+    phy_export_tmp = output_folder / "__phy_export_tmp__"
+    if analyzer_cache_root is not None and phy_export_tmp.resolve() == analyzer_cache_root.resolve():
+        raise ValueError("analyzer_cache_dir cannot be '__phy_export_tmp__' under output_folder.")
+    if phy_export_tmp.exists():
+        _safe_rmtree(phy_export_tmp)
+
+    export_to_phy(
+        sorting_analyzer=sorting_analyzer,
+        output_folder=phy_export_tmp,
+        compute_pc_features=True,
+        compute_amplitudes=True,
+        copy_binary=copy_binary,
+        remove_if_exists=False,
+        template_mode="average",
+        add_quality_metrics=True,
+        add_template_metrics=True,
+        dtype=None,
+        use_relative_path=False,
+        verbose=True,
+        **job_kwargs,
+    )
+    for child in phy_export_tmp.iterdir():
+        destination = output_folder / child.name
+        if destination.exists():
+            if destination.is_dir():
+                _safe_rmtree(destination)
+            else:
+                destination.unlink(missing_ok=True)
+        shutil.move(str(child), str(destination))
+    _safe_rmtree(phy_export_tmp)
+
+    params_file = output_folder / "params.py"
+    if dat_path is not None:
+        _fix_phy_params_file(
+            params_file=params_file,
+            dat_path=Path(dat_path),
+            hp_filtered=hp_filtered,
+            use_relative_path=bool(use_relative_path),
+        )
+
+
 def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
     def _log(message: str) -> None:
         if config.verbose:
@@ -360,9 +491,10 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
     if not sorting_phy_folder.exists():
         raise FileNotFoundError(f"sorting_phy_folder not found: {sorting_phy_folder}")
     _log(f"sorting_phy_folder={sorting_phy_folder}")
+    overwrite = _postprocess_overwrite_enabled(config)
 
     output_folder = _resolve_postprocess_output_folder(sorting_phy_folder)
-    if output_folder.exists() and config.remove_if_exists and not config.skip_curation:
+    if output_folder.exists() and overwrite and not config.skip_curation:
         _safe_rmtree(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
     _log(f"output_folder={output_folder}")
@@ -373,13 +505,35 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
             if config.analyzer_cache_dir is not None
             else (output_folder / "analyzer_cache").resolve()
         )
-        if analyzer_cache_root.exists() and config.remove_if_exists and not config.skip_curation:
+        if analyzer_cache_root.exists() and overwrite and not config.skip_curation:
             _safe_rmtree(analyzer_cache_root)
         analyzer_cache_root.mkdir(parents=True, exist_ok=True)
         _log(f"analyzer_cache_dir={analyzer_cache_root}")
 
+    preprocessed_dat_path: Path | None = None
+    metrics_csv_path = output_folder / config.metrics_csv_name
+    if not overwrite and metrics_csv_path.exists() and _phy_export_outputs_exist(output_folder):
+        _log("overwrite=False and postprocess outputs already exist; skipping postprocess")
+        return _load_postprocess_result_from_existing_outputs(
+            config=config,
+            sorting_phy_folder=sorting_phy_folder,
+            output_folder=output_folder,
+            analyzer_cache_root=analyzer_cache_root,
+            metrics_csv_path=metrics_csv_path,
+            preprocessed_dat_path=preprocessed_dat_path,
+        )
+
     # Container to track intermediate analyzers for cleanup before export
     _intermediate_analyzers: list = []
+
+    recording_for_post = None
+
+    def _ensure_recording_for_post():
+        nonlocal recording_for_post
+        if recording_for_post is None:
+            recording_for_post = _resolve_recording_for_postprocess(config)
+            _log("recording resolved")
+        return recording_for_post
 
     def _create_stage_analyzer(stage_name: str, sorting_obj):
         if config.analyzer_format == "binary_folder":
@@ -389,7 +543,7 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
                 _safe_rmtree(stage_folder)
             return si.create_sorting_analyzer(
                 sorting=sorting_obj,
-                recording=recording_for_post,
+                recording=_ensure_recording_for_post(),
                 format="binary_folder",
                 folder=stage_folder,
                 overwrite=True,
@@ -397,14 +551,10 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
             )
         return si.create_sorting_analyzer(
             sorting=sorting_obj,
-            recording=recording_for_post,
+            recording=_ensure_recording_for_post(),
             format="memory",
             **config.job_kwargs,
         )
-
-    recording_for_post = _resolve_recording_for_postprocess(config)
-    _log("recording resolved")
-    preprocessed_dat_path: Path | None = None
 
     low_rate_threshold_hz = float(config.noise_thresholds.get("firing_rate_lt", 0.01))
     _log(
@@ -429,18 +579,19 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
     # ---- skip_curation=True: try to load existing final analyzer -----------------
     _skipped_curation = False
 
-    if config.skip_curation and config.analyzer_format == "binary_folder" and analyzer_cache_root is not None:
+    if (config.skip_curation or not overwrite) and config.analyzer_format == "binary_folder" and analyzer_cache_root is not None:
         split_folder = analyzer_cache_root / "split"
         if split_folder.exists():
-            _log("[skip_curation=True] loading existing 'split' analyzer – skipping dedup/merge/split")
+            _log("loading existing 'split' analyzer – skipping dedup/merge/split")
             analyzer_split = si.load_sorting_analyzer(folder=split_folder)
             sorting_split = analyzer_split.sorting
             _skipped_curation = True
         else:
-            _log(
-                "[skip_curation=True] WARNING: no existing 'split' analyzer found – "
-                "falling back to full pipeline"
-            )
+            if config.skip_curation:
+                _log(
+                    "[skip_curation=True] WARNING: no existing 'split' analyzer found – "
+                    "falling back to full pipeline"
+                )
 
     # ---- Full curation pipeline (when skip_curation=False or no cache found) ------
     if not _skipped_curation:
@@ -457,7 +608,7 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
         _log("removing redundant units")
         analyzer_tmp = si.create_sorting_analyzer(
             sorting_removed_duplicates,
-            recording_for_post,
+            _ensure_recording_for_post(),
             format="memory",
             sparse=False,
         )
@@ -566,84 +717,62 @@ def run_postprocess_session(config: PostprocessConfig) -> PostprocessResult:
             job_kwargs=config.job_kwargs,
         )
 
-    _log("computing quality metrics")
-    qm_params = sqm.get_default_qm_params()
-    metrics_df = sqm.compute_quality_metrics(
-        analyzer_split,
-        metric_names=config.metric_names,
-        metric_params=qm_params,
-        skip_pc_metrics=config.skip_pc_metrics,
-        **config.job_kwargs,
-    )
-    metrics_csv_path = output_folder / config.metrics_csv_name
-    metrics_out_df = pd.DataFrame(metrics_df)
-    metrics_out_df.to_csv(metrics_csv_path, index=True)
+    if not overwrite and metrics_csv_path.exists():
+        _log("overwrite=False and quality metrics already exist; skipping metric recomputation")
+        metrics_out_df = pd.read_csv(metrics_csv_path, index_col=0)
+        metrics_df = metrics_out_df
+    else:
+        _log("computing quality metrics")
+        qm_params = sqm.get_default_qm_params()
+        metrics_df = sqm.compute_quality_metrics(
+            analyzer_split,
+            metric_names=config.metric_names,
+            metric_params=qm_params,
+            skip_pc_metrics=config.skip_pc_metrics,
+            **config.job_kwargs,
+        )
+        metrics_out_df = pd.DataFrame(metrics_df)
+        metrics_out_df.to_csv(metrics_csv_path, index=True)
 
-    _log("exporting to Phy")
-    keep_names: set[str] = set()
-    if analyzer_cache_root is not None and analyzer_cache_root.parent == output_folder:
-        keep_names.add(analyzer_cache_root.name)
-    if config.remove_if_exists:
-        _clear_folder_contents(output_folder, keep_names=keep_names)
+    if not overwrite and _phy_export_outputs_exist(output_folder):
+        _log("overwrite=False and Phy export already exists; skipping export")
+    else:
+        _log("exporting to Phy")
+        keep_names: set[str] = set()
+        if analyzer_cache_root is not None and analyzer_cache_root.parent == output_folder:
+            keep_names.add(analyzer_cache_root.name)
+        if overwrite:
+            _clear_folder_contents(output_folder, keep_names=keep_names)
 
-    # export_to_phy requires output_folder not to exist. Since we keep output_folder
-    # (and optionally analyzer_cache) around, export into a temporary child folder and
-    # then move exported files to output_folder root.
-    phy_export_tmp = output_folder / "__phy_export_tmp__"
-    if analyzer_cache_root is not None and phy_export_tmp.resolve() == analyzer_cache_root.resolve():
-        raise ValueError("analyzer_cache_dir cannot be '__phy_export_tmp__' under output_folder.")
-    if phy_export_tmp.exists():
-        _safe_rmtree(phy_export_tmp)
-
-    export_to_phy(
-        sorting_analyzer=analyzer_split,
-        output_folder=phy_export_tmp,
-        compute_pc_features=True,
-        compute_amplitudes=True,
-        copy_binary=config.copy_binary,
-        remove_if_exists=False,
-        template_mode="average",
-        add_quality_metrics=True,
-        add_template_metrics=True,
-        dtype=None,
-        use_relative_path=config.use_relative_path,
-        verbose=True,
-        **config.job_kwargs,
-    )
-    for child in phy_export_tmp.iterdir():
-        destination = output_folder / child.name
-        if destination.exists():
-            if destination.is_dir():
-                _safe_rmtree(destination)
-            else:
-                destination.unlink(missing_ok=True)
-        shutil.move(str(child), str(destination))
-    _safe_rmtree(phy_export_tmp)
-
-    params_file = output_folder / "params.py"
-    if config.dat_path is not None:
-        _log("fixing params.py dat_path/hp_filtered")
-        _fix_phy_params_file(
-            params_file=params_file,
-            dat_path=Path(config.dat_path),
+        _export_phy_to_output_folder(
+            sorting_analyzer=analyzer_split,
+            output_folder=output_folder,
+            analyzer_cache_root=analyzer_cache_root,
+            dat_path=Path(config.dat_path) if config.dat_path is not None else None,
             hp_filtered=(not bool(config.apply_preprocess)),
+            copy_binary=config.copy_binary,
             use_relative_path=bool(config.use_relative_path),
+            job_kwargs=config.job_kwargs,
         )
 
     # export_to_phy can recreate output_folder when remove_if_exists=True.
     # Persist metrics again after export so quality_metrics.csv is always present.
     metrics_out_df.to_csv(metrics_csv_path, index=True)
 
-    _log("marking noise clusters from metrics")
-    updated = mark_noise_clusters_from_metrics(
-        phy_dir=output_folder,
-        metrics_df=metrics_df,
-        thresholds=config.noise_thresholds,
-        backup=config.noise_backup,
-        reset_to_unsorted=True,
-        update_cluster_info=True,
-    )
-    n_noise_clusters = int((updated["group"] == "noise").sum())
+    if not overwrite and (output_folder / "cluster_info.tsv").exists():
+        _log("overwrite=False and cluster_info.tsv already exists; skipping noise relabel")
+        n_noise_clusters = _count_noise_clusters_in_phy_dir(output_folder)
+    else:
+        _log("marking noise clusters from metrics")
+        updated = mark_noise_clusters_from_metrics(
+            phy_dir=output_folder,
+            metrics_df=metrics_df,
+            thresholds=config.noise_thresholds,
+            backup=config.noise_backup,
+            reset_to_unsorted=True,
+            update_cluster_info=True,
+        )
+        n_noise_clusters = int((updated["group"] == "noise").sum())
 
     n_units_final, total_spikes_final = _count_units_and_spikes(sorting_split)
     if config.delete_analyzer_cache and analyzer_cache_root is not None and analyzer_cache_root.exists():

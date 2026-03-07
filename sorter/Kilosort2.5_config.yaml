@@ -1,41 +1,41 @@
 # Kilosort2.5 core parameters
-GPU: true
-fshigh: 500
+GPU: true                     # default: true
+fshigh: 500                  # default: 300
 Th:
-  - 10
-  - 4
-lam: 10
-AUCsplit: 0.9
-minFR: 0.01
+  - 8                       # default: 10
+  - 4                        # default: 4
+lam: 10                      # default: 10
+AUCsplit: 0.9                # default: 0.9
+minFR: 0.01                  # default: 0.02
 
 # Templates are learned more slowly than the upstream Kilosort2.5 default.
 momentum:
-  - 20
-  - 16000
+  - 20                       # default: 20
+  - 400                      # default: 400
 
-sigmaMask: 30
-ThPre: 8
-spkTh: -4
-reorder: 1
-nskip: 10
-nfilt_factor: 10
-ntbuff: 64
-NT: 64*1024+ntbuff
-whiteningRange: 32
-nSkipCov: 25
-scaleproc: 200
-nPCs: 6
-useRAM: false
+sigmaMask: 30                # default: 30
+ThPre: 6                     # default: 8
+spkTh: -4                    # default: -6
+reorder: 1                   # default: 1
+nskip: 25                    # default: 25
+nfilt_factor: 4              # default: 4
+ntbuff: 64                   # default: 64
+NT: 64*1024+ntbuff           # default: 64*1024+ntbuff
+whiteningRange: 32           # default: 32
+nSkipCov: 25                 # default: 25
+scaleproc: 200               # default: 200
+nPCs: 6                      # default: 3
+useRAM: false                # default: false
 
 # Kilosort2.5 drift-correction parameters
-sig: 20
-nblocks: 0 # without drift correction
+sig: 20                      # default: 20
+nblocks: 0                   # default: 5
 
 # Merge controls
-mergeTemplateSimThr: 0.5
+mergeTemplateSimThr: 0.5     # default: 0.5
 
 # Local optional merge shape gate added in this repo
-mergeShapeEnable: True
-mergeShapeMinCorr: 0.8
-mergeShapeExcludeMs: 2
-mergeShapeWindowMs: 50
+mergeShapeEnable: true       # local default: false
+mergeShapeMinCorr: 0.8       # local default: 0.8
+mergeShapeExcludeMs: 2       # local default: 2
+mergeShapeWindowMs: 50       # local default: 50

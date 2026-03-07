@@ -63,7 +63,8 @@ class PostprocessConfig:
     )
     skip_pc_metrics: bool = True
 
-    remove_if_exists: bool = True
+    overwrite: bool = True
+    remove_if_exists: bool | None = None
     copy_binary: bool = False
     use_relative_path: bool = True
     metrics_csv_name: str = "quality_metrics.csv"
