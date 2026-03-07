@@ -20,7 +20,7 @@ batch_size: 240000
 
 # Single-channel threshold used to collect snippets for universal-template learning.
 # KS4 default: 6
-Th_single_ch: 4
+Th_single_ch: 6
 
 # Detection threshold for universal templates.
 # KS4 default: 9

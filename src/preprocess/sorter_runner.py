@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
 from typing import Any
 import ast
 
@@ -1046,6 +1047,63 @@ def _kilosort1_chanmap_override(chanmap_mat_path: Path | None):
         yield
 
 
+def _resolve_kilosort4_import_root(kilosort4_path: Path) -> Path:
+    root = Path(kilosort4_path).resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"Kilosort4 package path not found: {root}")
+
+    if (root / "kilosort").is_dir():
+        return root
+    if root.name == "kilosort" and root.is_dir():
+        return root.parent
+
+    raise FileNotFoundError(
+        "Kilosort4 path must point to a repository root containing a "
+        f"'kilosort' package directory, or to the package directory itself: {root}"
+    )
+
+
+@contextmanager
+def _kilosort4_package_override(kilosort4_path: Path | None):
+    if kilosort4_path is None:
+        yield
+        return
+
+    import_root = _resolve_kilosort4_import_root(Path(kilosort4_path))
+    import_root_str = str(import_root)
+    original_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "kilosort" or name.startswith("kilosort.")
+    }
+    original_sys_path = list(sys.path)
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+
+    for name in list(sys.modules):
+        if name == "kilosort" or name.startswith("kilosort."):
+            del sys.modules[name]
+
+    sys.path.insert(0, import_root_str)
+    if existing_pythonpath:
+        os.environ["PYTHONPATH"] = import_root_str + os.pathsep + existing_pythonpath
+    else:
+        os.environ["PYTHONPATH"] = import_root_str
+
+    try:
+        print(f"Kilosort4 package path set to: {import_root}")
+        yield
+    finally:
+        for name in list(sys.modules):
+            if name == "kilosort" or name.startswith("kilosort."):
+                del sys.modules[name]
+        sys.path[:] = original_sys_path
+        if existing_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = existing_pythonpath
+        sys.modules.update(original_modules)
+
+
 def _cleanup_temp_wh_dat(output_folder: Path) -> None:
     candidates = [
         output_folder / "temp_wh.dat",
@@ -1071,6 +1129,7 @@ def execute_sorting_job(
     config_path: Path | None = None,
     kilosort1_path: Path | None = None,
     kilosort25_path: Path | None = None,
+    kilosort4_path: Path | None = None,
     matlab_path: Path | None = None,
     chanmap_mat_path: Path | None = None,
     dtype: str = "int16",
@@ -1256,6 +1315,10 @@ def execute_sorting_job(
                 chanmap_mat_path=chanmap_override_path,
                 ops_overrides=ks25_ops_overrides,
             )
+        elif sorter_input == "kilosort4":
+            override_ctx = _kilosort4_package_override(
+                Path(kilosort4_path) if kilosort4_path is not None else None
+            )
         else:
             override_ctx = nullcontext()
         with override_ctx:
@@ -1325,6 +1388,7 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
         config_path=Path(args.config) if args.config else None,
         kilosort1_path=Path(args.kilosort1_path) if args.kilosort1_path else None,
         kilosort25_path=Path(args.kilosort25_path) if args.kilosort25_path else None,
+        kilosort4_path=Path(args.kilosort4_path) if args.kilosort4_path else None,
         matlab_path=Path(args.matlab_path) if args.matlab_path else None,
         chanmap_mat_path=Path(args.chanmap) if args.chanmap else None,
         dtype=args.dtype,
@@ -1360,6 +1424,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="kilosort25_path",
         default="sorter/Kilosort2.5",
         help="Kilosort2.5 folder path (used only when --sorter kilosort2.5).",
+    )
+    p.add_argument(
+        "--kilosort4-path",
+        default=None,
+        help="Kilosort4 repository root path containing the kilosort package (used only when --sorter kilosort4).",
     )
     p.add_argument(
         "--matlab-path",
