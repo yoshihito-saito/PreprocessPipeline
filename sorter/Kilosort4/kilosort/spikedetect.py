@@ -47,6 +47,11 @@ def extract_snippets(X, nt, twav_min, Th_single_ch, loc_range=[4,5],
 
     return clips
 
+def normalize_clips_l2(clips, eps=1e-12):
+    norms = np.sqrt((clips**2).sum(1, keepdims=True))
+    norms = np.maximum(norms, eps)
+    return clips / norms
+
 def extract_wPCA_wTEMP(ops, bfile, nt=61, twav_min=20, Th_single_ch=6, nskip=25,
                        device=torch.device('cuda')):
 
@@ -67,7 +72,8 @@ def extract_wPCA_wTEMP(ops, bfile, nt=61, twav_min=20, Th_single_ch=6, nskip=25,
         i+= nnew 
 
     clips = clips[:i]
-    clips /= (clips**2).sum(1, keepdims=True)**.5
+    if ops['settings'].get('normalize_universal_snippets', True):
+        clips = normalize_clips_l2(clips)
 
     model = TruncatedSVD(n_components=ops['settings']['n_pcs']).fit(clips)
     wPCA = torch.from_numpy(model.components_).to(device).float()

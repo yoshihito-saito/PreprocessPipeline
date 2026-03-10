@@ -95,6 +95,10 @@ _KILOSORT4_BOOL_PARAMS = {
     "clear_cache",
     "delete_recording_dat",
     "progress_bar",
+    "normalize_universal_snippets",
+    "use_amplitude_feature",
+    "use_spatial_profile_feature",
+    "save_debug_stage_stats",
 }
 _JOB_KWARG_KEYS = set(_SI_JOB_KEYS)
 
@@ -1063,13 +1067,21 @@ def _resolve_kilosort4_import_root(kilosort4_path: Path) -> Path:
     )
 
 
+def _default_kilosort4_path() -> Path | None:
+    candidate = _repo_root() / "sorter" / "Kilosort4"
+    if (candidate / "kilosort").is_dir():
+        return candidate
+    return None
+
+
 @contextmanager
 def _kilosort4_package_override(kilosort4_path: Path | None):
-    if kilosort4_path is None:
+    target_path = Path(kilosort4_path) if kilosort4_path is not None else _default_kilosort4_path()
+    if target_path is None:
         yield
         return
 
-    import_root = _resolve_kilosort4_import_root(Path(kilosort4_path))
+    import_root = _resolve_kilosort4_import_root(target_path)
     import_root_str = str(import_root)
     original_modules = {
         name: module
@@ -1078,6 +1090,9 @@ def _kilosort4_package_override(kilosort4_path: Path | None):
     }
     original_sys_path = list(sys.path)
     existing_pythonpath = os.environ.get("PYTHONPATH")
+    original_is_installed = ss.Kilosort4Sorter.is_installed
+    original_get_sorter_version = ss.Kilosort4Sorter.get_sorter_version
+    original_check_sorter_version = ss.Kilosort4Sorter.check_sorter_version
 
     for name in list(sys.modules):
         if name == "kilosort" or name.startswith("kilosort."):
@@ -1089,10 +1104,17 @@ def _kilosort4_package_override(kilosort4_path: Path | None):
     else:
         os.environ["PYTHONPATH"] = import_root_str
 
+    ss.Kilosort4Sorter.is_installed = classmethod(lambda cls: True)
+    ss.Kilosort4Sorter.get_sorter_version = classmethod(lambda cls: "4.1.2")
+    ss.Kilosort4Sorter.check_sorter_version = classmethod(lambda cls: None)
+
     try:
         print(f"Kilosort4 package path set to: {import_root}")
         yield
     finally:
+        ss.Kilosort4Sorter.is_installed = original_is_installed
+        ss.Kilosort4Sorter.get_sorter_version = original_get_sorter_version
+        ss.Kilosort4Sorter.check_sorter_version = original_check_sorter_version
         for name in list(sys.modules):
             if name == "kilosort" or name.startswith("kilosort."):
                 del sys.modules[name]

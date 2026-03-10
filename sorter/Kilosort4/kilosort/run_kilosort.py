@@ -31,6 +31,144 @@ GUI_SETTINGS = [
 ]
 
 
+def _debug_stage_stats_enabled(ops) -> bool:
+    return bool(ops['settings'].get('save_debug_stage_stats', False))
+
+
+def _debug_results_dir(ops, results_dir=None) -> Path | None:
+    if results_dir is not None:
+        return Path(results_dir)
+    stored = ops.get('results_dir', None)
+    if stored in (None, ""):
+        return None
+    return Path(stored)
+
+
+def _prepare_debug_stage_dir(results_dir) -> Path:
+    debug_dir = Path(results_dir) / 'debug_stage_stats'
+    debug_dir.mkdir(exist_ok=True, parents=True)
+    summary_path = debug_dir / 'stage_summary.tsv'
+    if summary_path.exists():
+        summary_path.unlink()
+    lineage_dir = debug_dir / 'lineage'
+    lineage_dir.mkdir(exist_ok=True, parents=True)
+    for stale in lineage_dir.glob('*.npz'):
+        stale.unlink()
+    return debug_dir
+
+
+def _write_stage_lineage(
+    results_dir,
+    stage_name,
+    spike_times,
+    cluster_ids,
+    cluster_source,
+    spike_amplitudes=None,
+):
+    debug_dir = Path(results_dir) / 'debug_stage_stats' / 'lineage'
+    debug_dir.mkdir(exist_ok=True, parents=True)
+
+    spike_times = np.asarray(spike_times).reshape(-1).astype(np.int64, copy=False)
+    cluster_ids = np.asarray(cluster_ids).reshape(-1).astype(np.int64, copy=False)
+    if spike_times.shape[0] != cluster_ids.shape[0]:
+        raise ValueError(
+            f'spike_times and cluster_ids must have the same length for {stage_name}, '
+            f'got {spike_times.shape[0]} and {cluster_ids.shape[0]}.'
+        )
+
+    if spike_amplitudes is None:
+        spike_amplitudes = np.zeros(spike_times.shape[0], dtype=np.float32)
+    else:
+        spike_amplitudes = np.asarray(spike_amplitudes).reshape(-1).astype(np.float32, copy=False)
+        if spike_amplitudes.shape[0] != spike_times.shape[0]:
+            raise ValueError(
+                f'spike_amplitudes must have the same length as spike_times for {stage_name}, '
+                f'got {spike_amplitudes.shape[0]} and {spike_times.shape[0]}.'
+            )
+
+    np.savez(
+        debug_dir / f'{stage_name}.npz',
+        spike_times=spike_times,
+        cluster_ids=cluster_ids,
+        spike_amplitudes=spike_amplitudes,
+        cluster_source=np.asarray(cluster_source),
+    )
+
+
+def _write_stage_cluster_stats(
+    results_dir,
+    stage_name,
+    spike_times,
+    cluster_ids,
+    fs,
+    duration_sec,
+    cluster_source,
+):
+    debug_dir = Path(results_dir) / 'debug_stage_stats'
+    debug_dir.mkdir(exist_ok=True, parents=True)
+
+    spike_times = np.asarray(spike_times).reshape(-1)
+    cluster_ids = np.asarray(cluster_ids).reshape(-1).astype(np.int64, copy=False)
+    if spike_times.shape[0] != cluster_ids.shape[0]:
+        raise ValueError(
+            f'spike_times and cluster_ids must have the same length for {stage_name}, '
+            f'got {spike_times.shape[0]} and {cluster_ids.shape[0]}.'
+        )
+
+    stage_path = debug_dir / f'{stage_name}.tsv'
+    total_spikes = int(cluster_ids.size)
+    duration_sec = float(duration_sec)
+    if total_spikes == 0:
+        lines = [
+            'stage\tcluster_source\tcluster_id\tn_spikes\tfiring_rate_hz\tspike_fraction\tfirst_sample\tlast_sample\n'
+        ]
+        stage_path.write_text(''.join(lines), encoding='utf-8')
+        n_clusters = 0
+        max_n_spikes = 0
+        max_rate = 0.0
+        median_n_spikes = 0.0
+    else:
+        unique_ids, counts = np.unique(cluster_ids, return_counts=True)
+        order = np.argsort(counts)[::-1]
+        unique_ids = unique_ids[order]
+        counts = counts[order]
+
+        lines = [
+            'stage\tcluster_source\tcluster_id\tn_spikes\tfiring_rate_hz\tspike_fraction\tfirst_sample\tlast_sample\n'
+        ]
+        for cluster_id, count in zip(unique_ids, counts):
+            mask = cluster_ids == cluster_id
+            cluster_spike_times = spike_times[mask]
+            rate = float(count / duration_sec) if duration_sec > 0 else 0.0
+            fraction = float(count / total_spikes)
+            first_sample = int(cluster_spike_times.min()) if cluster_spike_times.size else -1
+            last_sample = int(cluster_spike_times.max()) if cluster_spike_times.size else -1
+            lines.append(
+                f'{stage_name}\t{cluster_source}\t{int(cluster_id)}\t{int(count)}\t'
+                f'{rate:.9f}\t{fraction:.9f}\t{first_sample}\t{last_sample}\n'
+            )
+        stage_path.write_text(''.join(lines), encoding='utf-8')
+        n_clusters = int(unique_ids.size)
+        max_n_spikes = int(counts.max())
+        max_rate = float(max_n_spikes / duration_sec) if duration_sec > 0 else 0.0
+        median_n_spikes = float(np.median(counts))
+
+    summary_path = debug_dir / 'stage_summary.tsv'
+    summary_header = (
+        'stage\tcluster_source\tn_clusters\ttotal_spikes\tduration_sec\t'
+        'max_n_spikes\tmax_firing_rate_hz\tmedian_n_spikes\n'
+    )
+    summary_line = (
+        f'{stage_name}\t{cluster_source}\t{n_clusters}\t{total_spikes}\t{duration_sec:.9f}\t'
+        f'{max_n_spikes}\t{max_rate:.9f}\t{median_n_spikes:.9f}\n'
+    )
+    if not summary_path.exists():
+        summary_path.write_text(summary_header + summary_line, encoding='utf-8')
+    else:
+        with summary_path.open('a', encoding='utf-8') as f:
+            f.write(summary_line)
+
+
 def run_kilosort(settings, probe=None, probe_name=None, filename=None,
                  data_dir=None, file_object=None, results_dir=None,
                  data_dtype=None, do_CAR=True, invert_sign=False, device=None,
@@ -255,6 +393,8 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
             )
 
         tic0 = time.time()
+        if _debug_stage_stats_enabled({'settings': settings}):
+            _prepare_debug_stage_dir(results_dir)
         ops, settings = initialize_ops(
             settings, probe, data_dtype, do_CAR, invert_sign,
             device, save_preprocessed_copy, gui_mode=(gui_sorter is not None)
@@ -406,6 +546,7 @@ def set_files(settings, filename, probe, probe_name, data_dir, results_dir,
         results_dir = results_dir / f'shank_{shank_idx}'
     # Make sure results directory exists
     results_dir.mkdir(exist_ok=True, parents=True)
+    settings['results_dir'] = results_dir
     
     # find probe configuration file and load
     if probe is None:
@@ -535,6 +676,7 @@ def initialize_ops(settings, probe, data_dtype, do_CAR, invert_sign,
     ops['settings'] = settings
     ops['probe'] = probe
     ops['data_dtype'] = data_dtype
+    ops['results_dir'] = str(settings.get('results_dir', '')) if settings.get('results_dir', None) is not None else ''
     ops['do_CAR'] = do_CAR
     ops['invert_sign'] = invert_sign
     ops['NTbuff'] = ops['batch_size'] + 2 * ops['nt']
@@ -632,6 +774,8 @@ def compute_preprocessing(ops, device, tic0=np.nan, file_object=None):
 
     # Save results
     ops['Nbatches'] = bfile.n_batches
+    ops['n_samples'] = int(bfile.n_samples)
+    ops['recording_duration_sec'] = float(bfile.n_samples / fs)
     ops['preprocessing'] = {}
     ops['preprocessing']['whiten_mat'] = whiten_mat
     ops['preprocessing']['hp_filter'] = hp_filter
@@ -744,7 +888,7 @@ def compute_drift_correction(ops, device, tic0=np.nan, progress_bar=None,
 
 
 def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
-                  clear_cache=False, verbose=False):
+                  clear_cache=False, verbose=False, results_dir=None):
     """Detect spikes via template deconvolution.
     
     Parameters
@@ -804,6 +948,25 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     logger.debug(f'tF shape: {tF.shape}')
     if len(st0) == 0:
         raise ValueError('No spikes detected, cannot continue sorting.')
+    debug_results_dir = _debug_results_dir(ops, results_dir)
+    if _debug_stage_stats_enabled(ops) and debug_results_dir is not None:
+        _write_stage_cluster_stats(
+            debug_results_dir,
+            'first_detection_templates',
+            st0[:, 0],
+            st0[:, 5],
+            ops['fs'],
+            ops.get('recording_duration_sec', bfile.n_samples / ops['fs']),
+            'universal_template_id',
+        )
+        _write_stage_lineage(
+            debug_results_dir,
+            'first_detection_templates',
+            st0[:, 0],
+            st0[:, 5],
+            'universal_template_id',
+            spike_amplitudes=st0[:, 2],
+        )
     log_performance(logger, 'info', 'Resource usage after spike detect (univ)',
                     reset=True)
     log_thread_count(logger)
@@ -830,6 +993,24 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
                 f'total {total:.2f}s')
     logger.debug(f'clu shape: {clu.shape}')
     logger.debug(f'Wall shape: {Wall.shape}')
+    if _debug_stage_stats_enabled(ops) and debug_results_dir is not None:
+        _write_stage_cluster_stats(
+            debug_results_dir,
+            'first_clustering',
+            st0[:, 0],
+            clu,
+            ops['fs'],
+            ops.get('recording_duration_sec', bfile.n_samples / ops['fs']),
+            'cluster_id',
+        )
+        _write_stage_lineage(
+            debug_results_dir,
+            'first_clustering',
+            st0[:, 0],
+            clu,
+            'cluster_id',
+            spike_amplitudes=st0[:, 2],
+        )
     log_performance(logger, 'info', 'Resource usage after first clustering',
                     reset=True)
    
@@ -857,6 +1038,24 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     logger.debug(f'tF shape: {tF.shape}')
     logger.debug(f'iCC shape: {ops["iCC"].shape}')
     logger.debug(f'iU shape: {ops["iU"].shape}')
+    if _debug_stage_stats_enabled(ops) and debug_results_dir is not None:
+        _write_stage_cluster_stats(
+            debug_results_dir,
+            'learned_extraction_templates',
+            st[:, 0],
+            st[:, 1],
+            ops['fs'],
+            ops.get('recording_duration_sec', bfile.n_samples / ops['fs']),
+            'template_id',
+        )
+        _write_stage_lineage(
+            debug_results_dir,
+            'learned_extraction_templates',
+            st[:, 0],
+            st[:, 1],
+            'template_id',
+            spike_amplitudes=st[:, 2],
+        )
 
     log_cuda_details(logger)
     log_performance(logger, 'info', 'Resource usage after spike detect (learned)',
@@ -866,7 +1065,7 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
 
 
 def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
-                   clear_cache=False, verbose=False):
+                   clear_cache=False, verbose=False, results_dir=None):
     """Cluster spikes using graph-based methods.
     
     Parameters
@@ -922,6 +1121,25 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
                 f'total {total:.2f}s')
     logger.debug(f'clu shape: {clu.shape}')
     logger.debug(f'Wall shape: {Wall.shape}')
+    debug_results_dir = _debug_results_dir(ops, results_dir)
+    if _debug_stage_stats_enabled(ops) and debug_results_dir is not None:
+        _write_stage_cluster_stats(
+            debug_results_dir,
+            'final_clustering',
+            st[:, 0],
+            clu,
+            ops['fs'],
+            ops.get('recording_duration_sec', bfile.n_samples / ops['fs']),
+            'cluster_id',
+        )
+        _write_stage_lineage(
+            debug_results_dir,
+            'final_clustering',
+            st[:, 0],
+            clu,
+            'cluster_id',
+            spike_amplitudes=st[:, 2],
+        )
     log_thread_count(logger)
 
     tic = time.time()
@@ -943,6 +1161,24 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
                 f'total {total:.2f}s')
     logger.debug(f'clu shape: {clu.shape}')
     logger.debug(f'Wall shape: {Wall.shape}')
+    if _debug_stage_stats_enabled(ops) and debug_results_dir is not None:
+        _write_stage_cluster_stats(
+            debug_results_dir,
+            'final_merge',
+            st[:, 0],
+            clu,
+            ops['fs'],
+            ops.get('recording_duration_sec', bfile.n_samples / ops['fs']),
+            'cluster_id',
+        )
+        _write_stage_lineage(
+            debug_results_dir,
+            'final_merge',
+            st[:, 0],
+            clu,
+            'cluster_id',
+            spike_amplitudes=st[:, 2],
+        )
 
     log_cuda_details(logger)
     log_performance(logger, 'info', 'Resource usage after clustering',

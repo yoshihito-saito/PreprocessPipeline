@@ -20,11 +20,11 @@ batch_size: 240000
 
 # Single-channel threshold used to collect snippets for universal-template learning.
 # KS4 default: 6
-Th_single_ch: 6
+Th_single_ch: 4
 
 # Detection threshold for universal templates.
 # KS4 default: 9
-Th_universal: 8
+Th_universal: 9
 
 # Detection threshold for learned templates during re-extraction.
 # KS4 default: 8
@@ -41,7 +41,11 @@ nearest_templates: 100
 
 # Number of 1D templates learned from data for universal-template detection.
 # KS4 default: 6
-n_templates: 6
+n_templates: 12
+
+# Apply L2 normalization to snippets before learning universal PCA/templates.
+# KS4 fork default: true
+normalize_universal_snippets: false
 
 # Vertical spacing of template centers in um.
 # This may be overwritten by auto geometry.
@@ -56,12 +60,12 @@ dminx: 32
 # Number of nearby channels used for spike detection / features.
 # Fixed value; not changed by auto geometry.
 # KS4 default: 10
-nearest_chans: 10
+nearest_chans: 12
 
 # Max channel/template comparison distance in um.
 # This may be overwritten by auto geometry.
 # KS4 default: 32
-max_channel_distance: 160
+max_channel_distance: 32
 
 # Number of x-axis grouping centers used in final clustering.
 # This may be overwritten by auto geometry.
@@ -80,7 +84,28 @@ highpass_cutoff: 500
 # Graph neighbors used in final clustering.
 # Lower values tend to split more; higher values tend to merge more.
 # KS4 default: 10
-cluster_neighbors: 8
+cluster_neighbors: 6
+cluster_downsampling: 1
+# Add a z-scored log-amplitude feature during clustering.
+# KS4 fork default: true
+use_amplitude_feature: true
+
+# Relative weight of the appended amplitude feature.
+# KS4 fork default: 1.0
+amplitude_feature_scale: 2.0
+
+# Add energy ratios from channels nearest to the per-spike peak channel during
+# clustering.
+# KS4 fork default: true
+use_spatial_profile_feature: true
+
+# Relative weight of the appended spatial profile feature.
+# KS4 fork default: 1.0
+spatial_profile_scale: 2.0
+
+# Save per-stage cluster size / firing-rate tables for debugging.
+# KS4 fork default: false
+save_debug_stage_stats: true
 
 # Wrapper / runtime options
 
@@ -107,7 +132,7 @@ clear_cache: true
 auto_geom_from_probe: true
 
 # Scale factor applied to local geometric distance when deriving max_channel_distance.
-auto_geom_max_channel_distance_factor: 1.5
+auto_geom_max_channel_distance_factor: 1.0
 
 # Gap threshold multiplier used when grouping x-columns into banks/components.
 auto_geom_gap_factor: 2.0

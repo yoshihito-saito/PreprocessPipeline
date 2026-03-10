@@ -17,6 +17,121 @@ from kilosort.utils import log_performance
 logger = logging.getLogger(__name__)
 
 
+def _scaled_log_amplitude_feature(spike_amplitudes, scale=1.0):
+    amp = np.asarray(spike_amplitudes, dtype=np.float32)
+    amp = np.log10(np.maximum(amp, 1e-6))
+    amp = torch.from_numpy(amp)
+    std = torch.std(amp, unbiased=False)
+
+    if torch.isnan(std) or std < 1e-6:
+        z_amp = torch.zeros((amp.numel(), 1), dtype=torch.float32)
+    else:
+        z_amp = ((amp - amp.mean()) / std).unsqueeze(1)
+
+    return z_amp * float(scale)
+
+
+def _nearest_to_peak_energy_ratio_features(
+    Xd_signal,
+    n_pcs,
+    *,
+    channel_ids,
+    xc,
+    yc,
+    neighbor_count,
+    scale=1.0,
+):
+    if n_pcs <= 0:
+        raise ValueError("n_pcs must be positive")
+    if Xd_signal.shape[1] % n_pcs != 0:
+        raise ValueError("Xd_signal feature dimension must be divisible by n_pcs")
+
+    n_spikes = Xd_signal.shape[0]
+    n_channels = Xd_signal.shape[1] // n_pcs
+    if n_channels <= 1 or neighbor_count <= 0:
+        return torch.zeros((n_spikes, 0), dtype=Xd_signal.dtype, device=Xd_signal.device)
+
+    dd = Xd_signal.reshape(n_spikes, n_channels, n_pcs)
+    energies = torch.linalg.vector_norm(dd, dim=2)
+    total_energy = energies.sum(dim=1, keepdim=True)
+    ratios = energies / torch.clamp(total_energy, min=1e-6)
+
+    channel_ids = torch.as_tensor(channel_ids, dtype=torch.long, device=Xd_signal.device)
+    xc_local = torch.as_tensor(xc, dtype=Xd_signal.dtype, device=Xd_signal.device)[channel_ids]
+    yc_local = torch.as_tensor(yc, dtype=Xd_signal.dtype, device=Xd_signal.device)[channel_ids]
+
+    peak_idx = torch.argmax(energies, dim=1, keepdim=True)
+    peak_x = xc_local[peak_idx.squeeze(1)].unsqueeze(1)
+    peak_y = yc_local[peak_idx.squeeze(1)].unsqueeze(1)
+    distances = (xc_local.unsqueeze(0) - peak_x) ** 2 + (yc_local.unsqueeze(0) - peak_y) ** 2
+    distances = distances.scatter(1, peak_idx, torch.inf)
+
+    k = min(int(neighbor_count), max(n_channels - 1, 0))
+    if k == 0:
+        return torch.zeros((n_spikes, 0), dtype=Xd_signal.dtype, device=Xd_signal.device)
+
+    nearest_idx = torch.topk(distances, k=k, dim=1, largest=False, sorted=True).indices
+    nearest_values = torch.gather(ratios, 1, nearest_idx)
+    if k < int(neighbor_count):
+        padding = torch.zeros(
+            (n_spikes, int(neighbor_count) - k),
+            dtype=Xd_signal.dtype,
+            device=Xd_signal.device,
+        )
+        nearest_values = torch.cat((nearest_values, padding), dim=1)
+
+    return nearest_values * float(scale)
+
+
+def _build_clustering_features(
+    Xd_signal,
+    spike_amplitudes=None,
+    *,
+    mode=None,
+    use_amplitude_feature=True,
+    amplitude_feature_scale=1.0,
+    use_spatial_profile_feature=False,
+    spatial_profile_scale=1.0,
+    n_pcs=None,
+    channel_ids=None,
+    xc=None,
+    yc=None,
+    spatial_profile_neighbor_count=None,
+):
+    extras = []
+    if use_amplitude_feature:
+        if spike_amplitudes is None:
+            raise ValueError("spike_amplitudes are required when amplitude features are enabled")
+        amp_feature = _scaled_log_amplitude_feature(
+            spike_amplitudes,
+            scale=amplitude_feature_scale,
+        ).to(dtype=Xd_signal.dtype, device=Xd_signal.device)
+        extras.append(amp_feature)
+
+    if use_spatial_profile_feature:
+        if n_pcs is None:
+            raise ValueError("n_pcs is required when spatial profile features are enabled")
+        if channel_ids is None or xc is None or yc is None:
+            raise ValueError("channel_ids, xc, and yc are required when spatial profile features are enabled")
+        if spatial_profile_neighbor_count is None:
+            raise ValueError("spatial_profile_neighbor_count is required when spatial profile features are enabled")
+        spatial_feature = _nearest_to_peak_energy_ratio_features(
+            Xd_signal,
+            int(n_pcs),
+            channel_ids=channel_ids,
+            xc=xc,
+            yc=yc,
+            neighbor_count=int(spatial_profile_neighbor_count),
+            scale=spatial_profile_scale,
+        )
+        if spatial_feature.shape[1] > 0:
+            extras.append(spatial_feature)
+
+    if not extras:
+        return Xd_signal
+    return torch.cat((Xd_signal, *extras), dim=1)
+
+
 def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
     # Xd is spikes by PCA features in a local neighborhood
     # finding n_neigh neighbors of each spike to a subset of every nskip spike
@@ -431,6 +546,10 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     n_neigh = ops['settings']['cluster_neighbors']
     max_sub = ops['settings']['max_cluster_subset']
     seed = ops['settings']['cluster_init_seed']
+    use_amplitude_feature = bool(ops['settings'].get('use_amplitude_feature', True))
+    amplitude_feature_scale = float(ops['settings'].get('amplitude_feature_scale', 1.0))
+    use_spatial_profile_feature = bool(ops['settings'].get('use_spatial_profile_feature', False))
+    spatial_profile_scale = float(ops['settings'].get('spatial_profile_scale', 1.0))
     ycent = y_centers(ops)
     xcent = x_centers(ops)
     nsp = st.shape[0]
@@ -469,22 +588,40 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     if verbose:
                         v = True
 
-                Xd, igood, ichan = get_data_cpu(
+                Xd_signal, igood, ichan = get_data_cpu(
                     ops, xy, iC, iclust_template, tF, ycent[kk], xcent[jj],
                     dmin=dmin, dminx=dminx, ix=ix,
                     )
-                if Xd is None:
+                if Xd_signal is None:
                     nearby_chans_empty += 1
                     continue
 
-                logger.debug(f'Center {ii} | Xd shape: {Xd.shape} | ntemp: {ntemp}')
-                if verbose and Xd.nelement() > 10**8:
+                Xd_cluster = _build_clustering_features(
+                    Xd_signal,
+                    st[igood, 2],
+                    mode=mode,
+                    use_amplitude_feature=use_amplitude_feature,
+                    amplitude_feature_scale=amplitude_feature_scale,
+                    use_spatial_profile_feature=use_spatial_profile_feature,
+                    spatial_profile_scale=spatial_profile_scale,
+                    n_pcs=ops['settings']['n_pcs'],
+                    channel_ids=ichan,
+                    xc=ops['xc'],
+                    yc=ops['yc'],
+                    spatial_profile_neighbor_count=ops['settings']['nearest_chans'],
+                )
+
+                logger.debug(
+                    f'Center {ii} | Xd_signal shape: {Xd_signal.shape} | '
+                    f'Xd_cluster shape: {Xd_cluster.shape} | ntemp: {ntemp}'
+                )
+                if verbose and Xd_cluster.nelement() > 10**8:
                     logger.info(f'Resetting cuda memory stats for Center {ii}')
                     if device == torch.device('cuda'):
                         torch.cuda.reset_peak_memory_stats(device)
                     v = True
-                if Xd.shape[0] < 1000:
-                    iclust = torch.zeros((Xd.shape[0],))
+                if Xd_cluster.shape[0] < 1000:
+                    iclust = torch.zeros((Xd_cluster.shape[0],))
                 else:
                     if mode == 'template':
                         st0 = st[igood,0]/ops['fs']
@@ -493,7 +630,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
 
                     # find new clusters
                     iclust, iclust0, M, _ = cluster(
-                        Xd, nskip=nskip, n_neigh=n_neigh, max_sub=max_sub,
+                        Xd_cluster, nskip=nskip, n_neigh=n_neigh, max_sub=max_sub,
                         lam=1, seed=seed, device=device, verbose=v
                         )
 
@@ -508,7 +645,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     xtree, tstat, my_clus = hierarchical.maketree(M, iclust, iclust0)
 
                     xtree, tstat = swarmsplitter.split(
-                        Xd.numpy(), xtree, tstat,iclust, my_clus, meta=st0
+                        Xd_cluster.numpy(), xtree, tstat,iclust, my_clus, meta=st0
                         )
 
                     iclust = swarmsplitter.new_clusters(iclust, my_clus, xtree, tstat)
@@ -523,7 +660,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                 # we need the new templates here         
                 W = torch.zeros((Nfilt, ops['Nchan'], ops['settings']['n_pcs']))
                 for j in range(Nfilt):
-                    w = Xd[iclust==j].mean(0)
+                    w = Xd_signal[iclust==j].mean(0)
                     W[j, ichan, :] = torch.reshape(w, (-1, ops['settings']['n_pcs'])).cpu()
                 
                 Wall = torch.cat((Wall, W), 0)
@@ -532,7 +669,11 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     progress_bar.emit(int((kk+1) / len(ycent) * 100))
     except:
         logger.exception(f'Error in clustering_qr.run on center {ii}')
-        logger.debug(f'Xd shape: {Xd.shape}')
+        try:
+            logger.debug(f'Xd_signal shape: {Xd_signal.shape}')
+            logger.debug(f'Xd_cluster shape: {Xd_cluster.shape}')
+        except UnboundLocalError:
+            logger.debug('Xd_signal or Xd_cluster not yet assigned')
         logger.debug(f'Nfilt: {Nfilt}')
         logger.debug(f'num spikes: {nsp}')
         try:

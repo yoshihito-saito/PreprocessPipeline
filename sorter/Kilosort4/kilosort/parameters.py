@@ -339,6 +339,16 @@ EXTRA_PARAMETERS = {
             """
     },
 
+    'normalize_universal_snippets': {
+        'gui_name': 'normalize universal snippets', 'type': bool, 'min': None,
+        'max': None, 'exclude': [], 'default': True, 'step': 'spike detection',
+        'description':
+            """
+            Apply L2 normalization to snippets before learning universal PCA
+            and universal templates from data.
+            """
+    },
+
     'n_pcs': {
         'gui_name': 'n pcs', 'type': int, 'min': 1, 'max': np.inf,
         'exclude': [], 'default': 6, 'step': 'spike detection',
@@ -461,6 +471,57 @@ EXTRA_PARAMETERS = {
             """
             Random seed for kmeans++ algorithm used to initialize the graph
             for clustering.
+            """
+    },
+
+    'use_amplitude_feature': {
+        'gui_name': 'use amplitude feature', 'type': bool, 'min': None,
+        'max': None, 'exclude': [], 'default': True, 'step': 'clustering',
+        'description':
+            """
+            Append a z-scored log-amplitude feature during clustering to help
+            separate units with similar shapes but different sizes.
+            """
+    },
+
+    'amplitude_feature_scale': {
+        'gui_name': 'amplitude feature scale', 'type': float, 'min': 0,
+        'max': np.inf, 'exclude': [], 'default': 1.0, 'step': 'clustering',
+        'description':
+            """
+            Scale factor applied to the appended log-amplitude clustering
+            feature.
+            """
+    },
+
+    'use_spatial_profile_feature': {
+        'gui_name': 'use spatial profile feature', 'type': bool, 'min': None,
+        'max': None, 'exclude': [], 'default': True, 'step': 'clustering',
+        'description':
+            """
+            Append energy ratios from channels nearest to the per-spike peak
+            channel during clustering to emphasize off-center spatial
+            differences. The number of appended channels follows
+            `nearest_chans`.
+            """
+    },
+
+    'spatial_profile_scale': {
+        'gui_name': 'spatial profile scale', 'type': float, 'min': 0,
+        'max': np.inf, 'exclude': [], 'default': 1.0, 'step': 'clustering',
+        'description':
+            """
+            Scale factor applied to the appended spatial profile feature.
+            """
+    },
+
+    'save_debug_stage_stats': {
+        'gui_name': 'save debug stage stats', 'type': bool, 'min': None,
+        'max': None, 'exclude': [], 'default': False, 'step': 'clustering',
+        'description':
+            """
+            Save per-stage cluster size and firing-rate summaries for debugging
+            to `results_dir/debug_stage_stats`.
             """
     },
 
