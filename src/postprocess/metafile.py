@@ -66,7 +66,13 @@ class PostprocessConfig:
         default_factory=lambda: ["firing_rate", "isi_violation", "presence_ratio", "snr", "amplitude_median"]
     )
     template_metric_names: list[str] = field(
-        default_factory=lambda: ["halfwidth", "repolarization_slope", "recovery_slope"]
+        default_factory=lambda: [
+            "peak_to_valley",
+            "peak_trough_ratio",
+            "half_width",
+            "repolarization_slope",
+            "recovery_slope",
+        ]
     )
     skip_pc_metrics: bool = True
 
@@ -81,9 +87,11 @@ class PostprocessConfig:
             "isi_violations_ratio_gt": 5.0,
             "isi_violations_count_gt": 50.0,
             "presence_ratio_lt": 0.1,
-            "snr_lt": 0.3,
-            "amplitude_median_lt": 25.0,
+            "snr_lt": 0.5,
+            "amplitude_median_lt": 5.0,
             "amplitude_median_gt": 2000.0,
+            "peak_to_valley_gt": 0.85,
+            "peak_trough_ratio_lt": -0.5,
             "halfwidth_gt": 0.45,
             "slope_lt": 100.0,
             "firing_rate_lt": 0.01,

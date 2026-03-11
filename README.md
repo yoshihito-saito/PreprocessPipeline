@@ -51,18 +51,29 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
   - `snr`
   - `amplitude_median`
 - `template_metrics`:
-  - `halfwidth`
+  - `peak_to_valley`
+  - `peak_trough_ratio`
+  - `half_width`
   - `repolarization_slope`
   - `recovery_slope`
-  - `slope = min(abs(repolarization_slope), abs(recovery_slope))`
+  - `slope = min(abs(repolarization_slope), abs(recovery_slope)) / 1000` (`uV/ms`)
 
 Default noise thresholds:
 
 - `firing_rate_lt = 0.01`
 - `amplitude_median_lt = 25.0`
 - `amplitude_median_gt = 2000.0`
+- `peak_to_valley_gt = 0.85`
+- `peak_trough_ratio_lt = -0.5`
 - `halfwidth_gt = 0.45`
 - `slope_lt = 100.0`
+
+Notes:
+
+- In this pipeline, `half_width` and `peak_to_valley` are converted to milliseconds before thresholding and export to Phy.
+- `peak_to_valley_gt = 0.85` means clusters above `0.85 ms` are marked as noise.
+- `peak_trough_ratio_lt = -0.5` is unitless and marks clusters with ratio `<= -0.5` as noise.
+- `halfwidth_gt = 0.45` corresponds to `0.45 ms` in the current SpikeCleaner thresholds.
 
 ## Artifact Removal Options (Current)
 
