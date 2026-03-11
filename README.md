@@ -57,6 +57,9 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
   - `repolarization_slope`
   - `recovery_slope`
   - `slope = min(abs(repolarization_slope), abs(recovery_slope)) / 1000` (`uV/ms`)
+- autosplit waveform rescue:
+  - `split_amp_mad_scale = 3.0`
+  - candidate spikes from the Mahalanobis gate are rescued only when waveform shape is similar and best-channel PTP amplitude stays within `median(clean_amp) +/- split_amp_mad_scale * MAD(clean_amp)`
 
 noise thresholds:
 

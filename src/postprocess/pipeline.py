@@ -766,6 +766,7 @@ def _run_postprocess_single_session(
             wf_template_max=config.split_wf_template_max,
             wf_n_chans=config.split_wf_n_chans,
             wf_center=config.split_wf_center,
+            amp_mad_scale=config.split_amp_mad_scale,
             squeeze_all_outlier_to_new=config.split_squeeze_all_outlier_to_new,
             min_spikes=config.split_min_spikes,
             return_details=False,

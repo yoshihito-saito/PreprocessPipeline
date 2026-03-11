@@ -57,6 +57,7 @@ class PostprocessConfig:
     split_wf_template_max: int | None = 1000
     split_wf_n_chans: int = 10
     split_wf_center: str = "demean"
+    split_amp_mad_scale: float = 3.0
     split_squeeze_all_outlier_to_new: bool = True
     split_min_spikes: int = 10
     split_verbose: bool = True

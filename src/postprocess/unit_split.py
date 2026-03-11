@@ -5,6 +5,24 @@ from sklearn.preprocessing import StandardScaler
 from scipy.stats import chi2
 from joblib import Parallel, delayed
 
+
+def _ptp_amplitudes(waveforms, best_ch):
+    if waveforms.size == 0:
+        return np.asarray([], dtype=np.float32)
+    return np.ptp(waveforms[:, :, best_ch], axis=1)
+
+
+def _mad_amplitude_mask(clean_amp, cand_amp, mad_scale):
+    clean_amp = np.asarray(clean_amp, dtype=np.float32)
+    cand_amp = np.asarray(cand_amp, dtype=np.float32)
+    if clean_amp.size == 0 or cand_amp.size == 0:
+        return np.zeros(cand_amp.shape, dtype=bool)
+    median_amp = float(np.median(clean_amp))
+    mad_amp = float(np.median(np.abs(clean_amp - median_amp)))
+    tol = max(float(mad_scale) * mad_amp, 1e-6)
+    return np.abs(cand_amp - median_amp) <= tol
+
+
 def autosplit_outliers_pca(
     analyzer,
     # ---- Distance Gate Parameters (Main) ----
@@ -19,6 +37,7 @@ def autosplit_outliers_pca(
     wf_template_max: int | None = 1000,
     wf_n_chans: int = 10,
     wf_center: str = "demean",
+    amp_mad_scale: float = 3.0,
     # ---- Output Control ----
     squeeze_all_outlier_to_new: bool = True,
     min_spikes: int = 10,
@@ -61,6 +80,9 @@ def autosplit_outliers_pca(
         Number of best channels (based on PTP) to use for the waveform gate.
     wf_center : str, default "demean"
         Waveform centering method ("demean" or None).
+    amp_mad_scale : float, default 3.0
+        Candidate spikes are rescued only if their best-channel PTP amplitude lies within
+        `median(clean_amp) +/- amp_mad_scale * MAD(clean_amp)`.
 
     squeeze_all_outlier_to_new : bool, default True
         If True, the outliers are moved to a new unit. If False, they are effectively discarded from the sorting.
@@ -345,6 +367,8 @@ def autosplit_outliers_pca(
 
                     if W_clean.shape[0] > 10:
                         clean_template = np.mean(W_clean, axis=0)
+                        best_ch = int(np.argmax(np.ptp(clean_template, axis=0)))
+                        clean_amp = _ptp_amplitudes(W_clean, best_ch)
 
                         valid_cand = (spike_frames[cand_idx] - nb >= 0) & (spike_frames[cand_idx] + na <= n_samp)
                         c_valid_idx = cand_idx[valid_cand]
@@ -359,7 +383,9 @@ def autosplit_outliers_pca(
 
                             if c_valid.size > 0:
                                 s_cand = _cosine_scores(W_valid, clean_template, wf_center)
-                                rescued_mask = s_cand >= wf_threshold
+                                cand_amp = _ptp_amplitudes(W_valid, best_ch)
+                                amp_ok = _mad_amplitude_mask(clean_amp, cand_amp, amp_mad_scale)
+                                rescued_mask = (s_cand >= wf_threshold) & amp_ok
                                 out_mask[c_valid[rescued_mask]] = False
 
         # --- C. Build results ---
@@ -447,4 +473,3 @@ def autosplit_outliers_pca(
         print(f"\n[Summary] Output: {contiguous_id} units (0 to {contiguous_id - 1})")
 
     return (sorting_out, details) if return_details else sorting_out
-
