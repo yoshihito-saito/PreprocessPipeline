@@ -42,6 +42,28 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
 ### 5. Post-Processing 🛠️
 - Refine Sorting: Clean sorting outputs by removing duplicate spikes, merging fragmented units, splitting outliers, and labeling noisy units.
 
+## Postprocess Metrics and Noise Rules
+
+- `quality_metrics`:
+  - `firing_rate`
+  - `isi_violation`
+  - `presence_ratio`
+  - `snr`
+  - `amplitude_median`
+- `template_metrics`:
+  - `halfwidth`
+  - `repolarization_slope`
+  - `recovery_slope`
+  - `slope = min(abs(repolarization_slope), abs(recovery_slope))`
+
+Default noise thresholds:
+
+- `firing_rate_lt = 0.01`
+- `amplitude_median_lt = 25.0`
+- `amplitude_median_gt = 2000.0`
+- `halfwidth_gt = 0.45`
+- `slope_lt = 100.0`
+
 ## Artifact Removal Options (Current)
 
 - TTL artifact removal: `remove_artifact_TTL=True`

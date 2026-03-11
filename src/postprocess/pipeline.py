@@ -344,6 +344,34 @@ def _compute_final_features(
         },
         **job_kwargs,
     )
+
+
+def _merge_template_metrics_into_metrics_df(
+    metrics_df: pd.DataFrame,
+    analyzer,
+    *,
+    template_metric_names: list[str],
+) -> pd.DataFrame:
+    if not template_metric_names:
+        return pd.DataFrame(metrics_df)
+
+    template_metrics = analyzer.compute(
+        "template_metrics",
+        metric_names=template_metric_names,
+        peak_sign="neg",
+    )
+    template_df = pd.DataFrame(template_metrics)
+    if template_df.empty:
+        return pd.DataFrame(metrics_df)
+
+    merged = pd.DataFrame(metrics_df).join(template_df, how="left")
+    repol = pd.to_numeric(merged.get("repolarization_slope"), errors="coerce")
+    recovery = pd.to_numeric(merged.get("recovery_slope"), errors="coerce")
+    if repol is not None and recovery is not None:
+        merged["slope"] = pd.concat((repol.abs(), recovery.abs()), axis=1).min(axis=1)
+    return merged
+
+
 def _sorting_analyzer_sparsity_kwargs(config: PostprocessConfig) -> dict[str, Any]:
     if not config.analyzer_sparse:
         return {"sparse": False}
@@ -760,6 +788,11 @@ def _run_postprocess_single_session(
             metric_params=qm_params,
             skip_pc_metrics=config.skip_pc_metrics,
             **config.job_kwargs,
+        )
+        metrics_df = _merge_template_metrics_into_metrics_df(
+            metrics_df,
+            analyzer_split,
+            template_metric_names=config.template_metric_names,
         )
         metrics_out_df = pd.DataFrame(metrics_df)
         metrics_out_df.to_csv(metrics_csv_path, index=True)

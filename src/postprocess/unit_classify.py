@@ -112,6 +112,9 @@ def mark_noise_clusters_from_metrics(
         - "presence_ratio_lt": float        # mark noise if presence < value
         - "snr_lt": float                   # mark noise if snr < value
         - "amplitude_median_lt": float      # mark noise if abs(amplitude_median) < value
+        - "amplitude_median_gt": float      # mark noise if abs(amplitude_median) > value
+        - "halfwidth_gt": float             # mark noise if halfwidth > value (ms)
+        - "slope_lt": float                 # mark noise if abs(slope) < value
         - "firing_rate_lt": float           # mark noise if firing rate <= value (Hz)
     backup : bool
         If True, make a timestamped backup of the original TSV before overwriting.
@@ -171,6 +174,12 @@ def mark_noise_clusters_from_metrics(
         conds.append(df["snr"] < thresholds["snr_lt"])
     if "amplitude_median_lt" in thresholds and "_amp_abs_" in df.columns:
         conds.append(df["_amp_abs_"] < thresholds["amplitude_median_lt"])
+    if "amplitude_median_gt" in thresholds and "_amp_abs_" in df.columns:
+        conds.append(df["_amp_abs_"] > thresholds["amplitude_median_gt"])
+    if "halfwidth_gt" in thresholds and "halfwidth" in df.columns:
+        conds.append(pd.to_numeric(df["halfwidth"], errors="coerce") > thresholds["halfwidth_gt"])
+    if "slope_lt" in thresholds and "slope" in df.columns:
+        conds.append(np.abs(pd.to_numeric(df["slope"], errors="coerce")) < thresholds["slope_lt"])
     if "firing_rate_lt" in thresholds and "firing_rate" in df.columns:
         conds.append(df["firing_rate"] <= thresholds["firing_rate_lt"])
 
