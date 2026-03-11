@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "preprocess-pipeline"
+version = "0.1.0"
+description = "Preprocessing and postprocessing pipeline for spike sorting and neural data analysis."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "PyYAML>=6.0",
+    "joblib>=1.3",
+    "scikit-learn>=1.3",
+    "matplotlib>=3.7",
+    "spikeinterface==0.103.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+notebook = [
+    "ipykernel>=6",
+    "jupyterlab>=4",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src", "src.*"]

@@ -4,19 +4,64 @@ A  preprocessing pipeline for spike sorting and neural data analysis.
 This project provides a streamlined workflow for loading raw electrophysiological recordings, applying preprocessing steps (such as filtering, artifact removal, and spike detection), and preparing data for downstream analysis or sorting algorithms.
 
 # ⚙️ Installation
-### Environment
+### Base environment
 ```
-conda create -n phy2 -y python=3.11 cython dask h5py joblib matplotlib numpy pillow pip pyopengl pyqt pyqtwebengine pytest python qtconsole requests responses scikit-learn scipy traitlets
-conda activate phy2
-pip install git+https://github.com/cortex-lab/phy.git
-pip install "spikeinterface[full]"
-pip install kilosort[gui]
-pip uninstall torch
+conda env create -f environment.yml
+conda activate preprocess
+```
 
-Install pytorch (Check compatible version from here)
-https://pytorch.org/get-started/locally/
-e.g. for cuda 11.8
-pip3 install torch --index-url https://download.pytorch.org/whl/cu118
+- Phy GUI:
+```bash
+pip install git+https://github.com/cortex-lab/phy.git
+```
+- Phy2 plugins:
+  1. Download the plugins from `https://github.com/petersenpeter/phy2-plugins`.
+  2. Copy the `plugins` folder to your Phy config directory:
+     - Linux/macOS: `~/.phy`
+     - Windows: `%USERPROFILE%\\.phy`
+  3. Copy `tempdir.py` from this repository's `plugins` directory into `*YourPhyDirectory*/phy/utils`.
+
+  4. If you use KlustaKwik on Windows, install `Visual C++ Redistributable for Visual Studio 2013`:
+     - x64: `https://www.microsoft.com/en-us/download/details.aspx?id=40784`
+- Kilosort / Torch:
+  - install PyTorch with the wheel that matches your OS, Python version, and CUDA/CPU target:
+    - https://pytorch.org/get-started/locally/
+  - then install Kilosort:
+```bash
+pip install kilosort[gui]
+```
+- MATLAB integration:
+  - MATLAB is not installed by `environment.yml`; it must be installed separately and available on the system path if you use MATLAB-dependent steps.
+
+### Kilosort1 on Windows
+
+If you need to compile Kilosort1 on a newer Windows PC, use an older MSVC toolset that is known to work with the legacy CUDA/MATLAB build.
+
+1. Install Visual Studio 2022 with the older MSVC toolset.
+   - Open Visual Studio Installer.
+   - Select `Modify`.
+   - Go to `Individual components`.
+   - Search for `MSVC`.
+   - Enable `MSVC v143 - VS 2022 C++ x64/x86 build tools (v14.36-17.6)`.
+2. Open MATLAB.
+3. Edit `mexGPUall.m` in the Kilosort1 folder so that the `mexcuda` lines include `NVCC_FLAGS="-allow-unsupported-compiler"`.
+4. Run the modified commands:
+
+```matlab
+mexcuda -largeArrayDims mexMPmuFEAT.cu NVCC_FLAGS="-allow-unsupported-compiler"
+mexcuda -largeArrayDims mexMPregMU.cu NVCC_FLAGS="-allow-unsupported-compiler"
+mexcuda -largeArrayDims mexWtW2.cu NVCC_FLAGS="-allow-unsupported-compiler"
+```
+
+This is only needed for Kilosort1 MATLAB/CUDA compilation on Windows. It is not required for the base Python environment in `environment.yml`.
+
+### Pip-only install
+
+If you already manage Python yourself and do not want conda, install the package in editable mode:
+
+```bash
+pip install -e .
+pip install ".[dev,notebook]"
 ```
 
 ## Pipeline Workflow
@@ -42,6 +87,39 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
 ### 5. Post-Processing 🛠️
 - Refine Sorting: Clean sorting outputs by removing duplicate spikes, merging fragmented units, splitting outliers, and labeling noisy units.
 
+
+## Artifact Removal
+
+- TTL artifact removal: `remove_artifact_TTL=True`
+- TTL channel selection: `artifact_TTL_channel` (0-based `[0..15]` or 1-based `[1..16]`)
+- TTL edge behavior:
+  - default: rising edges (`digitalIn.timestampsOn`)
+  - include falling edges: `artifact_TTL_include_offset=True` (`timestampsOn + timestampsOff`)
+- TTL cleaning params: `artifact_TTL_ms_before`, `artifact_TTL_ms_after`, `artifact_TTL_mode`, `artifact_TTL_by_group`
+- High-amplitude artifact removal: `remove_highamp_artifact=True`
+- High-amplitude params: `highamp_*`, `highamp_ms_before`, `highamp_ms_after`, `highamp_mode`, `highamp_remove_by_group`
+- Output files:
+  - `basename.artifactTTL.events.mat`
+  - `basename.artifactHigh.events.mat`
+
+### Autosplit
+
+Autosplit first identifies outlier spike candidates from PCA features using Mahalanobis distance. A waveform rescue step is then applied only to those candidates.
+
+- Main idea:
+  - candidate spikes are rescued only when waveform shape is similar to the clean template
+  - and their best-channel PTP amplitude stays within `median(clean_amp) +/- split_amp_mad_scale * MAD(clean_amp)`
+- Main parameter:
+  - `split_amp_mad_scale = 3.0`
+- Interpretation:
+  - smaller values are stricter and keep more splits
+  - `2.0` is fairly strict
+  - `3.0` is a standard starting point
+  - `4.0+` is looser
+
+Related autosplit settings in the notebook include `split_contamination`, `split_threshold_mode`, `split_wf_threshold`, `split_wf_n_chans`, and `split_amp_mad_scale`.
+
+
 ### Postprocess Metrics and Noise Rules
 
 - `quality_metrics`:
@@ -57,47 +135,32 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
   - `repolarization_slope`
   - `recovery_slope`
   - `slope = min(abs(repolarization_slope), abs(recovery_slope)) / 1000` (`uV/ms`)
-- autosplit waveform rescue:
-  - `split_amp_mad_scale = 3.0`
-  - candidate spikes from the Mahalanobis gate are rescued only when waveform shape is similar and best-channel PTP amplitude stays within `median(clean_amp) +/- split_amp_mad_scale * MAD(clean_amp)`
 
 noise thresholds:
 
 - `isi_violations_ratio_gt = 5.0`
+  - Exclude units with an excessively high refractory-period violation ratio.
 - `isi_violations_count_gt = 50.0`
+  - Exclude units with too many absolute refractory-period violations.
+  - When both `isi_violations_ratio_gt` and `isi_violations_count_gt` are set, the unit is marked as noise only if both thresholds are exceeded.
 - `presence_ratio_lt = 0.1`
+  - Exclude units with too little presence across the full recording.
 - `snr_lt = 2.0`
+  - Exclude units with low SNR and poorly separated waveforms.
 - `amplitude_median_lt = 5.0`
+  - Exclude units whose absolute median spike amplitude is too small.
 - `amplitude_median_gt = 2000.0`
+  - Exclude likely artifacts whose absolute median spike amplitude is too large.
 - `peak_to_valley_gt = 0.85`
+  - Exclude units with excessively long peak-to-valley duration.
 - `peak_trough_ratio_lt = -0.5`
+  - Exclude units whose peak/trough ratio is below threshold and suggests an implausible waveform shape.
 - `halfwidth_gt = 0.4`
+  - Exclude units with overly broad spike half-width.
 - `slope_lt = 100.0`
+  - Exclude units with repolarization/recovery-derived slope that is too shallow.
 - `firing_rate_lt = 0.01`
-
-Notes:
-
-- In this pipeline, `half_width` and `peak_to_valley` are converted to milliseconds before thresholding and export to Phy.
-- `amplitude_median_lt` / `amplitude_median_gt` use `abs(amplitude_median)`, so waveform sign does not affect the threshold.
-- `peak_to_valley_gt = 0.85` means clusters above `0.85 ms` are marked as noise.
-- `peak_trough_ratio_lt = -0.5` is unitless and marks clusters with ratio `<= -0.5` as noise.
-- `halfwidth_gt = 0.4` means clusters above `0.4 ms` are marked as noise.
-- `slope_lt = 100.0` is interpreted in `uV/ms`.
-- If you rerun `mark_noise_clusters_from_metrics(...)` manually in the notebook, keep the same threshold dict there or the Phy labels will reflect the manual values instead of `post_cfg.noise_thresholds`.
-
-## Artifact Removal Options (Current)
-
-- TTL artifact removal: `remove_artifact_TTL=True`
-- TTL channel selection: `artifact_TTL_channel` (0-based `[0..15]` or 1-based `[1..16]`)
-- TTL edge behavior:
-  - default: rising edges (`digitalIn.timestampsOn`)
-  - include falling edges: `artifact_TTL_include_offset=True` (`timestampsOn + timestampsOff`)
-- TTL cleaning params: `artifact_TTL_ms_before`, `artifact_TTL_ms_after`, `artifact_TTL_mode`, `artifact_TTL_by_group`
-- High-amplitude artifact removal: `remove_highamp_artifact=True`
-- High-amplitude params: `highamp_*`, `highamp_ms_before`, `highamp_ms_after`, `highamp_mode`, `highamp_remove_by_group`
-- Output files:
-  - `basename.artifactTTL.events.mat`
-  - `basename.artifactHigh.events.mat`
+  - Exclude units with firing rate that is too low.
 
 
 ## Python Implementation of Neurocode `preprocessSession` - To do
