@@ -8,6 +8,24 @@ def _prepare_cluster_info_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=["firing_rate"], errors="ignore")
 
 
+def _write_cluster_metric_tsv(
+    phy_dir: str | Path,
+    df: pd.DataFrame,
+    column_name: str,
+) -> None:
+    if column_name not in df.columns:
+        return
+
+    phy_dir = Path(phy_dir)
+    metric_df = df[["cluster_id", column_name]].copy()
+    metric_df.to_csv(phy_dir / f"cluster_{column_name}.tsv", sep="\t", index=False)
+
+
+def _write_additional_cluster_metric_tsvs(phy_dir: str | Path, df: pd.DataFrame) -> None:
+    for column_name in ("peak_to_valley", "half_width", "slope"):
+        _write_cluster_metric_tsv(phy_dir, df, column_name)
+
+
 def create_cluster_info_tsv(
     phy_dir: str | Path,
     metrics_df: pd.DataFrame,
@@ -78,6 +96,7 @@ def create_cluster_info_tsv(
         shutil.copyfile(info_path, bak)
     
     out_df.to_csv(info_path, sep="\t", index=False)
+    _write_additional_cluster_metric_tsvs(phy_dir, out_df)
     
     return out_df
 
@@ -112,6 +131,11 @@ def mark_noise_clusters_from_metrics(
         - "presence_ratio_lt": float        # mark noise if presence < value
         - "snr_lt": float                   # mark noise if snr < value
         - "amplitude_median_lt": float      # mark noise if abs(amplitude_median) < value
+        - "amplitude_median_gt": float      # mark noise if abs(amplitude_median) > value
+        - "peak_to_valley_gt": float        # mark noise if peak_to_valley > value (ms)
+        - "peak_trough_ratio_lt": float     # mark noise if peak_trough_ratio <= value
+        - "halfwidth_gt": float             # mark noise if half_width > value (ms)
+        - "slope_lt": float                 # mark noise if abs(slope) < value
         - "firing_rate_lt": float           # mark noise if firing rate <= value (Hz)
     backup : bool
         If True, make a timestamped backup of the original TSV before overwriting.
@@ -171,6 +195,16 @@ def mark_noise_clusters_from_metrics(
         conds.append(df["snr"] < thresholds["snr_lt"])
     if "amplitude_median_lt" in thresholds and "_amp_abs_" in df.columns:
         conds.append(df["_amp_abs_"] < thresholds["amplitude_median_lt"])
+    if "amplitude_median_gt" in thresholds and "_amp_abs_" in df.columns:
+        conds.append(df["_amp_abs_"] > thresholds["amplitude_median_gt"])
+    if "peak_to_valley_gt" in thresholds and "peak_to_valley" in df.columns:
+        conds.append(pd.to_numeric(df["peak_to_valley"], errors="coerce") > thresholds["peak_to_valley_gt"])
+    if "peak_trough_ratio_lt" in thresholds and "peak_trough_ratio" in df.columns:
+        conds.append(pd.to_numeric(df["peak_trough_ratio"], errors="coerce") <= thresholds["peak_trough_ratio_lt"])
+    if "halfwidth_gt" in thresholds and "half_width" in df.columns:
+        conds.append(pd.to_numeric(df["half_width"], errors="coerce") > thresholds["halfwidth_gt"])
+    if "slope_lt" in thresholds and "slope" in df.columns:
+        conds.append(np.abs(pd.to_numeric(df["slope"], errors="coerce")) < thresholds["slope_lt"])
     if "firing_rate_lt" in thresholds and "firing_rate" in df.columns:
         conds.append(df["firing_rate"] <= thresholds["firing_rate_lt"])
 
@@ -223,6 +257,7 @@ def mark_noise_clusters_from_metrics(
             shutil.copyfile(info_path, bak)
         
         info_df.to_csv(info_path, sep="\t", index=False)
+        _write_additional_cluster_metric_tsvs(phy_dir, info_df)
 
     return out_df
 
