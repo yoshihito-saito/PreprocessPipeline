@@ -42,7 +42,7 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
 ### 5. Post-Processing 🛠️
 - Refine Sorting: Clean sorting outputs by removing duplicate spikes, merging fragmented units, splitting outliers, and labeling noisy units.
 
-## Postprocess Metrics and Noise Rules
+### Postprocess Metrics and Noise Rules
 
 - `quality_metrics`:
   - `firing_rate`
@@ -58,22 +58,29 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu118
   - `recovery_slope`
   - `slope = min(abs(repolarization_slope), abs(recovery_slope)) / 1000` (`uV/ms`)
 
-Default noise thresholds:
+noise thresholds:
 
-- `firing_rate_lt = 0.01`
-- `amplitude_median_lt = 25.0`
+- `isi_violations_ratio_gt = 5.0`
+- `isi_violations_count_gt = 50.0`
+- `presence_ratio_lt = 0.1`
+- `snr_lt = 2.0`
+- `amplitude_median_lt = 5.0`
 - `amplitude_median_gt = 2000.0`
 - `peak_to_valley_gt = 0.85`
 - `peak_trough_ratio_lt = -0.5`
-- `halfwidth_gt = 0.45`
+- `halfwidth_gt = 0.4`
 - `slope_lt = 100.0`
+- `firing_rate_lt = 0.01`
 
 Notes:
 
 - In this pipeline, `half_width` and `peak_to_valley` are converted to milliseconds before thresholding and export to Phy.
+- `amplitude_median_lt` / `amplitude_median_gt` use `abs(amplitude_median)`, so waveform sign does not affect the threshold.
 - `peak_to_valley_gt = 0.85` means clusters above `0.85 ms` are marked as noise.
 - `peak_trough_ratio_lt = -0.5` is unitless and marks clusters with ratio `<= -0.5` as noise.
-- `halfwidth_gt = 0.45` corresponds to `0.45 ms` in the current SpikeCleaner thresholds.
+- `halfwidth_gt = 0.4` means clusters above `0.4 ms` are marked as noise.
+- `slope_lt = 100.0` is interpreted in `uV/ms`.
+- If you rerun `mark_noise_clusters_from_metrics(...)` manually in the notebook, keep the same threshold dict there or the Phy labels will reflect the manual values instead of `post_cfg.noise_thresholds`.
 
 ## Artifact Removal Options (Current)
 
