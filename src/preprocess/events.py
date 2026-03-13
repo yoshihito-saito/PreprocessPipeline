@@ -341,6 +341,74 @@ def _build_empty_cell_row(n_cells: int, shape: tuple[int, int]) -> np.ndarray:
     return out
 
 
+def _build_openephys_digital_word_segment(ttl_path: Path, sample_count: int) -> np.ndarray:
+    segment = np.zeros(max(0, int(sample_count)), dtype=np.uint16)
+    if segment.size == 0 or not ttl_path.exists():
+        return segment
+
+    sample_numbers_path = ttl_path / "sample_numbers.npy"
+    states_path = ttl_path / "states.npy"
+    full_words_path = ttl_path / "full_words.npy"
+    if not sample_numbers_path.exists() or not states_path.exists() or not full_words_path.exists():
+        return segment
+
+    sample_numbers = np.asarray(np.load(sample_numbers_path), dtype=np.int64).reshape(-1)
+    states = np.asarray(np.load(states_path), dtype=np.int64).reshape(-1)
+    full_words = np.asarray(np.load(full_words_path), dtype=np.uint64).reshape(-1)
+    if sample_numbers.size == 0:
+        return segment
+    if sample_numbers.size != states.size or sample_numbers.size != full_words.size:
+        raise ValueError(
+            "Open Ephys TTL arrays must have matching lengths: "
+            f"{sample_numbers_path}, {states_path}, {full_words_path}"
+        )
+
+    order = np.argsort(sample_numbers, kind="mergesort")
+    sample_numbers = sample_numbers[order]
+    full_words = full_words[order]
+
+    cursor = 0
+    current_word = np.uint16(0)
+    for sample_number, full_word in zip(sample_numbers, full_words, strict=True):
+        boundary = int(np.clip(sample_number, 0, segment.size))
+        if boundary > cursor:
+            segment[cursor:boundary] = current_word
+        current_word = np.uint16(int(full_word) & 0xFFFF)
+        cursor = boundary
+    if cursor < segment.size:
+        segment[cursor:] = current_word
+    return segment
+
+
+def build_openephys_digital_word_signal(
+    ttl_paths: list[Path],
+    sample_counts: list[int],
+) -> np.ndarray | None:
+    if not ttl_paths or not sample_counts:
+        return None
+    if len(ttl_paths) != len(sample_counts):
+        raise ValueError("Open Ephys TTL paths and sample counts must have the same length.")
+
+    total_samples = int(sum(max(0, int(n)) for n in sample_counts))
+    if total_samples <= 0:
+        return None
+
+    digital_word = np.zeros(total_samples, dtype=np.uint16)
+    cursor = 0
+    has_any = False
+    for ttl_path, sample_count in zip(ttl_paths, sample_counts, strict=True):
+        n_samples = max(0, int(sample_count))
+        segment = _build_openephys_digital_word_segment(ttl_path, n_samples)
+        if segment.size:
+            digital_word[cursor : cursor + n_samples] = segment
+            if np.any(segment):
+                has_any = True
+        cursor += n_samples
+    if not has_any:
+        return None
+    return digital_word
+
+
 def _build_digital_in_struct(
     *,
     digital_data_u16: np.ndarray,
@@ -502,6 +570,8 @@ def export_analog_digital_events(
     overwrite: bool,
     pulse_min_dur_sec: float | None = None,
     pulse_sess_epochs_1based: list[int] | None = None,
+    openephys_ttl_paths: list[Path] | None = None,
+    openephys_sample_counts: list[int] | None = None,
 ) -> tuple[list[Path], list[Path]]:
     del analog_channels  # neurocode preprocessSession computes analogInp/pulses on all active ADC channels
     del digital_active_channels_1based  # neurocode getDigitalIn decodes 16-bit word space
@@ -585,5 +655,31 @@ def export_analog_digital_events(
                 digital_paths.append(digital_out)
             elif digital_out.exists():
                 digital_out.unlink()
+    elif digital_inputs and openephys_ttl_paths is not None and openephys_sample_counts is not None:
+        existing_digital = _find_existing_digital_events_file(output_dir)
+        if (not overwrite) and existing_digital is not None:
+            digital_paths.append(existing_digital)
+        else:
+            digital_out = output_dir / "digitalIn.events.mat"
+            digital_word = build_openephys_digital_word_signal(openephys_ttl_paths, openephys_sample_counts)
+            if digital_word is None:
+                if digital_out.exists():
+                    digital_out.unlink()
+            else:
+                digital_data = digital_word.reshape(-1, 1)
+                selected_0based = _normalize_channel_indices(digital_channels, 16) if digital_channels else []
+                selected_1based = [i + 1 for i in selected_0based] if selected_0based else None
+                digital_in, has_any = _build_digital_in_struct(
+                    digital_data_u16=digital_data,
+                    digital_channels_1based=selected_1based,
+                    fs=digital_sr_eff,
+                    word_channels=1,
+                )
+                if has_any:
+                    savemat(digital_out, {"digitalIn": digital_in}, do_compression=True)
+                    _save_digital_plot(output_dir, digital_in)
+                    digital_paths.append(digital_out)
+                elif digital_out.exists():
+                    digital_out.unlink()
 
     return analog_paths, digital_paths

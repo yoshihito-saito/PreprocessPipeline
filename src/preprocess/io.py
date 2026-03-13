@@ -25,6 +25,10 @@ from .metafile import (
 )
 
 
+_OPENEPHYS_DATETIME_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})")
+_OPENEPHYS_RECORD_NODE_NAME = "Record Node 101"
+
+
 def extract_datetime(path: str) -> datetime:
     m = re.search(r"(\d{6}_\d{6})", path)
     if m:
@@ -501,6 +505,85 @@ def _direct_child_file_candidates(basepath: Path, *filenames: str) -> list[Path]
     return candidates
 
 
+def _extract_openephys_datetime(name: str) -> datetime | None:
+    match = _OPENEPHYS_DATETIME_PATTERN.search(name)
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y-%m-%d_%H-%M-%S")
+    except ValueError:
+        return None
+
+
+def _is_openephys_datetime_dir(path: Path) -> bool:
+    return (
+        path.is_dir()
+        and _extract_openephys_datetime(path.name) is not None
+        and (path / _OPENEPHYS_RECORD_NODE_NAME).is_dir()
+    )
+
+
+def _discover_openephys_recordings(basepath: Path, ignore_folders: list[str]) -> list[Path]:
+    recording_roots: list[Path] = []
+    for child in sorted(basepath.iterdir()):
+        if not child.is_dir():
+            continue
+        pstr = str(child).lower()
+        if any(tok.lower() in pstr for tok in ignore_folders):
+            continue
+        if not _is_openephys_datetime_dir(child):
+            continue
+        recording_root = child / _OPENEPHYS_RECORD_NODE_NAME / "experiment1" / "recording1"
+        if recording_root.is_dir() and (recording_root / "structure.oebin").exists():
+            recording_roots.append(recording_root)
+    return recording_roots
+
+
+def _find_openephys_datetime_ancestor(path: Path) -> Path | None:
+    for candidate in (path, *path.parents):
+        if _extract_openephys_datetime(candidate.name) is not None:
+            return candidate
+    return None
+
+
+def _openephys_subsession_name(recording_root: Path) -> str:
+    dt_dir = _find_openephys_datetime_ancestor(recording_root)
+    if dt_dir is not None:
+        return dt_dir.name
+    return recording_root.name
+
+
+def _load_openephys_structure(recording_root: Path) -> dict:
+    structure_path = recording_root / "structure.oebin"
+    with open(structure_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _resolve_openephys_stream_info(recording_root: Path) -> tuple[Path, str, Path, int, float]:
+    structure = _load_openephys_structure(recording_root)
+    continuous_entries = structure.get("continuous", [])
+    if not continuous_entries:
+        raise FileNotFoundError(f"No continuous streams found in {recording_root / 'structure.oebin'}")
+
+    entry = continuous_entries[0]
+    folder_name = str(entry["folder_name"]).rstrip("/\\")
+    continuous_dat = recording_root / "continuous" / folder_name / "continuous.dat"
+    if not continuous_dat.exists():
+        raise FileNotFoundError(f"Missing Open Ephys continuous.dat: {continuous_dat}")
+
+    recorded_processor = str(entry.get("recorded_processor", "Record Node")).strip()
+    recorded_processor_id = entry.get("recorded_processor_id")
+    if recorded_processor_id is not None:
+        stream_name = f"{recorded_processor} {recorded_processor_id}#{folder_name}"
+    else:
+        stream_name = folder_name
+
+    ttl_path = recording_root / "events" / folder_name / "TTL"
+    num_channels = int(entry["num_channels"])
+    sampling_frequency = float(entry["sample_rate"])
+    return continuous_dat, stream_name, ttl_path, num_channels, sampling_frequency
+
+
 def ensure_xml(basepath: Path, local_output_dir: Path, basename: str) -> Path:
     target = local_output_dir / f"{basename}.xml"
     base_xml = basepath / f"{basename}.xml"
@@ -620,19 +703,21 @@ def discover_subsessions(
 
     ignore_folders = ignore_folders or []
 
-    paths: list[Path] = []
-    for child in sorted(basepath.iterdir()):
-        if not child.is_dir():
-            continue
-        pstr = str(child).lower()
-        if any(tok.lower() in pstr for tok in ignore_folders):
-            continue
-        amp = child / "amplifier.dat"
-        cont = child / "continuous.dat"
-        if amp.exists():
-            paths.append(amp)
-        elif cont.exists():
-            paths.append(cont)
+    paths = _discover_openephys_recordings(basepath, ignore_folders)
+    if not paths:
+        paths = []
+        for child in sorted(basepath.iterdir()):
+            if not child.is_dir():
+                continue
+            pstr = str(child).lower()
+            if any(tok.lower() in pstr for tok in ignore_folders):
+                continue
+            amp = child / "amplifier.dat"
+            cont = child / "continuous.dat"
+            if amp.exists():
+                paths.append(amp)
+            elif cont.exists():
+                paths.append(cont)
 
     if not paths:
         return []
@@ -660,16 +745,20 @@ def _normalize_alt_sort_indices(alt_sort: list[int], n: int) -> list[int]:
 
 def _subsession_sort_key(path: Path) -> tuple[int, str]:
     name = path.parent.name
+    oe_dt_dir = _find_openephys_datetime_ancestor(path)
+    if oe_dt_dir is not None:
+        dt = _extract_openephys_datetime(oe_dt_dir.name)
+        if dt is not None:
+            return int(dt.strftime("%Y%m%d%H%M%S")), str(path)
 
     intan_match = re.search(r"(\d{6}_\d{6})", name)
     if intan_match:
         dt = datetime.strptime(intan_match.group(1), "%y%m%d_%H%M%S")
         return int(dt.strftime("%Y%m%d%H%M%S")), str(path)
 
-    oe_match = re.search(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})", name)
-    if oe_match:
-        dt = datetime.strptime(oe_match.group(1), "%Y-%m-%d_%H-%M-%S")
-        return int(dt.strftime("%Y%m%d%H%M%S")), str(path)
+    oe_dt = _extract_openephys_datetime(name)
+    if oe_dt is not None:
+        return int(oe_dt.strftime("%Y%m%d%H%M%S")), str(path)
 
     return 0, str(path)
 
@@ -686,6 +775,69 @@ def build_acquisition_catalog(
     dtype: str,
     intan_header: IntanRhdHeader | None = None,
 ) -> AcquisitionCatalog:
+    if amplifier_paths and amplifier_paths[0].is_dir() and (amplifier_paths[0] / "structure.oebin").exists():
+        itemsize = np.dtype(dtype).itemsize
+        recording_paths = [Path(p) for p in amplifier_paths]
+        continuous_paths: list[Path] = []
+        recording_stream_names: list[str | None] = []
+        ttl_event_paths: list[Path] = []
+        sample_counts: list[int] = []
+        sampling_frequency: float | None = None
+        amplifier_channels: int | None = None
+
+        for recording_root in recording_paths:
+            continuous_path, stream_name, ttl_path, n_channels, sr = _resolve_openephys_stream_info(recording_root)
+            if sampling_frequency is None:
+                sampling_frequency = sr
+            elif not np.isclose(sampling_frequency, sr):
+                raise ValueError(
+                    "Open Ephys recordings with mismatched sampling frequencies are unsupported: "
+                    f"{sampling_frequency} vs {sr} ({recording_root})"
+                )
+            if amplifier_channels is None:
+                amplifier_channels = n_channels
+            elif amplifier_channels != n_channels:
+                raise ValueError(
+                    "Open Ephys recordings with mismatched channel counts are unsupported: "
+                    f"{amplifier_channels} vs {n_channels} ({recording_root})"
+                )
+
+            continuous_paths.append(continuous_path)
+            recording_stream_names.append(stream_name)
+            ttl_event_paths.append(ttl_path)
+            sample_counts.append(int(continuous_path.stat().st_size // (n_channels * itemsize)))
+
+        has_ttl = any(path.exists() for path in ttl_event_paths)
+        dig_ch = 16 if has_ttl else 0
+        dig_word_ch = 1 if has_ttl else 0
+        dig_native_orders = list(range(16)) if has_ttl else []
+
+        return AcquisitionCatalog(
+            source_type="openephys",
+            subsession_names=[_openephys_subsession_name(p) for p in recording_paths],
+            recording_paths=recording_paths,
+            recording_stream_names=recording_stream_names,
+            ttl_event_paths=ttl_event_paths,
+            amplifier_paths=continuous_paths,
+            analogin_paths=[],
+            digitalin_paths=[],
+            auxiliary_paths=[],
+            supply_paths=[],
+            time_paths=[],
+            sample_counts=sample_counts,
+            sampling_frequency=sampling_frequency,
+            amplifier_channels=int(amplifier_channels or n_amplifier_channels),
+            auxiliary_input_channels=0,
+            supply_voltage_channels=0,
+            board_adc_channels=0,
+            board_digital_input_channels=dig_ch,
+            board_digital_word_channels=dig_word_ch,
+            board_digital_output_channels=0,
+            temperature_sensor_channels=0,
+            board_adc_native_orders=[],
+            board_digital_input_native_orders=dig_native_orders,
+        )
+
     itemsize = np.dtype(dtype).itemsize
     sample_counts = [int(p.stat().st_size // (n_amplifier_channels * itemsize)) for p in amplifier_paths]
 
@@ -754,7 +906,11 @@ def build_acquisition_catalog(
         dig_native_orders = list(range(int(dig_ch)))
 
     return AcquisitionCatalog(
+        source_type="intan",
         subsession_names=[p.parent.name for p in amplifier_paths],
+        recording_paths=[p.parent for p in amplifier_paths],
+        recording_stream_names=[None for _ in amplifier_paths],
+        ttl_event_paths=[],
         amplifier_paths=amplifier_paths,
         analogin_paths=analogin_paths,
         digitalin_paths=digitalin_paths,
@@ -762,6 +918,7 @@ def build_acquisition_catalog(
         supply_paths=supply_paths,
         time_paths=time_paths,
         sample_counts=sample_counts,
+        sampling_frequency=None,
         amplifier_channels=n_amplifier_channels,
         auxiliary_input_channels=aux_ch,
         supply_voltage_channels=supply_ch,
