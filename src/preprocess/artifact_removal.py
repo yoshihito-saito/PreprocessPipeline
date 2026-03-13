@@ -306,7 +306,13 @@ def remove_artifacts(
         agg_ch_ids = recording_clean.get_channel_ids()
         gid_map = {int(ch_ids[i]): int(original_group_ids[i]) for i in range(len(ch_ids))}
         agg_groups = [gid_map[int(ch)] for ch in agg_ch_ids]
-        recording_clean.set_channel_property(agg_ch_ids, "group", agg_groups)
+        if hasattr(recording_clean, "set_channel_property"):
+            recording_clean.set_channel_property(agg_ch_ids, "group", agg_groups)
+        elif hasattr(recording_clean, "set_property"):
+            try:
+                recording_clean.set_property("group", agg_groups, ids=agg_ch_ids)
+            except TypeError:
+                recording_clean.set_property("group", agg_groups)
     except Exception:
         pass
 

@@ -13,6 +13,75 @@ import spikeinterface.extractors as se
 import spikeinterface.preprocessing as spre
 
 
+def _set_channel_property_compat(recording: Any, channel_ids: list[int], key: str, values: list[Any]) -> None:
+    if hasattr(recording, "set_channel_property"):
+        recording.set_channel_property(channel_ids, key, values)
+        return
+    if hasattr(recording, "set_property"):
+        try:
+            recording.set_property(key, values, ids=channel_ids)
+        except TypeError:
+            # Fallback for API variants that do not accept ids.
+            recording.set_property(key, values)
+        return
+    raise AttributeError("Recording object does not support set_channel_property/set_property.")
+
+
+def _build_chanmap_group_properties(chanmap_mat_path: Path, channel_ids: list[int]) -> dict[str, list[int]]:
+    mat = loadmat(chanmap_mat_path)
+    required = {"kcoords", "chanMap"}
+    if not required.issubset(set(mat.keys())):
+        missing = ", ".join(sorted(required.difference(set(mat.keys()))))
+        raise ValueError(f"chanMap is missing required fields: {missing}")
+
+    device_ch_inds = np.asarray(mat["chanMap"]).flatten().astype(int) - 1
+    if device_ch_inds.size == 0:
+        raise ValueError("chanMap has no channel entries.")
+
+    probe_ids = np.asarray(mat.get("probe_ids", np.ones_like(device_ch_inds))).flatten().astype(int)
+    shank_ids = np.asarray(mat["kcoords"]).flatten().astype(int)
+    n = min(device_ch_inds.size, probe_ids.size, shank_ids.size)
+    if n == 0:
+        raise ValueError("chanMap has empty probe/shank metadata.")
+
+    device_ch_inds = device_ch_inds[:n]
+    probe_ids = probe_ids[:n]
+    shank_ids = shank_ids[:n]
+
+    probe_map: dict[int, int] = {}
+    shank_map: dict[int, tuple[int, int]] = {}
+    for dev_ch, probe_id, shank_id in zip(device_ch_inds, probe_ids, shank_ids, strict=True):
+        probe_map[int(dev_ch)] = int(probe_id)
+        shank_map[int(dev_ch)] = (int(probe_id), int(shank_id))
+
+    channel_ids_int = [int(ch) for ch in channel_ids]
+    missing_channels = [ch for ch in channel_ids_int if ch not in probe_map or ch not in shank_map]
+    if missing_channels:
+        preview = ", ".join(str(ch) for ch in missing_channels[:10])
+        suffix = "..." if len(missing_channels) > 10 else ""
+        raise ValueError(
+            "chanMap does not define probe/shank assignments for all recording channels. "
+            f"Missing channel ids: {preview}{suffix}"
+        )
+
+    probe_groups = [probe_map[ch] for ch in channel_ids_int]
+
+    pair_to_group: dict[tuple[int, int], int] = {}
+    next_group = 0
+    shank_groups: list[int] = []
+    for ch in channel_ids_int:
+        key = shank_map[ch]
+        if key not in pair_to_group:
+            pair_to_group[key] = next_group
+            next_group += 1
+        shank_groups.append(pair_to_group[key])
+
+    return {
+        "artifact_group_probe": probe_groups,
+        "artifact_group_shank": shank_groups,
+    }
+
+
 def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path) -> Any:
     mat = loadmat(chanmap_mat_path)
     required = {"xcoords", "ycoords", "kcoords", "chanMap"}
@@ -92,7 +161,7 @@ def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path) -> Any:
 
     if hasattr(recording, "set_probegroup"):
         try:
-            return recording.set_probegroup(probegroup, group_mode="by_probe")
+            recording = recording.set_probegroup(probegroup, group_mode="by_probe")
         except Exception as exc:
             warnings.warn(
                 f"Failed to attach probe from chanMap ({chanmap_mat_path}): {exc}. "
@@ -101,9 +170,9 @@ def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path) -> Any:
                 stacklevel=2,
             )
             return recording
-    if hasattr(recording, "set_probe"):
+    elif hasattr(recording, "set_probe"):
         try:
-            return recording.set_probe(probegroup.probes[0])
+            recording = recording.set_probe(probegroup.probes[0])
         except Exception as exc:
             warnings.warn(
                 f"Failed to attach probe from chanMap ({chanmap_mat_path}): {exc}. "
@@ -112,6 +181,53 @@ def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path) -> Any:
                 stacklevel=2,
             )
             return recording
+
+    # Keep both probe-level and shank-level group properties for artifact routing.
+    try:
+        ch_ids = [int(ch) for ch in recording.get_channel_ids()]
+        group_props = _build_chanmap_group_properties(chanmap_mat_path, ch_ids)
+        _set_channel_property_compat(recording, ch_ids, "artifact_group_probe", group_props["artifact_group_probe"])
+        _set_channel_property_compat(recording, ch_ids, "artifact_group_shank", group_props["artifact_group_shank"])
+        _set_channel_property_compat(recording, ch_ids, "group", group_props["artifact_group_probe"])
+    except Exception as exc:
+        warnings.warn(
+            f"Failed to attach artifact group properties from chanMap ({chanmap_mat_path}): {exc}. "
+            "Continuing with existing group assignments.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    return recording
+
+
+def apply_artifact_group_mode(
+    recording: Any,
+    *,
+    chanmap_mat_path: Path | None,
+    mode: str,
+) -> Any:
+    if mode not in {"all", "probe", "shank"}:
+        raise ValueError(f"Unsupported artifact group mode: {mode}")
+
+    channel_ids = [int(ch) for ch in recording.get_channel_ids()]
+    if not channel_ids:
+        return recording
+
+    if mode == "all":
+        _set_channel_property_compat(recording, channel_ids, "group", [0] * len(channel_ids))
+        return recording
+
+    if chanmap_mat_path is None or not Path(chanmap_mat_path).exists():
+        raise ValueError(
+            f"artifact group mode '{mode}' requires a valid chanMap.mat path, but none was found."
+        )
+
+    group_props = _build_chanmap_group_properties(Path(chanmap_mat_path), channel_ids)
+    _set_channel_property_compat(recording, channel_ids, "artifact_group_probe", group_props["artifact_group_probe"])
+    _set_channel_property_compat(recording, channel_ids, "artifact_group_shank", group_props["artifact_group_shank"])
+
+    selected_key = "artifact_group_probe" if mode == "probe" else "artifact_group_shank"
+    _set_channel_property_compat(recording, channel_ids, "group", group_props[selected_key])
     return recording
 
 

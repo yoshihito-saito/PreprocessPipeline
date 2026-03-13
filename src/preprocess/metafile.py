@@ -25,15 +25,13 @@ class PreprocessConfig:
     bandpass_max_hz: float = 8000.0
     reference: str = "local"
     local_radius_um: tuple[float, float] = (50.0, 200.0)
-    remove_artifact_TTL: bool = False
+    artifact_ttl_group_mode: Literal["none", "all", "probe", "shank"] = "none"
     artifact_TTL_channel: int | None = None
-    artifact_TTL_by_group: bool = True
     artifact_TTL_ms_before: float = 1.0
     artifact_TTL_ms_after: float = 1.0
     artifact_TTL_mode: str = "cubic"
     artifact_TTL_include_offset: bool = False
-    remove_highamp_artifact: bool = False
-    highamp_detect_by_group: bool = False
+    artifact_highamp_group_mode: Literal["none", "all", "probe", "shank"] = "none"
     highamp_estimate_windows: int = 50
     highamp_estimate_window_s: float = 1.0
     highamp_threshold_sigma: float = 10.0
@@ -41,7 +39,6 @@ class PreprocessConfig:
     highamp_chunk_s: float = 100.0
     highamp_dead_time_ms: float = 5.0
     highamp_n_jobs: int = -1
-    highamp_remove_by_group: bool = False
     highamp_ms_before: float = 1.0
     highamp_ms_after: float = 1.0
     highamp_mode: str = "cubic"

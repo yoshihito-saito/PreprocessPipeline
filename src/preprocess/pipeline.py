@@ -25,6 +25,7 @@ from .intan_rhd import read_intan_rhd_header
 from .mergepoints import compute_mergepoints, save_mergepoints_events_mat
 from .recording import (
     apply_preprocessing,
+    apply_artifact_group_mode,
     attach_probe_and_remove_bad_channels,
     apply_transform_to_selected_channels_preserve_shape,
     concatenate_recordings_si,
@@ -133,6 +134,22 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         step_idx += 1
         print(f"[Step {step_idx}/{total_steps}] {label}")
 
+    valid_modes = {"none", "all", "probe", "shank"}
+    ttl_group_mode = str(config.artifact_ttl_group_mode).lower()
+    highamp_group_mode = str(config.artifact_highamp_group_mode).lower()
+    if ttl_group_mode not in valid_modes:
+        raise ValueError(
+            f"artifact_ttl_group_mode must be one of {sorted(valid_modes)}. Got: {config.artifact_ttl_group_mode}"
+        )
+    if highamp_group_mode not in valid_modes:
+        raise ValueError(
+            "artifact_highamp_group_mode must be one of "
+            f"{sorted(valid_modes)}. Got: {config.artifact_highamp_group_mode}"
+        )
+
+    ttl_artifact_enabled = ttl_group_mode != "none"
+    highamp_artifact_enabled = highamp_group_mode != "none"
+
     _step("Make session metafile context")
     basepath, basename = resolve_basepath_and_basename(config.basepath)
     output_dir = resolve_local_output_dir(basepath, basename, config)
@@ -193,16 +210,18 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     save_mergepoints_events_mat(mergepoints_path, merge_data)
 
     ttl_channel_0based: int | None = None
-    if config.remove_artifact_TTL:
+    if ttl_artifact_enabled:
         if config.artifact_TTL_channel is None:
-            raise ValueError("remove_artifact_TTL=True requires artifact_TTL_channel to be specified.")
+            raise ValueError(
+                "artifact_ttl_group_mode != 'none' requires artifact_TTL_channel to be specified."
+            )
         ttl_channel_0based = _normalize_artifact_ttl_channel(config.artifact_TTL_channel)
 
     # Build sidecar dat/events early so TTL artifact removal can reuse digitalIn.events.mat
     # instead of re-parsing digitalin binary separately.
     _step("Prepare sidecar dat files")
     intermediate_dat_paths: dict[str, Path] = {}
-    need_sidecar_for_events = bool(config.analog_inputs or config.digital_inputs or config.remove_artifact_TTL)
+    need_sidecar_for_events = bool(config.analog_inputs or config.digital_inputs or ttl_artifact_enabled)
     if config.export_intermediate_dat or need_sidecar_for_events:
         analog_ch = (
             int(catalog.board_adc_channels)
@@ -261,7 +280,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         if int(catalog.board_digital_word_channels) > 0
         else 1
     )
-    digital_inputs_for_export = bool(config.digital_inputs or config.remove_artifact_TTL)
+    digital_inputs_for_export = bool(config.digital_inputs or ttl_artifact_enabled)
     digital_channels_for_export = list(config.digital_channels) if config.digital_channels else None
     if ttl_channel_0based is not None:
         ttl_ch_1based = int(ttl_channel_0based) + 1
@@ -363,13 +382,13 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
                 reference=config.reference,
                 local_radius_um=config.local_radius_um,
             )
-    if (config.remove_artifact_TTL or config.remove_highamp_artifact) and not config.do_preprocess:
+    if (ttl_artifact_enabled or highamp_artifact_enabled) and not config.do_preprocess:
         raise ValueError(
             "Artifact removal requires CMR output. Set do_preprocess=True when "
-            "remove_artifact_TTL or remove_highamp_artifact is enabled."
+            "artifact_ttl_group_mode or artifact_highamp_group_mode is not 'none'."
         )
     _step("Run TTL artifact removal (optional)")
-    if config.remove_artifact_TTL:
+    if ttl_artifact_enabled:
         existing_ttl_events_path = output_dir / f"{basename}.artifactTTL.events.mat"
         if existing_ttl_events_path.exists() and not config.overwrite:
             print(f"Skipping TTL artifact removal: existing file found ({existing_ttl_events_path})")
@@ -378,7 +397,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             ttl_events_path = next((p for p in digital_event_paths if "digitalIn.events.mat" in p.name), None)
             if ttl_events_path is None:
                 raise ValueError(
-                    "remove_artifact_TTL=True but digitalIn.events.mat was not generated. "
+                    "artifact_ttl_group_mode != 'none' but digitalIn.events.mat was not generated. "
                     "Check digitalin availability and TTL channel settings."
                 )
             loaded_digital = loadmat(ttl_events_path, simplify_cells=True)
@@ -420,20 +439,26 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
                 source_label = "digitalIn.timestampsOn+timestampsOff"
             if ttl_sec.size == 0:
                 raise ValueError(
-                    "remove_artifact_TTL=True but no TTL events were detected for "
+                    "artifact_ttl_group_mode != 'none' but no TTL events were detected for "
                     f"artifact_TTL_channel={ttl_channel_0based} "
                     f"(include_offset={bool(config.artifact_TTL_include_offset)})."
                 )
             artifact_ttl_timestamps_sec = np.unique(ttl_sec.astype(np.float64))
             artifact_ttl = np.unique(np.rint(ttl_sec * float(effective_sr)).astype(np.int64)).tolist()
 
+            recording_for_ttl = apply_artifact_group_mode(
+                recording_preprocessed,
+                chanmap_mat_path=config.chanmap_mat_path,
+                mode=ttl_group_mode,
+            )
+
             recording_preprocessed = apply_transform_to_selected_channels_preserve_shape(
-                recording_raw=recording_preprocessed,
+                recording_raw=recording_for_ttl,
                 selected_channel_ids=good_channels_0based,
                 transform_fn=lambda rec_sel: remove_artifacts(
                     recording_in=rec_sel,
                     artifact_per_group=artifact_ttl,
-                    by_group=config.artifact_TTL_by_group,
+                    by_group=(ttl_group_mode != "all"),
                     ms_before=config.artifact_TTL_ms_before,
                     ms_after=config.artifact_TTL_ms_after,
                     mode=config.artifact_TTL_mode,
@@ -458,7 +483,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             intermediate_dat_paths["artifact_ttl_events"] = ttl_events_path
 
     _step("Run high-amplitude artifact removal (optional)")
-    if config.remove_highamp_artifact:
+    if highamp_artifact_enabled:
         existing_high_events_path = output_dir / f"{basename}.artifactHigh.events.mat"
         if existing_high_events_path.exists() and not config.overwrite:
             print(f"Skipping high-amplitude artifact removal: existing file found ({existing_high_events_path})")
@@ -466,10 +491,16 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         else:
             highamp_frames_by_group: dict[int, list[int]] = {}
 
+            recording_for_highamp = apply_artifact_group_mode(
+                recording_preprocessed,
+                chanmap_mat_path=config.chanmap_mat_path,
+                mode=highamp_group_mode,
+            )
+
             def _apply_highamp_artifacts(rec_sel):
                 detected = detect_high_amplitude_artifacts(
                     rec_sel,
-                    by_group=config.highamp_detect_by_group,
+                    by_group=(highamp_group_mode != "all"),
                     estimate_windows=config.highamp_estimate_windows,
                     estimate_window_s=config.highamp_estimate_window_s,
                     threshold_sigma=config.highamp_threshold_sigma,
@@ -483,14 +514,14 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
                 return remove_artifacts(
                     recording_in=rec_sel,
                     artifact_per_group=detected,
-                    by_group=config.highamp_remove_by_group,
+                    by_group=(highamp_group_mode != "all"),
                     ms_before=config.highamp_ms_before,
                     ms_after=config.highamp_ms_after,
                     mode=config.highamp_mode,
                 )[0]
 
             recording_preprocessed = apply_transform_to_selected_channels_preserve_shape(
-                recording_raw=recording_preprocessed,
+                recording_raw=recording_for_highamp,
                 selected_channel_ids=good_channels_0based,
                 transform_fn=_apply_highamp_artifacts,
             )
