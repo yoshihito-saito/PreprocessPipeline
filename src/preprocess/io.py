@@ -1024,6 +1024,27 @@ def set_tree_world_rw(root: Path) -> None:
             print(f"Warning: failed to update permissions for {path}: {exc}")
 
 
+def set_paths_world_rw(paths: list[Path]) -> None:
+    seen: set[Path] = set()
+    for path in paths:
+        current = Path(path)
+        if current.name == "@eaDir":
+            continue
+        if current in seen or not current.exists():
+            continue
+        seen.add(current)
+        try:
+            if current.is_symlink():
+                continue
+            mode = current.stat().st_mode
+            if current.is_dir():
+                current.chmod(mode | 0o777)
+            elif current.is_file():
+                current.chmod(mode | 0o666)
+        except Exception as exc:
+            print(f"Warning: failed to update permissions for {current}: {exc}")
+
+
 def copy_results_to_basepath(
     *,
     local_output_dir: Path,
@@ -1040,16 +1061,22 @@ def copy_results_to_basepath(
     if src == dst:
         raise ValueError(f"Source and destination are identical: {src}")
 
+    changed_paths: list[Path] = []
+
     def _copy_path_contents_no_metadata(source_path: Path, target_path: Path) -> bool:
         copied = False
         if source_path.is_dir():
+            created = not target_path.exists()
             target_path.mkdir(parents=True, exist_ok=True)
+            if created:
+                changed_paths.append(target_path)
             for nested in source_path.iterdir():
                 copied = _copy_path_contents_no_metadata(nested, target_path / nested.name) or copied
             return copied
         if source_path.is_file():
             target_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source_path, target_path)
+            changed_paths.append(target_path)
             return True
         return False
 
@@ -1058,7 +1085,7 @@ def copy_results_to_basepath(
         copied_any = _copy_path_contents_no_metadata(child, dst / child.name) or copied_any
 
     if copied_any:
-        set_tree_world_rw(dst)
+        set_paths_world_rw(changed_paths)
 
     if delete_local:
         shutil.rmtree(src)

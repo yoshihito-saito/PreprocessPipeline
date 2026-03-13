@@ -110,12 +110,8 @@ Autosplit first identifies outlier spike candidates from PCA features using Maha
   - candidate spikes are rescued only when waveform shape is similar to the clean template
   - and their best-channel PTP amplitude stays within `median(clean_amp) +/- split_amp_mad_scale * MAD(clean_amp)`
 - Main parameter:
-  - `split_amp_mad_scale = 3.0`
-- Interpretation:
+  - `split_amp_mad_scale = 10.0`
   - smaller values are stricter and keep more splits
-  - `2.0` is fairly strict
-  - `3.0` is a standard starting point
-  - `4.0+` is looser
 
 Related autosplit settings in the notebook include `split_contamination`, `split_threshold_mode`, `split_wf_threshold`, `split_wf_n_chans`, and `split_amp_mad_scale`.
 
