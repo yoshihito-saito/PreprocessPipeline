@@ -1007,6 +1007,65 @@ def save_params_and_manifest(
             copy2(script_path, output_dir / "preprocessSession.log")
 
 
+def set_tree_world_rw(root: Path) -> None:
+    root = Path(root)
+    if not root.exists():
+        return
+    for path in [root, *root.rglob("*")]:
+        try:
+            if path.is_symlink():
+                continue
+            mode = path.stat().st_mode
+            if path.is_dir():
+                path.chmod(mode | 0o777)
+            elif path.is_file():
+                path.chmod(mode | 0o666)
+        except Exception as exc:
+            print(f"Warning: failed to update permissions for {path}: {exc}")
+
+
+def copy_results_to_basepath(
+    *,
+    local_output_dir: Path,
+    basepath: Path,
+    delete_local: bool = False,
+) -> Path:
+    src = Path(local_output_dir).resolve()
+    dst = Path(basepath).resolve()
+
+    if not src.exists() or not src.is_dir():
+        raise FileNotFoundError(f"Local output directory does not exist: {src}")
+    if not dst.exists() or not dst.is_dir():
+        raise NotADirectoryError(f"Basepath does not exist or is not a directory: {dst}")
+    if src == dst:
+        raise ValueError(f"Source and destination are identical: {src}")
+
+    def _copy_path_contents_no_metadata(source_path: Path, target_path: Path) -> bool:
+        copied = False
+        if source_path.is_dir():
+            target_path.mkdir(parents=True, exist_ok=True)
+            for nested in source_path.iterdir():
+                copied = _copy_path_contents_no_metadata(nested, target_path / nested.name) or copied
+            return copied
+        if source_path.is_file():
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source_path, target_path)
+            return True
+        return False
+
+    copied_any = False
+    for child in src.iterdir():
+        copied_any = _copy_path_contents_no_metadata(child, dst / child.name) or copied_any
+
+    if copied_any:
+        set_tree_world_rw(dst)
+
+    if delete_local:
+        shutil.rmtree(src)
+
+    return dst
+
+
 def convert_dual_side_map(
     chan_map_file: str | Path,
     x_shift: float = 6.0,
