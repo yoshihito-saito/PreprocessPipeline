@@ -148,32 +148,38 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         except Exception as exc:
             print(f"Warning: failed to parse info.rhd ({rhd_path}): {exc}")
 
-    # Neurocode-compatible behavior: use XML-derived amplifier metadata.
-    effective_sr = float(xml_meta.sr)
-    effective_n_channels = int(xml_meta.n_channels)
-    analog_sr = effective_sr
-    digital_sr = effective_sr
-    if intan_header is not None:
-        analog_sr = float(intan_header.board_adc_sample_rate)
-        digital_sr = float(intan_header.board_dig_in_sample_rate)
-
     _step("Discover input recordings")
-    amplifier_paths = discover_subsessions(
+    subsession_paths = discover_subsessions(
         basepath=basepath,
         sort_files=config.sort_files,
         alt_sort=config.alt_sort,
         ignore_folders=config.ignore_folders,
     )
-    if not amplifier_paths:
+    if not subsession_paths:
         raise FileNotFoundError(f"No subsession dat files found under {basepath}")
 
     catalog = build_acquisition_catalog(
-        amplifier_paths=amplifier_paths,
-        n_amplifier_channels=effective_n_channels,
+        amplifier_paths=subsession_paths,
+        n_amplifier_channels=int(xml_meta.n_channels),
         dtype=config.dtype,
         intan_header=intan_header,
     )
     print_catalog_summary(catalog)
+
+    # Neurocode-compatible behavior: Intan uses XML-derived amplifier metadata.
+    if catalog.source_type == "openephys":
+        effective_sr = float(catalog.sampling_frequency if catalog.sampling_frequency is not None else xml_meta.sr)
+        effective_n_channels = int(catalog.amplifier_channels)
+        analog_sr = effective_sr
+        digital_sr = effective_sr
+    else:
+        effective_sr = float(xml_meta.sr)
+        effective_n_channels = int(xml_meta.n_channels)
+        analog_sr = effective_sr
+        digital_sr = effective_sr
+        if intan_header is not None:
+            analog_sr = float(intan_header.board_adc_sample_rate)
+            digital_sr = float(intan_header.board_dig_in_sample_rate)
 
     _step("Build merge points")
     merge_data = compute_mergepoints(
@@ -291,6 +297,8 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         digital_dat_path=intermediate_dat_paths.get("digitalin"),
         merge_timestamps_sec=merge_data.timestamps_sec,
         overwrite=config.overwrite,
+        openephys_ttl_paths=(catalog.ttl_event_paths if catalog.source_type == "openephys" else None),
+        openephys_sample_counts=(catalog.sample_counts if catalog.source_type == "openephys" else None),
     )
 
     _step("Load and concatenate amplifier dat")
@@ -301,6 +309,8 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         dtype=config.dtype,
         gain_to_uV=config.gain_to_uV,
         offset_to_uV=config.offset_to_uV,
+        recording_paths=catalog.recording_paths,
+        recording_stream_names=catalog.recording_stream_names,
     )
     recording_concat = concatenate_recordings_si(recordings)
 

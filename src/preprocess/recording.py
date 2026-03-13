@@ -122,17 +122,28 @@ def load_subsession_recordings(
     dtype: str,
     gain_to_uV: float,
     offset_to_uV: float,
+    recording_paths: list[Path] | None = None,
+    recording_stream_names: list[str | None] | None = None,
 ) -> list[Any]:
     recordings = []
-    for p in dat_paths:
-        rec = se.read_binary(
-            str(p),
-            sampling_frequency=sampling_frequency,
-            dtype=dtype,
-            num_channels=num_channels,
-            gain_to_uV=gain_to_uV,
-            offset_to_uV=offset_to_uV,
-        )
+    recording_paths = recording_paths or dat_paths
+    recording_stream_names = recording_stream_names or [None for _ in dat_paths]
+    for p, recording_root, stream_name in zip(dat_paths, recording_paths, recording_stream_names, strict=True):
+        if recording_root.is_dir() and stream_name:
+            rec = se.read_openephys(
+                folder_path=str(recording_root),
+                stream_name=stream_name,
+            )
+            rec = rec.rename_channels(list(range(rec.get_num_channels())))
+        else:
+            rec = se.read_binary(
+                str(p),
+                sampling_frequency=sampling_frequency,
+                dtype=dtype,
+                num_channels=num_channels,
+                gain_to_uV=gain_to_uV,
+                offset_to_uV=offset_to_uV,
+            )
         recordings.append(rec)
     return recordings
 

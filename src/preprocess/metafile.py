@@ -123,7 +123,11 @@ class MergePointsData:
 
 @dataclass
 class AcquisitionCatalog:
+    source_type: Literal["intan", "openephys"]
     subsession_names: list[str]
+    recording_paths: list[Path]
+    recording_stream_names: list[str | None]
+    ttl_event_paths: list[Path]
     amplifier_paths: list[Path]
     analogin_paths: list[Path]
     digitalin_paths: list[Path]
@@ -131,6 +135,7 @@ class AcquisitionCatalog:
     supply_paths: list[Path]
     time_paths: list[Path]
     sample_counts: list[int]
+    sampling_frequency: float | None
 
     amplifier_channels: int
     auxiliary_input_channels: int
