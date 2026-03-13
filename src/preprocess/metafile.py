@@ -74,6 +74,7 @@ class PreprocessConfig:
     sorter_path: Path | None = None
     sorter_config_path: Path | None = None
     matlab_path: Path | None = None
+    matlab_max_workers: int = 128
     sorter_verbose: bool = False
     cleanup_temp_wh: bool = True
 

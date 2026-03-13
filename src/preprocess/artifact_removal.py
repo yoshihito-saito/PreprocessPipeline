@@ -16,7 +16,7 @@ def detect_high_amplitude_artifacts(
     seed: int = 0,                     # RNG seed for reproducible window sampling
     chunk_s: float = 5.0,              # Chunk duration (s) for scanning the full recording
     dead_time_ms: float = 50.0,       # Refractory (ms) to merge nearby triggers from the same group
-    n_jobs: int = -1                   # Number of parallel workers for chunk scanning (joblib semantics)
+    n_jobs: int = -1                   # Number of parallel workers for threshold estimation and chunk scanning
 ):
     """
     Detect large-amplitude movement/lick artifacts and return trigger frames per group.
@@ -43,7 +43,8 @@ def detect_high_amplitude_artifacts(
     dead_time_ms : float, default 100.0
         Refractory period (ms) to merge multiple detection triggers into one.
     n_jobs : int, default -1
-        Number of parallel jobs (joblib). Use backend="threading" internally.
+        Number of parallel jobs (joblib) used for threshold estimation and chunk scanning.
+        Uses backend="threading" internally.
 
     Returns
     -------
@@ -79,6 +80,33 @@ def detect_high_amplitude_artifacts(
                 candidates[gid] = violation_inds + start_frame
         return candidates
 
+    def _estimate_threshold_for_group_inner(gid, ch_inds, starts, channel_ids):
+        if ch_inds.size == 0:
+            return int(gid), 1e6
+
+        sub = recording.select_channels(channel_ids=channel_ids[ch_inds])
+        pool_abs = []
+
+        for s in starts:
+            start = int(s)
+            end = int(s + W_est)
+            # Load window and compute time-wise median across channels
+            X_est = sub.get_traces(
+                start_frame=start,
+                end_frame=end,
+                return_in_uV=True,
+            ).astype(np.float32).T
+            m = np.median(np.abs(X_est), axis=1)
+            pool_abs.append(m)
+
+        if not pool_abs:
+            # Degenerate case: set an extremely high threshold to avoid false positives
+            return int(gid), 1e6
+
+        abs_vals = np.concatenate(pool_abs)
+        sigma = 1.4826 * np.median(abs_vals)   # MAD → σ
+        return int(gid), float(sigma * threshold_sigma)
+
     # ----------------------------------------------------
     
     assert recording.get_num_segments() == 1, "Single segment only supported"
@@ -106,35 +134,23 @@ def detect_high_amplitude_artifacts(
     print(f"Detecting artifacts on {len(unique_groups)} groups (by_group={by_group})...")
 
     # -------------------- threshold estimation --------------------
-    print("Estimating thresholds...")
-    thresholds = {}
+    print(f"Estimating thresholds using backend='threading' (n_jobs={n_jobs})...")
     rng = np.random.default_rng(seed)
     W_est = int(estimate_window_s * sf)
-
-    for gid in unique_groups:
-        idx = group_to_inds[gid]
-        if idx.size == 0:
-            continue
-
-        sub = recording.select_channels(channel_ids=ch_ids[idx])
-        # Sample random, nonoverlapping starting points for estimation windows
-        starts = rng.integers(0, max(1, T - W_est - 1), size=estimate_windows)
-        pool_abs = []
-        
-        for s in starts:
-            # Load window and compute time-wise median across channels
-            X_est = sub.get_traces(start_frame=int(s), end_frame=int(s+W_est), return_in_uV=True).astype(np.float32).T
-            m = np.median(np.abs(X_est), axis=1)
-            pool_abs.append(m)
-        
-        if not pool_abs:
-            # Degenerate case: set an extremely high threshold to avoid false positives
-            thresholds[int(gid)] = 1e6
-            continue
-            
-        abs_vals = np.concatenate(pool_abs)
-        sigma = 1.4826 * np.median(abs_vals)   # MAD → σ
-        thresholds[int(gid)] = sigma * threshold_sigma
+    group_estimation_starts = {
+        int(gid): rng.integers(0, max(1, T - W_est - 1), size=estimate_windows)
+        for gid in unique_groups
+    }
+    threshold_items = Parallel(n_jobs=n_jobs, backend="threading")(
+        delayed(_estimate_threshold_for_group_inner)(
+            gid,
+            group_to_inds[gid],
+            group_estimation_starts[int(gid)],
+            ch_ids,
+        )
+        for gid in unique_groups
+    )
+    thresholds = {gid: threshold for gid, threshold in threshold_items}
 
     # -------------------- scanning --------------------
     print(f"Scanning recording using backend='threading' (n_jobs={n_jobs})...")

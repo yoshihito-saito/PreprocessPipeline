@@ -675,6 +675,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             config_path=config.sorter_config_path,
             kilosort1_path=config.sorter_path,
             matlab_path=config.matlab_path,
+            matlab_max_workers=config.matlab_max_workers,
             chanmap_mat_path=config.chanmap_mat_path,
             exclude_channels_0based=sorter_exclude_channels_0based,
             job_kwargs=config.job_kwargs,

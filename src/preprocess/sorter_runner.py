@@ -181,19 +181,59 @@ def _resolve_matlab_cmd(matlab_path: Path | None) -> str | None:
     return None
 
 
-def _inject_matlab_shim(matlab_cmd: str, matlab_log: Path) -> Path:
+def _inject_matlab_shim(
+    matlab_cmd: str,
+    matlab_log: Path,
+    *,
+    matlab_max_workers: int | None = 128,
+) -> Path:
     shim_dir = _repo_root() / ".matlab_shim"
     shim_dir.mkdir(parents=True, exist_ok=True)
+    requested_workers = None if matlab_max_workers is None else int(matlab_max_workers)
+    if requested_workers is not None and requested_workers < 1:
+        requested_workers = 1
+    startup_lines = [
+        "try",
+        "    parallel.gpu.enableCUDAForwardCompatibility(true);",
+        "catch",
+        "end",
+    ]
+    if requested_workers is not None:
+        startup_lines.extend(
+            [
+                "try",
+                "    if isempty(getCurrentTask())",
+                f"        requested_workers = {requested_workers};",
+                "        c = parcluster('Processes');",
+                "        detected_max_workers = c.NumWorkers;",
+                "        pool_workers = min(requested_workers, detected_max_workers);",
+                "        if pool_workers >= 1",
+                "            c.NumWorkers = pool_workers;",
+                "            try",
+                "                c.PreferredPoolNumWorkers = pool_workers;",
+                "            catch",
+                "            end",
+                "            try",
+                "                c.NumThreads = 1;",
+                "            catch",
+                "            end",
+                "            pool = gcp('nocreate');",
+                "            if ~isempty(pool) && pool.NumWorkers ~= pool_workers",
+                "                delete(pool);",
+                "                pool = [];",
+                "            end",
+                "            if isempty(pool)",
+                "                parpool(c, pool_workers);",
+                "            end",
+                "        end",
+                "    end",
+                "catch ME",
+                "    fprintf(2, 'Warning: failed to configure MATLAB process pool: %s\\n', ME.message);",
+                "end",
+            ]
+        )
     startup_m = shim_dir / "startup.m"
-    startup_m.write_text(
-        (
-            "try\n"
-            "    parallel.gpu.enableCUDAForwardCompatibility(true);\n"
-            "catch\n"
-            "end\n"
-        ),
-        encoding="utf-8",
-    )
+    startup_m.write_text("\n".join(startup_lines) + "\n", encoding="utf-8")
     existing_matlabpath = os.environ.get("MATLABPATH", "")
     os.environ["MATLABPATH"] = (
         str(shim_dir) if not existing_matlabpath else str(shim_dir) + os.pathsep + existing_matlabpath
@@ -1072,6 +1112,7 @@ def execute_sorting_job(
     kilosort1_path: Path | None = None,
     kilosort25_path: Path | None = None,
     matlab_path: Path | None = None,
+    matlab_max_workers: int = 128,
     chanmap_mat_path: Path | None = None,
     dtype: str = "int16",
     gain_to_uV: float = 0.195,
@@ -1132,7 +1173,11 @@ def execute_sorting_job(
         print(f"Prepended MATLAB bin to PATH for this run: {matlab_bin}")
 
         matlab_log = _repo_root() / ".matlab_shim" / "matlab_run.log"
-        shim_path = _inject_matlab_shim(matlab_cmd, matlab_log)
+        shim_path = _inject_matlab_shim(
+            matlab_cmd,
+            matlab_log,
+            matlab_max_workers=matlab_max_workers,
+        )
         print(f"Injected MATLAB shim: {shim_path}")
         print(f"MATLAB output will be logged to: {matlab_log}")
 
@@ -1326,6 +1371,7 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
         kilosort1_path=Path(args.kilosort1_path) if args.kilosort1_path else None,
         kilosort25_path=Path(args.kilosort25_path) if args.kilosort25_path else None,
         matlab_path=Path(args.matlab_path) if args.matlab_path else None,
+        matlab_max_workers=int(args.matlab_max_workers),
         chanmap_mat_path=Path(args.chanmap) if args.chanmap else None,
         dtype=args.dtype,
         gain_to_uV=args.gain_to_uV,
@@ -1365,6 +1411,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--matlab-path",
         default=None,
         help="Optional MATLAB executable or MATLAB bin directory path",
+    )
+    p.add_argument(
+        "--matlab-max-workers",
+        type=int,
+        default=128,
+        help="Cap MATLAB process-pool workers; uses min(requested, profile/device max).",
     )
 
     p.add_argument("--dat-path", required=True, help="Path to input dat file")
