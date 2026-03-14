@@ -36,7 +36,8 @@ class PostprocessConfig:
     delete_analyzer_cache: bool = True
     skip_curation: bool = False
     analyzer_sparse: bool = True
-    sparsity_method: str = "best_channels"
+    sparsity_method: str = "radius"
+    sparsity_radius_um: float = 80.0
     sparsity_num_channels: int = 8
     random_spikes_method: str = "all"
     n_components: int = 3

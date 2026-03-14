@@ -24,6 +24,7 @@ from ..preprocess.recording import (
     apply_preprocessing,
     attach_probe_and_remove_bad_channels,
     preprocess_selected_channels_preserve_shape,
+    select_recording_channels,
 )
 from .metafile import PostprocessConfig, PostprocessResult
 
@@ -131,6 +132,18 @@ def _resolve_phy_sample_rate(phy_dir: Path, fallback_sample_rate: float | None =
     raise ValueError(
         f"Could not resolve sample_rate from {params_path} and no fallback sampling_frequency was provided."
     )
+
+
+def _resolve_phy_n_channels_dat(phy_dir: Path, fallback_num_channels: int | None = None) -> int | None:
+    params_path = phy_dir / "params.py"
+    if params_path.exists():
+        text = params_path.read_text(encoding="utf-8", errors="replace")
+        match = re.search(r"(?m)^\s*n_channels_dat\s*=\s*([0-9]+)", text)
+        if match is not None:
+            return int(match.group(1))
+    if fallback_num_channels is not None:
+        return int(fallback_num_channels)
+    return None
 
 
 def _mark_low_firing_rate_clusters_as_noise(
@@ -391,7 +404,9 @@ def _sorting_analyzer_sparsity_kwargs(config: PostprocessConfig) -> dict[str, An
         "sparse": True,
         "method": config.sparsity_method,
     }
-    if config.sparsity_method in {"best_channels", "closest_channels"}:
+    if config.sparsity_method == "radius":
+        kwargs["radius_um"] = float(config.sparsity_radius_um)
+    elif config.sparsity_method in {"best_channels", "closest_channels"}:
         kwargs["num_channels"] = int(config.sparsity_num_channels)
     return kwargs
 
@@ -419,14 +434,16 @@ def _resolve_recording_for_postprocess(config: PostprocessConfig):
         chanmap_mat_path=config.chanmap_mat_path,
         reject_channels_0based=sorted(set(config.reject_channels)),
     )
+    if hasattr(rec_with_probe, "get_channel_ids"):
+        bad_set = {int(ch) for ch in bad_0}
+        all_channels = [int(ch) for ch in rec_with_probe.get_channel_ids()]
+        good_channels = [ch for ch in all_channels if ch not in bad_set]
+    else:
+        good_channels = []
+
     if config.apply_preprocess:
-        if hasattr(rec_with_probe, "get_channel_ids"):
-            bad_set = {int(ch) for ch in bad_0}
-            all_channels = [int(ch) for ch in rec_with_probe.get_channel_ids()]
-            good_channels = [ch for ch in all_channels if ch not in bad_set]
-            if not good_channels:
-                return rec_with_probe
-            return preprocess_selected_channels_preserve_shape(
+        if good_channels:
+            rec_processed = preprocess_selected_channels_preserve_shape(
                 recording_raw=rec_with_probe,
                 selected_channel_ids=good_channels,
                 bandpass_min_hz=config.bandpass_min_hz,
@@ -434,14 +451,20 @@ def _resolve_recording_for_postprocess(config: PostprocessConfig):
                 reference=config.reference,
                 local_radius_um=config.local_radius_um,
             )
-        return apply_preprocessing(
-            recording_raw=rec_with_probe,
-            bandpass_min_hz=config.bandpass_min_hz,
-            bandpass_max_hz=config.bandpass_max_hz,
-            reference=config.reference,
-            local_radius_um=config.local_radius_um,
-        )
-    return rec_with_probe
+        else:
+            rec_processed = apply_preprocessing(
+                recording_raw=rec_with_probe,
+                bandpass_min_hz=config.bandpass_min_hz,
+                bandpass_max_hz=config.bandpass_max_hz,
+                reference=config.reference,
+                local_radius_um=config.local_radius_um,
+            )
+    else:
+        rec_processed = rec_with_probe
+
+    if good_channels:
+        return select_recording_channels(rec_processed, good_channels)
+    return rec_processed
 
 
 def _fix_phy_params_file(
@@ -449,6 +472,7 @@ def _fix_phy_params_file(
     dat_path: Path,
     hp_filtered: bool,
     *,
+    n_channels_dat: int | None,
     use_relative_path: bool,
 ) -> None:
     content = params_file.read_text(encoding="utf-8")
@@ -472,7 +496,24 @@ def _fix_phy_params_file(
         content = re.sub(r"(?m)^hp_filtered\s*=.*$", lambda _: hp_line, content)
     else:
         content += f"\n{hp_line}\n"
+
+    if n_channels_dat is not None:
+        n_channels_line = f"n_channels_dat = {int(n_channels_dat)}"
+        if re.search(r"(?m)^n_channels_dat\s*=", content):
+            content = re.sub(r"(?m)^n_channels_dat\s*=.*$", lambda _: n_channels_line, content)
+        else:
+            content += f"\n{n_channels_line}\n"
     params_file.write_text(content, encoding="utf-8")
+
+
+def _fix_phy_channel_map_file(output_folder: Path) -> None:
+    channel_map_si_file = output_folder / "channel_map_si.npy"
+    channel_map_file = output_folder / "channel_map.npy"
+    if not channel_map_si_file.exists() or not channel_map_file.exists():
+        return
+
+    channel_map_si = np.load(channel_map_si_file)
+    np.save(channel_map_file, np.asarray(channel_map_si, dtype="int32"))
 
 
 def _export_phy_to_output_folder(
@@ -482,6 +523,7 @@ def _export_phy_to_output_folder(
     analyzer_cache_root: Path | None,
     dat_path: Path | None,
     hp_filtered: bool,
+    raw_num_channels: int | None,
     copy_binary: bool,
     use_relative_path: bool,
     job_kwargs: dict[str, Any],
@@ -529,8 +571,10 @@ def _export_phy_to_output_folder(
             params_file=params_file,
             dat_path=Path(dat_path),
             hp_filtered=hp_filtered,
+            n_channels_dat=raw_num_channels,
             use_relative_path=bool(use_relative_path),
         )
+    _fix_phy_channel_map_file(output_folder)
 
 
 def _config_for_sorting_target(
@@ -825,6 +869,10 @@ def _run_postprocess_single_session(
             analyzer_cache_root=analyzer_cache_root,
             dat_path=Path(config.dat_path) if config.dat_path is not None else None,
             hp_filtered=(not bool(config.apply_preprocess)),
+            raw_num_channels=_resolve_phy_n_channels_dat(
+                sorting_phy_folder,
+                fallback_num_channels=config.num_channels,
+            ),
             copy_binary=config.copy_binary,
             use_relative_path=bool(config.use_relative_path),
             job_kwargs=config.job_kwargs,
@@ -966,18 +1014,28 @@ def build_preprocessed_recording_from_result(
         gain_to_uV=preprocess_config.gain_to_uV,
         offset_to_uV=preprocess_config.offset_to_uV,
     )
-    rec_with_probe, _, _ = attach_probe_and_remove_bad_channels(
+    rec_with_probe, bad_0, _ = attach_probe_and_remove_bad_channels(
         recording=rec_raw,
         chanmap_mat_path=preprocess_config.chanmap_mat_path,
         reject_channels_0based=_resolve_bad_channels_for_postprocess(result, preprocess_config),
     )
-    return apply_preprocessing(
+    if hasattr(rec_with_probe, "get_channel_ids"):
+        bad_set = {int(ch) for ch in bad_0}
+        all_channels = [int(ch) for ch in rec_with_probe.get_channel_ids()]
+        good_channels = [ch for ch in all_channels if ch not in bad_set]
+    else:
+        good_channels = []
+
+    rec_processed = apply_preprocessing(
         recording_raw=rec_with_probe,
         bandpass_min_hz=preprocess_config.bandpass_min_hz,
         bandpass_max_hz=preprocess_config.bandpass_max_hz,
         reference=preprocess_config.reference,
         local_radius_um=preprocess_config.local_radius_um,
     )
+    if good_channels:
+        return select_recording_channels(rec_processed, good_channels)
+    return rec_processed
 
 
 # Short aliases for notebook use
