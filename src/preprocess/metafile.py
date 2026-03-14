@@ -69,6 +69,7 @@ class PreprocessConfig:
     export_intermediate_dat: bool = True
     zero_bad: bool = True
     bad_channels: bool = True
+    rhd_use_first_child_match: bool = False
 
     sorter: str | None = None
     sorter_path: Path | None = None

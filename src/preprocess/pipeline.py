@@ -155,7 +155,12 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     output_dir = resolve_local_output_dir(basepath, basename, config)
 
     xml_path = ensure_xml(basepath, output_dir, basename)
-    rhd_path = ensure_rhd(basepath, output_dir, basename)
+    rhd_path = ensure_rhd(
+        basepath,
+        output_dir,
+        basename,
+        use_first_child_match=bool(config.rhd_use_first_child_match),
+    )
     xml_meta = load_xml_metadata(xml_path)
     session_xml_meta = load_session_xml_metadata(xml_path)
     intan_header = None
@@ -172,6 +177,13 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         alt_sort=config.alt_sort,
         ignore_folders=config.ignore_folders,
     )
+    print("Subsession file order:")
+    for idx, path in enumerate(subsession_paths, start=1):
+        try:
+            display_path = path.relative_to(basepath)
+        except Exception:
+            display_path = path
+        print(f"  [{idx}] {display_path}")
     if not subsession_paths:
         raise FileNotFoundError(f"No subsession dat files found under {basepath}")
 

@@ -27,6 +27,7 @@ from .metafile import (
 
 _OPENEPHYS_DATETIME_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})")
 _OPENEPHYS_RECORD_NODE_NAME = "Record Node 101"
+_DAY_PREFIX_PATTERN = re.compile(r"^(?:day|d)(\d+)", re.IGNORECASE)
 
 
 def extract_datetime(path: str) -> datetime:
@@ -34,6 +35,24 @@ def extract_datetime(path: str) -> datetime:
     if m:
         return datetime.strptime(m.group(1), "%y%m%d_%H%M%S")
     return datetime.min
+
+
+def _natural_sort_key(text: str) -> tuple[tuple[int, int | str], ...]:
+    parts = [part for part in re.split(r"(\d+)", text) if part]
+    key_parts: list[tuple[int, int | str]] = []
+    for part in parts:
+        if part.isdigit():
+            key_parts.append((0, int(part)))
+        else:
+            key_parts.append((1, part.lower()))
+    return tuple(key_parts)
+
+
+def _fallback_session_name_sort_key(name: str) -> tuple[int, int | tuple[tuple[int, int | str], ...], str]:
+    day_match = _DAY_PREFIX_PATTERN.match(name)
+    if day_match is not None:
+        return 0, int(day_match.group(1)), name.lower()
+    return 1, _natural_sort_key(name), name.lower()
 
 
 def select_folder(initial_drive: str = "T:\\") -> str | None:
@@ -610,7 +629,13 @@ def ensure_xml(basepath: Path, local_output_dir: Path, basename: str) -> Path:
     )
 
 
-def ensure_rhd(basepath: Path, local_output_dir: Path, basename: str) -> Path | None:
+def ensure_rhd(
+    basepath: Path,
+    local_output_dir: Path,
+    basename: str,
+    *,
+    use_first_child_match: bool = False,
+) -> Path | None:
     target = local_output_dir / f"{basename}.rhd"
     preferred = [basepath / f"{basename}.rhd", basepath / "info.rhd"]
 
@@ -624,22 +649,23 @@ def ensure_rhd(basepath: Path, local_output_dir: Path, basename: str) -> Path | 
         copy2(child_matches[0], target)
         return target
     if len(child_matches) > 1:
-        names = ", ".join(str(p.relative_to(basepath)) for p in child_matches)
-        raise FileNotFoundError(
-            f"Multiple rhd files found in direct child folders under {basepath}: {names}. "
-            f"Keep exactly one match or place {basename}.rhd/info.rhd directly in {basepath}."
+        ordered_matches = sorted(
+            child_matches,
+            key=lambda path: _subsession_sort_key(path.parent / "amplifier.dat"),
         )
+        first_match = ordered_matches[0]
+        copy2(first_match, target)
+        return target
 
     local_rhd = sorted(basepath.glob("*.rhd"))
     if len(local_rhd) == 1:
         copy2(local_rhd[0], target)
         return target
     if len(local_rhd) > 1:
-        names = ", ".join(p.name for p in local_rhd)
-        raise FileNotFoundError(
-            f"Multiple rhd files found in {basepath}: {names}. "
-            f"Keep exactly one match or place {basename}.rhd/info.rhd directly in {basepath}."
-        )
+        local_rhd = sorted(local_rhd, key=lambda path: _fallback_session_name_sort_key(path.stem))
+        first_match = local_rhd[0]
+        copy2(first_match, target)
+        return target
 
     if target.exists():
         return target
@@ -698,9 +724,6 @@ def discover_subsessions(
     alt_sort: list[int] | None,
     ignore_folders: list[str] | None,
 ) -> list[Path]:
-    if sort_files and alt_sort:
-        raise ValueError("sort_files=True cannot be used with alt_sort")
-
     ignore_folders = ignore_folders or []
 
     paths = _discover_openephys_recordings(basepath, ignore_folders)
@@ -722,11 +745,11 @@ def discover_subsessions(
     if not paths:
         return []
 
-    if sort_files:
-        paths = sorted(paths, key=_subsession_sort_key)
-    elif alt_sort:
+    if alt_sort:
         idx = _normalize_alt_sort_indices(alt_sort, len(paths))
         paths = [paths[i] for i in idx]
+    else:
+        paths = sorted(paths, key=_subsession_sort_key)
 
     return paths
 
@@ -743,24 +766,31 @@ def _normalize_alt_sort_indices(alt_sort: list[int], n: int) -> list[int]:
     return idx
 
 
-def _subsession_sort_key(path: Path) -> tuple[int, str]:
+def _subsession_sort_key(
+    path: Path,
+) -> tuple[int, tuple[tuple[int, int | tuple[tuple[int, int | str], ...] | str], ...], str]:
     name = path.parent.name
     oe_dt_dir = _find_openephys_datetime_ancestor(path)
     if oe_dt_dir is not None:
         dt = _extract_openephys_datetime(oe_dt_dir.name)
         if dt is not None:
-            return int(dt.strftime("%Y%m%d%H%M%S")), str(path)
+            return 0, ((0, int(dt.strftime("%Y%m%d%H%M%S"))),), str(path)
 
     intan_match = re.search(r"(\d{6}_\d{6})", name)
     if intan_match:
         dt = datetime.strptime(intan_match.group(1), "%y%m%d_%H%M%S")
-        return int(dt.strftime("%Y%m%d%H%M%S")), str(path)
+        return 0, ((0, int(dt.strftime("%Y%m%d%H%M%S"))),), str(path)
 
     oe_dt = _extract_openephys_datetime(name)
     if oe_dt is not None:
-        return int(oe_dt.strftime("%Y%m%d%H%M%S")), str(path)
+        return 0, ((0, int(oe_dt.strftime("%Y%m%d%H%M%S"))),), str(path)
 
-    return 0, str(path)
+    fallback_rank, fallback_value, fallback_name = _fallback_session_name_sort_key(name)
+    if isinstance(fallback_value, tuple):
+        fallback_key = fallback_value
+    else:
+        fallback_key = ((0, int(fallback_value)),)
+    return 1, ((0, int(fallback_rank)),) + fallback_key + ((1, fallback_name),), str(path)
 
 
 def _infer_channels_from_file(path: Path, sample_count: int, bytes_per_sample: int = 2) -> int:
