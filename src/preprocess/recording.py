@@ -264,6 +264,25 @@ def load_subsession_recordings(
     return recordings
 
 
+def load_binary_recording(
+    *,
+    dat_path: Path,
+    sampling_frequency: float,
+    num_channels: int,
+    dtype: str,
+    gain_to_uV: float,
+    offset_to_uV: float,
+) -> Any:
+    return se.read_binary(
+        str(dat_path),
+        sampling_frequency=sampling_frequency,
+        dtype=dtype,
+        num_channels=num_channels,
+        gain_to_uV=gain_to_uV,
+        offset_to_uV=offset_to_uV,
+    )
+
+
 def concatenate_recordings_si(recordings: list[Any]) -> Any:
     return si.concatenate_recordings(recordings)
 

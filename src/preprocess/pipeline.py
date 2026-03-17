@@ -29,6 +29,7 @@ from .recording import (
     attach_probe_and_remove_bad_channels,
     apply_transform_to_selected_channels_preserve_shape,
     concatenate_recordings_si,
+    load_binary_recording,
     load_subsession_recordings,
     preprocess_selected_channels_preserve_shape,
     zero_selected_channels_preserve_shape,
@@ -81,6 +82,18 @@ def _normalize_artifact_ttl_channel(channel: int) -> int:
         "artifact_TTL_channel must be within digital bit range [0, 15] "
         "(or [1, 16] for 1-based input)."
     )
+
+
+def _resolve_highamp_n_jobs(config: PreprocessConfig) -> int:
+    explicit_n_jobs = config.highamp_n_jobs
+    if explicit_n_jobs not in (None, -1):
+        return int(explicit_n_jobs)
+
+    inherited_n_jobs = (config.job_kwargs or {}).get("n_jobs")
+    if inherited_n_jobs is not None:
+        return int(inherited_n_jobs)
+
+    return -1
 
 
 def _save_artifact_events_mat(
@@ -149,6 +162,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
 
     ttl_artifact_enabled = ttl_group_mode != "none"
     highamp_artifact_enabled = highamp_group_mode != "none"
+    highamp_n_jobs = _resolve_highamp_n_jobs(config)
 
     _step("Make session metafile context")
     basepath, basename = resolve_basepath_and_basename(config.basepath)
@@ -354,9 +368,18 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             output_dat_path=raw_dat_path,
             overwrite=config.overwrite,
             job_kwargs=config.job_kwargs,
-    )
+        )
 
     recording_base = recording_concat
+    if raw_dat_path is not None:
+        recording_base = load_binary_recording(
+            dat_path=raw_dat_path,
+            sampling_frequency=effective_sr,
+            num_channels=effective_n_channels,
+            dtype=config.dtype,
+            gain_to_uV=config.gain_to_uV,
+            offset_to_uV=config.offset_to_uV,
+        )
 
     _step("Attach probe and mark bad channels")
     recording_raw, bad_0, bad_1 = attach_probe_and_remove_bad_channels(
@@ -519,7 +542,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
                     seed=config.highamp_seed,
                     chunk_s=config.highamp_chunk_s,
                     dead_time_ms=config.highamp_dead_time_ms,
-                    n_jobs=config.highamp_n_jobs,
+                    n_jobs=highamp_n_jobs,
                 )
                 for gid, frames in detected.items():
                     highamp_frames_by_group[int(gid)] = [int(x) for x in frames]

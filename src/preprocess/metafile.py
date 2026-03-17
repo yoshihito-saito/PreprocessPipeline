@@ -1,10 +1,18 @@
 ﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+
+
+def _default_parallel_n_jobs() -> int:
+    cpu_count = os.cpu_count() or 1
+    if cpu_count <= 128:
+        return max(1, int(cpu_count) - 4)
+    return 128
 
 
 @dataclass
@@ -19,12 +27,13 @@ class PreprocessConfig:
     dtype: str = "int16"
     gain_to_uV: float = 0.195
     offset_to_uV: float = 0.0
+    save_raw: bool = False
 
     do_preprocess: bool = True
     bandpass_min_hz: float = 500.0
     bandpass_max_hz: float = 8000.0
     reference: str = "local"
-    local_radius_um: tuple[float, float] = (50.0, 200.0)
+    local_radius_um: tuple[float, float] = (20.0, 200.0)
     artifact_ttl_group_mode: Literal["none", "all", "probe", "shank"] = "none"
     artifact_TTL_channel: int | None = None
     artifact_TTL_ms_before: float = 1.0
@@ -32,13 +41,13 @@ class PreprocessConfig:
     artifact_TTL_mode: str = "cubic"
     artifact_TTL_include_offset: bool = False
     artifact_highamp_group_mode: Literal["none", "all", "probe", "shank"] = "none"
-    highamp_estimate_windows: int = 50
+    highamp_estimate_windows: int = 500
     highamp_estimate_window_s: float = 1.0
     highamp_threshold_sigma: float = 10.0
     highamp_seed: int = 0
-    highamp_chunk_s: float = 100.0
-    highamp_dead_time_ms: float = 5.0
-    highamp_n_jobs: int = -1
+    highamp_chunk_s: float = 10.0
+    highamp_dead_time_ms: float = 2.0
+    highamp_n_jobs: int = field(default_factory=_default_parallel_n_jobs)
     highamp_ms_before: float = 1.0
     highamp_ms_after: float = 1.0
     highamp_mode: str = "cubic"
@@ -55,7 +64,7 @@ class PreprocessConfig:
     state_winparms: tuple[float, float] = (2.0, 15.0)
     emg_th_alpha: float = 1.0
     state_min_state_length: float = 6.0
-    state_block_wake_to_rem: bool = True
+    state_block_wake_to_rem: bool = False
 
     analog_inputs: bool = False
     analog_channels: list[int] | None = None
@@ -65,7 +74,6 @@ class PreprocessConfig:
     chanmap_mat_path: Path | None = None
     reject_channels: list[int] = field(default_factory=list)
 
-    save_raw: bool = False
     export_intermediate_dat: bool = True
     zero_bad: bool = True
     bad_channels: bool = True
@@ -75,7 +83,7 @@ class PreprocessConfig:
     sorter_path: Path | None = None
     sorter_config_path: Path | None = None
     matlab_path: Path | None = None
-    matlab_max_workers: int = 128
+    matlab_max_workers: int = field(default_factory=_default_parallel_n_jobs)
     sorter_verbose: bool = False
     cleanup_temp_wh: bool = True
 
@@ -86,7 +94,7 @@ class PreprocessConfig:
     overwrite: bool = False
     job_kwargs: dict[str, Any] = field(
         default_factory=lambda: {
-            "n_jobs": 4,
+            "n_jobs": _default_parallel_n_jobs(),
             "chunk_duration": "10s",
             "progress_bar": True,
         }

@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 from typing import Any
+
+
+def _default_parallel_n_jobs() -> int:
+    cpu_count = os.cpu_count() or 1
+    if cpu_count <= 128:
+        return max(1, int(cpu_count) - 4)
+    return 128
 
 
 @dataclass
@@ -103,7 +111,7 @@ class PostprocessConfig:
 
     job_kwargs: dict[str, Any] = field(
         default_factory=lambda: {
-            "n_jobs": 256,
+            "n_jobs": _default_parallel_n_jobs(),
             "progress_bar": True,
         }
     )

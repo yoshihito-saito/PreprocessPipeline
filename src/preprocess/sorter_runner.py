@@ -20,6 +20,13 @@ from .io import load_xml_metadata
 from .recording import apply_preprocessing, attach_probe_from_chanmap, select_recording_channels
 
 
+def _default_parallel_n_jobs() -> int:
+    cpu_count = os.cpu_count() or 1
+    if cpu_count <= 128:
+        return max(1, int(cpu_count) - 4)
+    return 128
+
+
 _SORTER_ALIASES = {
     "kilosort": "kilosort",
     "kilosort2.5": "kilosort2_5",
@@ -185,7 +192,7 @@ def _inject_matlab_shim(
     matlab_cmd: str,
     matlab_log: Path,
     *,
-    matlab_max_workers: int | None = 128,
+    matlab_max_workers: int | None = None,
 ) -> Path:
     shim_dir = _repo_root() / ".matlab_shim"
     shim_dir.mkdir(parents=True, exist_ok=True)
@@ -1112,7 +1119,7 @@ def execute_sorting_job(
     kilosort1_path: Path | None = None,
     kilosort25_path: Path | None = None,
     matlab_path: Path | None = None,
-    matlab_max_workers: int = 128,
+    matlab_max_workers: int = _default_parallel_n_jobs(),
     chanmap_mat_path: Path | None = None,
     dtype: str = "int16",
     gain_to_uV: float = 0.195,
@@ -1415,7 +1422,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--matlab-max-workers",
         type=int,
-        default=128,
+        default=_default_parallel_n_jobs(),
         help="Cap MATLAB process-pool workers; uses min(requested, profile/device max).",
     )
 

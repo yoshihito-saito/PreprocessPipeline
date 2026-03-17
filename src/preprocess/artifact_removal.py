@@ -1,9 +1,28 @@
 import numpy as np
 import spikeinterface as si
 import spikeinterface.preprocessing as spre
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, effective_n_jobs
 import matplotlib.pyplot as plt
 import spikeinterface.widgets as sw
+
+try:
+    from tqdm.auto import tqdm as _tqdm
+except Exception:  # pragma: no cover - optional dependency fallback
+    _tqdm = None
+
+
+class _NullProgress:
+    def update(self, n: int = 1) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def _make_progress(*, total: int, desc: str, disable: bool):
+    if disable or _tqdm is None:
+        return _NullProgress()
+    return _tqdm(total=total, desc=desc, unit="task", leave=False)
 
 
 
@@ -52,13 +71,95 @@ def detect_high_amplitude_artifacts(
         Mapping {group_id: [frame_indices]}.
     """
     
-    def _worker_scan_chunk_inner(start_frame, end_frame, thresholds_dict, group_to_inds):
-        # Load traces in microvolts for the time window [start_frame, end_frame)
+    def _estimate_threshold_for_window_inner(gid, ch_inds, start, channel_ids):
+        if ch_inds.size == 0:
+            return int(gid), np.empty((0,), dtype=np.float32)
+
+        sub = recording.select_channels(channel_ids=channel_ids[ch_inds])
+        start_frame = int(start)
+        end_frame = int(start_frame + W_est)
+        # Load window and compute time-wise median across channels
+        X_est = sub.get_traces(
+            start_frame=start_frame,
+            end_frame=end_frame,
+            return_in_uV=True,
+        ).astype(np.float32).T
+        m = np.median(np.abs(X_est), axis=1)
+        return int(gid), np.asarray(m, dtype=np.float32)
+
+    def _expand_run_ranges_with_dead_time(run_ranges, last_trig):
+        if len(run_ranges) == 0:
+            return np.empty((0,), dtype=np.int64), last_trig
+
+        accepted_chunks = []
+        step = int(dead_time_samp) + 1
+        current_last = int(last_trig)
+        for start, end in np.asarray(run_ranges, dtype=np.int64):
+            first = max(int(start), current_last + step)
+            if first > int(end):
+                continue
+            accepted = np.arange(first, int(end) + 1, step, dtype=np.int64)
+            if accepted.size == 0:
+                continue
+            accepted_chunks.append(accepted)
+            current_last = int(accepted[-1])
+        if not accepted_chunks:
+            return np.empty((0,), dtype=np.int64), current_last
+        return np.concatenate(accepted_chunks), current_last
+
+    def _build_cluster_summaries_from_run_ranges(run_ranges):
+        run_ranges = np.asarray(run_ranges, dtype=np.int64)
+        if run_ranges.size == 0:
+            return []
+
+        cluster_summaries = []
+        cluster_start_idx = 0
+        cluster_end = int(run_ranges[0, 1])
+        step = int(dead_time_samp) + 1
+
+        for idx in range(1, run_ranges.shape[0]):
+            next_start = int(run_ranges[idx, 0])
+            if next_start - cluster_end > dead_time_samp:
+                cluster_runs = run_ranges[cluster_start_idx:idx]
+                cluster_accepted, _ = _expand_run_ranges_with_dead_time(
+                    cluster_runs,
+                    int(cluster_runs[0, 0]) - step,
+                )
+                cluster_summaries.append(
+                    (
+                        int(cluster_runs[0, 0]),
+                        cluster_runs.copy(),
+                        cluster_accepted,
+                    )
+                )
+                cluster_start_idx = idx
+            cluster_end = max(cluster_end, int(run_ranges[idx, 1]))
+
+        cluster_runs = run_ranges[cluster_start_idx:]
+        cluster_accepted, _ = _expand_run_ranges_with_dead_time(
+            cluster_runs,
+            int(cluster_runs[0, 0]) - step,
+        )
+        cluster_summaries.append(
+            (
+                int(cluster_runs[0, 0]),
+                cluster_runs.copy(),
+                cluster_accepted,
+            )
+        )
+        return cluster_summaries
+
+    def _worker_scan_chunk_inner(core_start_frame, core_end_frame, thresholds_dict, group_to_inds, halo_samp):
+        read_start_frame = max(0, int(core_start_frame) - int(halo_samp))
+        read_end_frame = min(T, int(core_end_frame) + int(halo_samp))
+
+        # Load traces in microvolts for the expanded time window [read_start_frame, read_end_frame)
         X = recording.get_traces(
-            start_frame=start_frame, 
-            end_frame=end_frame, 
+            start_frame=read_start_frame,
+            end_frame=read_end_frame,
             return_in_uV=True
         ).astype(np.float32)
+        np.abs(X, out=X)
 
         # For each group, test the absolute median across its channels against the group threshold
         candidates = {}
@@ -67,45 +168,30 @@ def detect_high_amplitude_artifacts(
                 continue
 
             th_amp = thresholds_dict[gid]
-            
-            # Median across channels for each timepoint (robust to per-channel outliers)
-            # m = np.median(X[:, ch_inds], axis=1)
-            m = np.median(np.abs(X[:, ch_inds]), axis=1)
-            
-            violation_mask = np.abs(m) > th_amp
-            violation_inds = np.flatnonzero(violation_mask)
 
-            if violation_inds.size > 0:
-                # Convert local indices to global frame indices
-                candidates[gid] = violation_inds + start_frame
+            # X has already been converted to absolute amplitudes once per chunk.
+            m = np.median(X[:, ch_inds], axis=1)
+
+            violation_mask = m > th_amp
+            if not np.any(violation_mask):
+                continue
+
+            # Collapse contiguous supra-threshold samples into runs in the worker.
+            # This keeps scan output compact even when long noisy intervals exceed threshold.
+            run_start_mask = violation_mask.copy()
+            run_start_mask[1:] &= ~violation_mask[:-1]
+            run_end_mask = violation_mask.copy()
+            run_end_mask[:-1] &= ~violation_mask[1:]
+
+            run_starts = np.flatnonzero(run_start_mask) + read_start_frame
+            run_ends = np.flatnonzero(run_end_mask) + read_start_frame
+            in_core = (run_ends >= core_start_frame) & (run_starts < core_end_frame)
+            if np.any(in_core):
+                run_starts = np.maximum(run_starts[in_core], core_start_frame)
+                run_ends = np.minimum(run_ends[in_core], core_end_frame - 1)
+                run_ranges = np.column_stack((run_starts, run_ends)).astype(np.int64, copy=False)
+                candidates[gid] = _build_cluster_summaries_from_run_ranges(run_ranges)
         return candidates
-
-    def _estimate_threshold_for_group_inner(gid, ch_inds, starts, channel_ids):
-        if ch_inds.size == 0:
-            return int(gid), 1e6
-
-        sub = recording.select_channels(channel_ids=channel_ids[ch_inds])
-        pool_abs = []
-
-        for s in starts:
-            start = int(s)
-            end = int(s + W_est)
-            # Load window and compute time-wise median across channels
-            X_est = sub.get_traces(
-                start_frame=start,
-                end_frame=end,
-                return_in_uV=True,
-            ).astype(np.float32).T
-            m = np.median(np.abs(X_est), axis=1)
-            pool_abs.append(m)
-
-        if not pool_abs:
-            # Degenerate case: set an extremely high threshold to avoid false positives
-            return int(gid), 1e6
-
-        abs_vals = np.concatenate(pool_abs)
-        sigma = 1.4826 * np.median(abs_vals)   # MAD → σ
-        return int(gid), float(sigma * threshold_sigma)
 
     # ----------------------------------------------------
     
@@ -141,19 +227,53 @@ def detect_high_amplitude_artifacts(
         int(gid): rng.integers(0, max(1, T - W_est - 1), size=estimate_windows)
         for gid in unique_groups
     }
-    threshold_items = Parallel(n_jobs=n_jobs, backend="threading")(
-        delayed(_estimate_threshold_for_group_inner)(
-            gid,
-            group_to_inds[gid],
-            group_estimation_starts[int(gid)],
-            ch_ids,
-        )
+    threshold_tasks = [
+        (int(gid), int(start))
         for gid in unique_groups
+        for start in group_estimation_starts[int(gid)]
+    ]
+    threshold_batch_size = max(1, int(effective_n_jobs(n_jobs)))
+    threshold_window_items = []
+    threshold_progress = _make_progress(
+        total=len(threshold_tasks),
+        desc="Estimating thresholds",
+        disable=False,
     )
-    thresholds = {gid: threshold for gid, threshold in threshold_items}
+    for batch_start in range(0, len(threshold_tasks), threshold_batch_size):
+        task_batch = threshold_tasks[batch_start: batch_start + threshold_batch_size]
+        batch_items = Parallel(n_jobs=n_jobs, backend="threading")(
+            delayed(_estimate_threshold_for_window_inner)(
+                gid,
+                group_to_inds[gid],
+                start,
+                ch_ids,
+            )
+            for gid, start in task_batch
+        )
+        threshold_window_items.extend(batch_items)
+        threshold_progress.update(len(task_batch))
+    threshold_progress.close()
+    threshold_samples_by_group = {int(gid): [] for gid in unique_groups}
+    for gid, abs_vals in threshold_window_items:
+        if abs_vals.size > 0:
+            threshold_samples_by_group[int(gid)].append(abs_vals)
+    thresholds = {}
+    for gid in unique_groups:
+        pool_abs = threshold_samples_by_group[int(gid)]
+        if not pool_abs:
+            thresholds[int(gid)] = 1e6
+            continue
+        abs_vals = np.concatenate(pool_abs)
+        sigma = 1.4826 * np.median(abs_vals)   # MAD → σ
+        thresholds[int(gid)] = float(sigma * threshold_sigma)
 
     # -------------------- scanning --------------------
-    print(f"Scanning recording using backend='threading' (n_jobs={n_jobs})...")
+    scan_halo_samp = max(0, dead_time_samp)
+    scan_halo_ms = (1000.0 * scan_halo_samp / float(sf)) if sf else 0.0
+    print(
+        "Scanning recording using "
+        f"backend='threading' (n_jobs={n_jobs}, halo_ms={scan_halo_ms:.3f})..."
+    )
     chunk_len = int(chunk_s * sf)
     chunks = []
     beg = 0
@@ -162,43 +282,49 @@ def detect_high_amplitude_artifacts(
         chunks.append((beg, end))
         beg = end
 
-    # Parallel chunk scan; returns a list of dicts: shank_id -> trigger frames (local→global)
-    results = Parallel(n_jobs=n_jobs, backend="threading")(
-        delayed(_worker_scan_chunk_inner)(
-            start, end, thresholds, group_to_inds
-        ) 
-        for start, end in chunks
+    # -------------------- aggregation & dead-time merge --------------------
+    final_triggers = {int(g): [] for g in unique_groups}
+    last_trig_by_group = {int(g): -dead_time_samp * 2 for g in unique_groups}
+    scan_batch_size = max(1, int(effective_n_jobs(n_jobs)))
+    scan_progress = _make_progress(
+        total=len(chunks),
+        desc="Scanning chunks",
+        disable=False,
     )
 
-    # -------------------- aggregation & dead-time merge --------------------
-    all_candidates = {int(g): [] for g in unique_groups}
-    for res in results:
-        for gid, inds in res.items():
-            all_candidates[gid].append(inds)
+    # Process chunk batches in chronological order so dead-time merging is preserved
+    # even when detections straddle chunk boundaries.
+    for batch_start in range(0, len(chunks), scan_batch_size):
+        chunk_batch = chunks[batch_start: batch_start + scan_batch_size]
+        batch_results = Parallel(n_jobs=n_jobs, backend="threading")(
+            delayed(_worker_scan_chunk_inner)(
+                start, end, thresholds, group_to_inds, scan_halo_samp
+            )
+            for start, end in chunk_batch
+        )
+        scan_progress.update(len(chunk_batch))
 
-    final_triggers = {}
+        for res in batch_results:
+            for gid, cluster_summaries in res.items():
+                if len(cluster_summaries) == 0:
+                    continue
+                filtered = final_triggers[int(gid)]
+                last_trig = last_trig_by_group[int(gid)]
+                for cluster_idx, (cluster_start, cluster_runs, cluster_accepted) in enumerate(cluster_summaries):
+                    if cluster_idx == 0 and int(cluster_start) - int(last_trig) <= dead_time_samp:
+                        accepted, last_trig = _expand_run_ranges_with_dead_time(cluster_runs, last_trig)
+                    else:
+                        accepted = cluster_accepted
+                        if accepted.size > 0:
+                            last_trig = int(accepted[-1])
+                    if accepted.size > 0:
+                        filtered.extend(accepted.tolist())
+                last_trig_by_group[int(gid)] = int(last_trig)
+    scan_progress.close()
+
     total_artifacts = 0
-
     for gid in unique_groups:
-        if not all_candidates[gid]:
-            final_triggers[gid] = []
-            print(f"  Group {gid}: 0 artifacts detected")
-            continue
-            
-        candidates = np.concatenate(all_candidates[gid])
-        candidates.sort()
-        
-        # Enforce dead time on a per-group basis
-        filtered = []
-        last_trig = -dead_time_samp * 2
-
-        for t in candidates:
-            if t - last_trig > dead_time_samp:
-                filtered.append(int(t))
-                last_trig = t
-        
-        final_triggers[gid] = filtered
-        n_art = len(filtered)
+        n_art = len(final_triggers[int(gid)])
         total_artifacts += n_art
         print(f"  Group {gid}: {n_art} artifacts detected")
 
