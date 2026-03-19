@@ -63,7 +63,7 @@ def detect_high_amplitude_artifacts(
         Refractory period (ms) to merge multiple detection triggers into one.
     n_jobs : int, default -1
         Number of parallel jobs (joblib) used for threshold estimation and chunk scanning.
-        Uses backend="threading" internally.
+        Uses backend="loky" internally.
 
     Returns
     -------
@@ -220,7 +220,7 @@ def detect_high_amplitude_artifacts(
     print(f"Detecting artifacts on {len(unique_groups)} groups (by_group={by_group})...")
 
     # -------------------- threshold estimation --------------------
-    print(f"Estimating thresholds using backend='threading' (n_jobs={n_jobs})...")
+    print(f"Estimating thresholds using backend='loky' (n_jobs={n_jobs})...")
     rng = np.random.default_rng(seed)
     W_est = int(estimate_window_s * sf)
     group_estimation_starts = {
@@ -241,7 +241,7 @@ def detect_high_amplitude_artifacts(
     )
     for batch_start in range(0, len(threshold_tasks), threshold_batch_size):
         task_batch = threshold_tasks[batch_start: batch_start + threshold_batch_size]
-        batch_items = Parallel(n_jobs=n_jobs, backend="threading")(
+        batch_items = Parallel(n_jobs=n_jobs, backend="loky")(
             delayed(_estimate_threshold_for_window_inner)(
                 gid,
                 group_to_inds[gid],
@@ -272,7 +272,7 @@ def detect_high_amplitude_artifacts(
     scan_halo_ms = (1000.0 * scan_halo_samp / float(sf)) if sf else 0.0
     print(
         "Scanning recording using "
-        f"backend='threading' (n_jobs={n_jobs}, halo_ms={scan_halo_ms:.3f})..."
+        f"backend='loky' (n_jobs={n_jobs}, halo_ms={scan_halo_ms:.3f})..."
     )
     chunk_len = int(chunk_s * sf)
     chunks = []
@@ -296,7 +296,7 @@ def detect_high_amplitude_artifacts(
     # even when detections straddle chunk boundaries.
     for batch_start in range(0, len(chunks), scan_batch_size):
         chunk_batch = chunks[batch_start: batch_start + scan_batch_size]
-        batch_results = Parallel(n_jobs=n_jobs, backend="threading")(
+        batch_results = Parallel(n_jobs=n_jobs, backend="loky")(
             delayed(_worker_scan_chunk_inner)(
                 start, end, thresholds, group_to_inds, scan_halo_samp
             )
