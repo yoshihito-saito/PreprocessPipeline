@@ -447,6 +447,68 @@ def _nearest_interp(x: np.ndarray, y: np.ndarray, x_new: np.ndarray) -> np.ndarr
     return yy[out_idx]
 
 
+def _align_metric_to_timestamps(metric: np.ndarray, metric_t: np.ndarray, target_t: np.ndarray) -> np.ndarray:
+    vals = np.asarray(metric, dtype=np.float64).reshape(-1)
+    src_t = np.asarray(metric_t, dtype=np.float64).reshape(-1)
+    dst_t = np.asarray(target_t, dtype=np.float64).reshape(-1)
+    out = np.full(dst_t.shape, np.nan, dtype=np.float64)
+    if vals.size == 0 or src_t.size == 0 or dst_t.size == 0:
+        return out
+    if vals.size != src_t.size:
+        if vals.size == dst_t.size:
+            return vals.astype(np.float64, copy=False)
+        return out
+    if vals.size == dst_t.size and np.array_equal(src_t, dst_t):
+        return vals.astype(np.float64, copy=False)
+
+    idx = np.searchsorted(src_t, dst_t, side="left")
+    idx = np.clip(idx, 0, src_t.size - 1)
+    left = np.clip(idx - 1, 0, src_t.size - 1)
+    choose_left = np.abs(src_t[left] - dst_t) < np.abs(src_t[idx] - dst_t)
+    nearest_idx = np.where(choose_left, left, idx)
+    nearest_dist = np.abs(src_t[nearest_idx] - dst_t)
+
+    diffs = np.diff(src_t)
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if diffs.size:
+        tol = float(np.median(diffs)) * 0.51
+    else:
+        tol = 1e-9
+    valid = nearest_dist <= tol
+    out[valid] = vals[nearest_idx[valid]]
+    return out
+
+
+def _mean_pairwise_corr_over_windows(sig: np.ndarray, sample_index: np.ndarray) -> np.ndarray:
+    arr = np.asarray(sig, dtype=np.float64)
+    idx = np.asarray(sample_index, dtype=np.int64)
+    n_bins = int(idx.shape[0])
+    n_ch = int(arr.shape[1])
+    if n_bins == 0:
+        return np.empty((0,), dtype=np.float64)
+    if n_ch < 2:
+        return np.zeros((n_bins,), dtype=np.float64)
+
+    pair_i, pair_j = np.triu_indices(n_ch, k=1)
+    window_len = int(idx.shape[1])
+    target_bytes = 32 * 1024 * 1024
+    bins_per_block = max(1, int(target_bytes // max(1, window_len * n_ch * arr.dtype.itemsize * 2)))
+    bins_per_block = min(n_bins, bins_per_block)
+
+    out = np.zeros((n_bins,), dtype=np.float64)
+    for start in range(0, n_bins, bins_per_block):
+        stop = min(n_bins, start + bins_per_block)
+        seg = arr[idx[start:stop], :]  # block x window x channel
+        seg = seg - seg.mean(axis=1, keepdims=True)
+        sq = np.sum(seg * seg, axis=1)
+        norms = np.sqrt(np.maximum(sq, 0.0))
+        num = np.einsum("bwc,bwd->bcd", seg, seg, optimize=True)
+        den = norms[:, :, None] * norms[:, None, :]
+        corr = np.divide(num, den, out=np.zeros_like(num), where=den > 0)
+        out[start:stop] = corr[:, pair_i, pair_j].mean(axis=1)
+    return out
+
+
 def _matlab_downsample(x: np.ndarray, factor: int) -> np.ndarray:
     arr = np.asarray(x)
     f = max(1, int(factor))
@@ -949,24 +1011,9 @@ def _compute_emg_from_lfp(
         centers = np.asarray([sig.shape[0] // 2], dtype=np.int64)
 
     n_bins = int(centers.size)
-    emg_corr = np.zeros((n_bins,), dtype=np.float64)
-    n_pairs = 0
     offsets = np.arange(-half_window, half_window + 1, dtype=np.int64)
     sample_index = centers[:, None] + offsets[None, :]
-
-    for j in range(sig.shape[1]):
-        for k in range(j + 1, sig.shape[1]):
-            x_seg = sig[sample_index, j]
-            y_seg = sig[sample_index, k]
-            x_seg = x_seg - x_seg.mean(axis=1, keepdims=True)
-            y_seg = y_seg - y_seg.mean(axis=1, keepdims=True)
-            den = np.sqrt(np.sum(x_seg * x_seg, axis=1) * np.sum(y_seg * y_seg, axis=1))
-            num = np.sum(x_seg * y_seg, axis=1)
-            corr = np.where(den > 0, num / den, 0.0)
-            emg_corr += corr
-            n_pairs += 1
-    if n_pairs > 0:
-        emg_corr /= float(n_pairs)
+    emg_corr = _mean_pairwise_corr_over_windows(sig, sample_index)
 
     emg = {
         "timestamps": (centers.astype(np.float64) / fs).reshape(-1, 1),
@@ -1549,6 +1596,23 @@ def _find_next_to_ints(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.nda
     return next_to_right, next_to_left
 
 
+def _assign_state_on_intervals(
+    states: np.ndarray,
+    timestamps: np.ndarray,
+    intervals: np.ndarray,
+    state_value: int,
+) -> None:
+    ts = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+    ints = np.asarray(intervals, dtype=np.float64).reshape(-1, 2)
+    if ts.size == 0 or ints.size == 0:
+        return
+    for st, en in ints:
+        i0 = int(np.searchsorted(ts, float(st), side="left"))
+        i1 = int(np.searchsorted(ts, float(en), side="right"))
+        if i1 > i0:
+            states[i0:i1] = np.uint8(state_value)
+
+
 def _suppress_wake_to_rem_transitions(
     states: np.ndarray,
     timestamps: np.ndarray,
@@ -1806,9 +1870,7 @@ def _compute_sleep_state(
     # short nrem -> wake
     short_nrem = (nrem_int[:, 1] - nrem_int[:, 0]) <= min_sws if nrem_int.size else np.asarray([], dtype=bool)
     if short_nrem.size and np.any(short_nrem):
-        for st, en in nrem_int[short_nrem]:
-            m = (idx_timestamps >= st) & (idx_timestamps <= en)
-            states[m] = 1
+        _assign_state_on_intervals(states, idx_timestamps, nrem_int[short_nrem], 1)
 
     ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
     wake_int = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
@@ -1818,9 +1880,7 @@ def _compute_sleep_state(
     short_w = (wake_int[:, 1] - wake_int[:, 0]) <= min_w_next_rem if wake_int.size else np.asarray([], dtype=bool)
     wr, rw = _find_next_to_ints(wake_int, rem_int)
     if short_w.size and np.any(short_w & (wr | rw)):
-        for st, en in wake_int[short_w & (wr | rw)]:
-            m = (idx_timestamps >= st) & (idx_timestamps <= en)
-            states[m] = 5
+        _assign_state_on_intervals(states, idx_timestamps, wake_int[short_w & (wr | rw)], 5)
 
     ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
     rem_int = np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
@@ -1830,17 +1890,13 @@ def _compute_sleep_state(
     short_r = (rem_int[:, 1] - rem_int[:, 0]) <= min_rem_in_w if rem_int.size else np.asarray([], dtype=bool)
     rr, rl = _find_next_to_ints(rem_int, wake_int)
     if short_r.size and np.any(short_r & (rr & rl)):
-        for st, en in rem_int[short_r & (rr & rl)]:
-            m = (idx_timestamps >= st) & (idx_timestamps <= en)
-            states[m] = 1
+        _assign_state_on_intervals(states, idx_timestamps, rem_int[short_r & (rr & rl)], 1)
 
     ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
     rem_int = np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
     short_r2 = (rem_int[:, 1] - rem_int[:, 0]) <= min_rem if rem_int.size else np.asarray([], dtype=bool)
     if short_r2.size and np.any(short_r2):
-        for st, en in rem_int[short_r2]:
-            m = (idx_timestamps >= st) & (idx_timestamps <= en)
-            states[m] = 1
+        _assign_state_on_intervals(states, idx_timestamps, rem_int[short_r2], 1)
 
     ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
     wake_int = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
@@ -1848,17 +1904,13 @@ def _compute_sleep_state(
     short_w2 = (wake_int[:, 1] - wake_int[:, 0]) <= min_wake if wake_int.size else np.asarray([], dtype=bool)
     wn, nw = _find_next_to_ints(wake_int, nrem_int)
     if short_w2.size and np.any(short_w2 & (wn | nw)):
-        for st, en in wake_int[short_w2 & (wn | nw)]:
-            m = (idx_timestamps >= st) & (idx_timestamps <= en)
-            states[m] = 3
+        _assign_state_on_intervals(states, idx_timestamps, wake_int[short_w2 & (wn | nw)], 3)
 
     ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
     nrem_int = np.asarray(ints.get("NREMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
     short_nrem2 = (nrem_int[:, 1] - nrem_int[:, 0]) <= min_sws if nrem_int.size else np.asarray([], dtype=bool)
     if short_nrem2.size and np.any(short_nrem2):
-        for st, en in nrem_int[short_nrem2]:
-            m = (idx_timestamps >= st) & (idx_timestamps <= en)
-            states[m] = 1
+        _assign_state_on_intervals(states, idx_timestamps, nrem_int[short_nrem2], 1)
 
     ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
 
@@ -2316,14 +2368,18 @@ def _append_theta_epochs(sleep_state: dict[str, Any], basepath: Path, basename: 
     emgthr = float(hists["EMGthresh"])
 
     states = np.asarray(sleep_state["idx"]["states"]).reshape(-1)
-    theta_ndx = (thratio > ththr) & (emg > emgthr)
+    timestamps = np.asarray(sleep_state["idx"]["timestamps"]).reshape(-1).astype(np.float64)
+    metric_t = np.asarray(metrics.get("t_clus", timestamps), dtype=np.float64).reshape(-1)
+    if thratio.size != states.size or emg.size != states.size:
+        thratio = _align_metric_to_timestamps(thratio, metric_t, timestamps)
+        emg = _align_metric_to_timestamps(emg, metric_t, timestamps)
+    theta_ndx = np.isfinite(thratio) & np.isfinite(emg) & (thratio > ththr) & (emg > emgthr)
 
     theta_states = np.zeros(states.shape, dtype=np.uint8)
     theta_states[theta_ndx] = 7
     non_theta = (states == 1) & (theta_states == 0)
     theta_states[non_theta] = 9
 
-    timestamps = np.asarray(sleep_state["idx"]["timestamps"]).reshape(-1).astype(np.float64)
     statenames = np.asarray(["", "", "", "", "", "", "THETA", "", "nonTHETA"], dtype=object)
     theta_idx = {
         "states": theta_states.reshape(-1, 1),
