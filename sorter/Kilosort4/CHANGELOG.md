@@ -1,5 +1,30 @@
 # Kilosort4 Change Log
 
+## 2026-03-08
+
+### Clustering feature customization
+- Added optional appended clustering features in [`kilosort/clustering_qr.py`](./kilosort/clustering_qr.py):
+  - z-scored log-amplitude feature (`use_amplitude_feature`, `amplitude_feature_scale`)
+  - nearest-to-peak spatial energy-ratio feature (`use_spatial_profile_feature`, `spatial_profile_scale`)
+- The spatial feature now uses channels nearest to each spike's peak channel in probe geometry, and its width follows `nearest_chans`.
+- Appended features affect clustering assignments only; `Wall` / template reconstruction still uses the original `Xd_signal`.
+
+### First and final clustering behavior
+- Appended clustering features are now applied in both clustering passes:
+  - first clustering (`mode="spikes"`)
+  - final clustering (`mode="template"`)
+- This keeps upstream Kilosort4's two-pass clustering structure while allowing the fork to bias both passes toward stronger split behavior on local silicon-probe data.
+
+### Debug outputs for stage analysis
+- Added optional debug stage summaries under `results_dir/debug_stage_stats/`:
+  - `first_clustering.tsv`
+  - `learned_extraction_templates.tsv`
+  - `final_clustering.tsv`
+  - `final_merge.tsv`
+  - `stage_summary.tsv`
+- Added optional per-spike lineage dumps under `results_dir/debug_stage_stats/lineage/` for tracing how final units map back to earlier clustering stages.
+- Added config flag `save_debug_stage_stats` to control these temporary debugging outputs.
+
 ## 2026-02-27
 
 ### Pipeline integration
@@ -41,4 +66,3 @@
 ### Local Kilosort package patch notes
 - Local environment patch to `kilosort/clustering_qr.py` is currently:
   - `swarmsplitter.split(..., meta=st0)` (restored from temporary `meta=None` workaround).
-

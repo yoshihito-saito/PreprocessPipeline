@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a bug.
+title: "BUG: <Please replace this text with a comprehensive title>"
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      Thank you for taking the time to file a bug report. Before creating a new issue,
+      please try updating to the newest version of Kilosort4. If you are using
+      spikeinterface, try running Kilosort4 on its own.
+
+- type: markdown
+  attributes:
+    value: >
+      If the bug occurred during sorting, please also **upload kilosort4.log**
+      located in the results directory (v4.0.8 or later).
+    
+- type: textarea
+  attributes: 
+    label: "Describe the issue:"
+  validations:
+    required: true
+
+- type: textarea
+  attributes:
+    label: "Reproduce the bug:"
+    description: >
+      A short code example that reproduces the problem/missing feature,
+      if applicable, or a description of how you encountered it.
+    render: python
+  
+- type: textarea
+  attributes:
+    label: "Error message:"
+    description: >
+      Please include the full statement of all error messages, if any.
+    render: shell
+
+- type: textarea
+  attributes:
+    label: "Version information:"
+    description: >
+      Version of python, Kilosort, operating system, and any other
+      software versions you think might be relevant to the bug (e.g. CUDA toolkit).
+  validations:
+    required: true

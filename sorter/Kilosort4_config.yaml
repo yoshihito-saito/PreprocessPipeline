@@ -24,7 +24,7 @@ Th_single_ch: 4
 
 # Detection threshold for universal templates.
 # KS4 default: 9
-Th_universal: 8
+Th_universal: 9
 
 # Detection threshold for learned templates during re-extraction.
 # KS4 default: 8
@@ -41,7 +41,7 @@ nearest_templates: 100
 
 # Number of 1D templates learned from data for universal-template detection.
 # KS4 default: 6
-n_templates: 6
+n_templates: 12
 
 # Vertical spacing of template centers in um.
 # This may be overwritten by auto geometry.
@@ -80,7 +80,8 @@ highpass_cutoff: 500
 # Graph neighbors used in final clustering.
 # Lower values tend to split more; higher values tend to merge more.
 # KS4 default: 10
-cluster_neighbors: 8
+cluster_neighbors: 6
+cluster_downsampling: 1
 
 # Wrapper / runtime options
 
@@ -107,7 +108,7 @@ clear_cache: true
 auto_geom_from_probe: true
 
 # Scale factor applied to local geometric distance when deriving max_channel_distance.
-auto_geom_max_channel_distance_factor: 1.5
+auto_geom_max_channel_distance_factor: 1.0
 
 # Gap threshold multiplier used when grouping x-columns into banks/components.
 auto_geom_gap_factor: 2.0

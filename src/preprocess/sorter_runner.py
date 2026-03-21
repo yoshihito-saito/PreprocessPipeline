@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
 from typing import Any
 import ast
 
@@ -147,6 +148,10 @@ def _default_kilosort1_path() -> Path:
 
 def _default_kilosort25_path() -> Path:
     return _repo_root() / "sorter" / "Kilosort2.5"
+
+
+def _default_kilosort4_path() -> Path:
+    return _repo_root() / "sorter" / "Kilosort4"
 
 
 def _resolve_matlab_cmd(matlab_path: Path | None) -> str | None:
@@ -1093,6 +1098,71 @@ def _kilosort1_chanmap_override(chanmap_mat_path: Path | None):
         yield
 
 
+@contextmanager
+def _kilosort4_package_override(kilosort4_path: Path | None):
+    target_path = Path(kilosort4_path) if kilosort4_path is not None else _default_kilosort4_path()
+    if target_path is None:
+        yield
+        return
+
+    import_root = Path(target_path).resolve()
+    if not import_root.exists():
+        raise FileNotFoundError(f"Kilosort4 path not found: {import_root}")
+
+    if (import_root / "kilosort").is_dir():
+        package_root = import_root
+    elif import_root.name == "kilosort" and import_root.is_dir():
+        package_root = import_root.parent
+    else:
+        raise FileNotFoundError(
+            "Kilosort4 path must point to a repository root containing a "
+            f"'kilosort' package directory, or to the package directory itself: {import_root}"
+        )
+
+    package_root_str = str(package_root)
+    original_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "kilosort" or name.startswith("kilosort.")
+    }
+    original_sys_path = list(sys.path)
+    original_pythonpath = os.environ.get("PYTHONPATH")
+    original_is_installed = ss.Kilosort4Sorter.is_installed
+    original_get_sorter_version = ss.Kilosort4Sorter.get_sorter_version
+    original_check_sorter_version = ss.Kilosort4Sorter.check_sorter_version
+
+    for name in list(sys.modules):
+        if name == "kilosort" or name.startswith("kilosort."):
+            del sys.modules[name]
+
+    sys.path.insert(0, package_root_str)
+    if original_pythonpath:
+        os.environ["PYTHONPATH"] = package_root_str + os.pathsep + original_pythonpath
+    else:
+        os.environ["PYTHONPATH"] = package_root_str
+
+    ss.Kilosort4Sorter.is_installed = classmethod(lambda cls: True)
+    ss.Kilosort4Sorter.get_sorter_version = classmethod(lambda cls: "4.1.2")
+    ss.Kilosort4Sorter.check_sorter_version = classmethod(lambda cls: None)
+
+    try:
+        print(f"Kilosort4 package path set to: {package_root}")
+        yield
+    finally:
+        ss.Kilosort4Sorter.is_installed = original_is_installed
+        ss.Kilosort4Sorter.get_sorter_version = original_get_sorter_version
+        ss.Kilosort4Sorter.check_sorter_version = original_check_sorter_version
+        for name in list(sys.modules):
+            if name == "kilosort" or name.startswith("kilosort."):
+                del sys.modules[name]
+        sys.path[:] = original_sys_path
+        if original_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = original_pythonpath
+        sys.modules.update(original_modules)
+
+
 def _cleanup_temp_wh_dat(output_folder: Path) -> None:
     candidates = [
         output_folder / "temp_wh.dat",
@@ -1118,6 +1188,7 @@ def execute_sorting_job(
     config_path: Path | None = None,
     kilosort1_path: Path | None = None,
     kilosort25_path: Path | None = None,
+    kilosort4_path: Path | None = None,
     matlab_path: Path | None = None,
     matlab_max_workers: int = _default_parallel_n_jobs(),
     chanmap_mat_path: Path | None = None,
@@ -1150,6 +1221,7 @@ def execute_sorting_job(
     ks4_auto_geom_enabled = False
     ks4_auto_geom_options: dict[str, Any] = {}
     ks25_ops_overrides: dict[str, Any] = {}
+    kilosort4_import_root: Path | None = None
     output_folder = Path(output_folder).resolve()
 
     if sorter_input in _MATLAB_SORTER_INPUTS:
@@ -1202,6 +1274,10 @@ def execute_sorting_job(
         else:
             ss.Kilosort2_5Sorter.set_kilosort2_5_path(str(ks_path))
             print(f"Kilosort2.5 path set to: {ks_path}")
+    elif sorter_input == "kilosort4":
+        kilosort4_import_root = (kilosort4_path or _default_kilosort4_path()).resolve()
+        if not kilosort4_import_root.exists():
+            raise FileNotFoundError(f"Kilosort4 path not found: {kilosort4_import_root}")
 
     cfg_path = (config_path or _default_sorter_config_path(sorter_input)).resolve()
     params = _load_params(cfg_path)
@@ -1233,7 +1309,10 @@ def execute_sorting_job(
         params, ks25_ops_overrides = _normalize_kilosort25_params(params)
         print("Resolved Kilosort2.5 params")
     elif sorter_input == "kilosort4":
-        params = _normalize_kilosort4_params(params)
+        global _KILOSORT4_ALLOWED_PARAM_KEYS
+        with _kilosort4_package_override(kilosort4_import_root):
+            _KILOSORT4_ALLOWED_PARAM_KEYS = None
+            params = _normalize_kilosort4_params(params)
         if ignored_channels_0based:
             params["bad_channels"] = ignored_channels_0based
         print("Resolved Kilosort4 params")
@@ -1308,6 +1387,10 @@ def execute_sorting_job(
                 chanmap_mat_path=chanmap_override_path,
                 ops_overrides=ks25_ops_overrides,
             )
+        elif sorter_input == "kilosort4":
+            override_ctx = _kilosort4_package_override(
+                Path(kilosort4_path) if kilosort4_path is not None else None
+            )
         else:
             override_ctx = nullcontext()
         with override_ctx:
@@ -1377,6 +1460,7 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
         config_path=Path(args.config) if args.config else None,
         kilosort1_path=Path(args.kilosort1_path) if args.kilosort1_path else None,
         kilosort25_path=Path(args.kilosort25_path) if args.kilosort25_path else None,
+        kilosort4_path=Path(args.kilosort4_path) if args.kilosort4_path else None,
         matlab_path=Path(args.matlab_path) if args.matlab_path else None,
         matlab_max_workers=int(args.matlab_max_workers),
         chanmap_mat_path=Path(args.chanmap) if args.chanmap else None,
@@ -1413,6 +1497,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="kilosort25_path",
         default="sorter/Kilosort2.5",
         help="Kilosort2.5 folder path (used only when --sorter kilosort2.5).",
+    )
+    p.add_argument(
+        "--kilosort4-path",
+        default="sorter/Kilosort4",
+        help="Kilosort4 repository root path containing the kilosort package (used only when --sorter kilosort4).",
     )
     p.add_argument(
         "--matlab-path",
