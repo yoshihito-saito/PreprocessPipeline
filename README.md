@@ -26,10 +26,15 @@ pip install git+https://github.com/cortex-lab/phy.git
 - Kilosort / Torch:
   - install PyTorch with the wheel that matches your OS, Python version, and CUDA/CPU target:
     - https://pytorch.org/get-started/locally/
-  - then install Kilosort:
-```bash
-pip install kilosort[gui]
+  - this repository uses the bundled Kilosort4 code under `sorter/Kilosort4`
+  - no separate `pip install kilosort[gui]` is required for the preprocessing pipeline
+  - in the notebook/config, point the sorter to the repository copy:
+```python
+sorter='kilosort4'
+sorter_path=Path('sorter') / 'Kilosort4'
+sorter_config_path=Path('sorter') / 'Kilosort4_config.yaml'
 ```
+  - if you update Kilosort4, update the files in `sorter/Kilosort4` and keep `sorter/Kilosort4_config.yaml` in sync
 - MATLAB integration:
   - MATLAB is not installed by `environment.yml`; it must be installed separately and available on the system path if you use MATLAB-dependent steps.
 
@@ -54,15 +59,6 @@ mexcuda -largeArrayDims mexWtW2.cu NVCC_FLAGS="-allow-unsupported-compiler"
 ```
 
 This is only needed for Kilosort1 MATLAB/CUDA compilation on Windows. It is not required for the base Python environment in `environment.yml`.
-
-### Pip-only install
-
-If you already manage Python yourself and do not want conda, install the package in editable mode:
-
-```bash
-pip install -e .
-pip install ".[dev,notebook]"
-```
 
 ## Pipeline Workflow
 

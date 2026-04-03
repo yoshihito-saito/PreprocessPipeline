@@ -183,9 +183,10 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     trange = torch.arange(-nt, nt+1, device=device) 
     tiwave = torch.arange(-(nt//2), nt//2+1, device=device) 
 
-    st = torch.zeros((100000,2), dtype = torch.int64, device = device)
-    amps = torch.zeros((100000,1), dtype = torch.float, device = device)
-    th_amps = torch.zeros((100000,1), dtype = torch.float, device = device)
+    initial_buffer = 1_000_000
+    st = torch.zeros((initial_buffer, 2), dtype=torch.int64, device=device)
+    amps = torch.zeros((initial_buffer, 1), dtype=torch.float, device=device)
+    th_amps = torch.zeros((initial_buffer, 1), dtype=torch.float, device=device)
     k = 0
 
     Xres = X.clone()
@@ -222,6 +223,23 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
         #isort = torch.sort(iX)
 
         nsp = len(iX)
+        if k + nsp > st.shape[0]:
+            new_size = st.shape[0]
+            while k + nsp > new_size:
+                new_size *= 2
+
+            st_expanded = torch.zeros((new_size, 2), dtype=st.dtype, device=device)
+            st_expanded[:k] = st[:k]
+            st = st_expanded
+
+            amps_expanded = torch.zeros((new_size, 1), dtype=amps.dtype, device=device)
+            amps_expanded[:k] = amps[:k]
+            amps = amps_expanded
+
+            th_amps_expanded = torch.zeros((new_size, 1), dtype=th_amps.dtype, device=device)
+            th_amps_expanded[:k] = th_amps[:k]
+            th_amps = th_amps_expanded
+
         st[k:k+nsp, 0] = iX[:,0]
         st[k:k+nsp, 1] = iY[:,0]
         amps[k:k+nsp] = B[iY,iX] / nm[iY]
