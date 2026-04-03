@@ -743,6 +743,14 @@ def discover_subsessions(
                 paths.append(cont)
 
     if not paths:
+        direct_amp = basepath / "amplifier.dat"
+        direct_cont = basepath / "continuous.dat"
+        if direct_amp.exists():
+            paths = [direct_amp]
+        elif direct_cont.exists():
+            paths = [direct_cont]
+
+    if not paths:
         return []
 
     if alt_sort:
