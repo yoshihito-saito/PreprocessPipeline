@@ -56,6 +56,12 @@ def _create_or_update_env(conda: str, env_file: Path, env_name: str) -> None:
     _run([conda, "env", "create", "--name", env_name, "--file", str(env_file)], cwd=REPO_ROOT)
 
 
+def _remove_env(conda: str, env_name: str) -> None:
+    if not _conda_env_exists(conda, env_name):
+        return
+    _run([conda, "remove", "--name", env_name, "--all", "-y"], cwd=REPO_ROOT)
+
+
 def _conda_run(conda: str, env_name: str, cmd: list[str]) -> None:
     _run([conda, "run", "--no-capture-output", "-n", env_name, *cmd], cwd=REPO_ROOT)
 
@@ -91,6 +97,11 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="auto, cpu, or an explicit wheel channel such as cu124 or cu130",
     )
+    parser.add_argument(
+        "--force-recreate",
+        action="store_true",
+        help="Delete the target conda environment first, then create it from scratch.",
+    )
     return parser.parse_args()
 
 
@@ -105,6 +116,8 @@ def main() -> None:
     env_file = WINDOWS_ENV_FILE if strategy == "windows" else DEFAULT_ENV_FILE
     env_name = args.env_name or _parse_env_name(env_file)
 
+    if args.force_recreate:
+        _remove_env(conda, env_name)
     _create_or_update_env(conda, env_file, env_name)
 
     if strategy == "windows":
