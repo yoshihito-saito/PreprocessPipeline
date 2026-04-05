@@ -10,6 +10,35 @@ conda env create -f environment.yml
 conda activate preprocess
 ```
 
+### Rebuild with automatic PyTorch setup
+
+- Windows:
+```bat
+setup_env_windows.bat
+```
+- Linux/macOS:
+```bash
+python scripts/setup_env.py
+```
+
+The setup helper uses a different strategy on Windows to avoid the `conda-forge` plus `pip torch` OpenMP conflict:
+
+- Windows creates a minimal conda env from `environment.windows.yml`
+- PyTorch is installed first with `scripts/install_torch.py`
+- the project dependencies are then installed with `pip install -e .[dev,notebook]`
+
+PyTorch wheel selection is automatic:
+
+- if `nvidia-smi` reports a supported NVIDIA CUDA level, the highest compatible `cu*` wheel is selected
+- if no supported GPU is detected, the installer falls back to CPU wheels
+- you can override the choice with `--torch-channel`, for example:
+```bat
+setup_env_windows.bat --torch-channel cu124
+```
+```bash
+python scripts/setup_env.py --torch-channel cpu
+```
+
 - Phy GUI:
 ```bash
 pip install git+https://github.com/cortex-lab/phy.git
@@ -24,7 +53,9 @@ pip install git+https://github.com/cortex-lab/phy.git
   4. If you use KlustaKwik on Windows, install `Visual C++ Redistributable for Visual Studio 2013`:
      - x64: `https://www.microsoft.com/en-us/download/details.aspx?id=40784`
 - Kilosort / Torch:
-  - install PyTorch with the wheel that matches your OS, Python version, and CUDA/CPU target:
+  - the recommended path in this repository is `setup_env_windows.bat` on Windows or `python scripts/setup_env.py` on Linux/macOS
+  - `scripts/install_torch.py` auto-selects a PyTorch wheel from the NVIDIA driver's reported CUDA compatibility and falls back to CPU when needed
+  - manual wheel selection is still available if you need it:
     - https://pytorch.org/get-started/locally/
   - this repository uses the bundled Kilosort4 code under `sorter/Kilosort4`
   - no separate `pip install kilosort[gui]` is required for the preprocessing pipeline
