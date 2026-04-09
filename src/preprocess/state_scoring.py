@@ -130,6 +130,31 @@ def _resolve_parallel_jobs(job_kwargs: dict[str, Any] | None) -> int:
     return max(1, n_jobs)
 
 
+def _config_channels_0based_to_1based(
+    channels: list[int] | None,
+    *,
+    n_channels: int,
+    field_name: str,
+) -> np.ndarray | None:
+    if not channels:
+        return None
+    vals = [int(ch) for ch in channels]
+    invalid = [v for v in vals if v < 0 or v >= n_channels]
+    if invalid:
+        raise ValueError(
+            f"{field_name} must contain 0-based channel indices within [0, {n_channels - 1}]. "
+            f"Got invalid values: {sorted(set(invalid))}"
+        )
+    seen: set[int] = set()
+    normalized: list[int] = []
+    for v in vals:
+        if v in seen:
+            continue
+        seen.add(v)
+        normalized.append(v + 1)
+    return np.asarray(normalized, dtype=np.int64).reshape(-1)
+
+
 def _to_uint_vector(values: np.ndarray) -> np.ndarray:
     vals = np.asarray(values).reshape(-1)
     if vals.size == 0:
@@ -2455,12 +2480,17 @@ def run_state_scoring(
     reject_channels_1based = _extract_bad_channels_1based(session_struct)
     parallel_jobs = _resolve_parallel_jobs(config.job_kwargs)
     pss_cache: dict[tuple[Any, ...], dict[str, np.ndarray]] = {}
-    sw_channels_1based = None
-    if config.sw_channels:
-        sw_channels_1based = np.asarray(config.sw_channels, dtype=np.int64).reshape(-1)
-    th_channels_1based = None
-    if config.theta_channels:
-        th_channels_1based = np.asarray(config.theta_channels, dtype=np.int64).reshape(-1)
+    n_channels = int(session_struct["extracellular"]["nChannels"])
+    sw_channels_1based = _config_channels_0based_to_1based(
+        config.sw_channels,
+        n_channels=n_channels,
+        field_name="sw_channels",
+    )
+    th_channels_1based = _config_channels_0based_to_1based(
+        config.theta_channels,
+        n_channels=n_channels,
+        field_name="theta_channels",
+    )
 
     emg, emg_path = _compute_emg_from_lfp(
         basepath=basepath,

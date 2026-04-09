@@ -72,15 +72,10 @@ def _make_tree_world_rw(root: Path) -> None:
 
 def _normalize_artifact_ttl_channel(channel: int) -> int:
     ch = int(channel)
-    if ch == 0:
-        return 0
-    if 1 <= ch <= 16:
-        return ch - 1
     if 0 <= ch < 16:
         return ch
     raise ValueError(
-        "artifact_TTL_channel must be within digital bit range [0, 15] "
-        "(or [1, 16] for 1-based input)."
+        "artifact_TTL_channel must be a 0-based digital bit index within [0, 15]."
     )
 
 
@@ -309,11 +304,10 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     digital_inputs_for_export = bool(config.digital_inputs or ttl_artifact_enabled)
     digital_channels_for_export = list(config.digital_channels) if config.digital_channels else None
     if ttl_channel_0based is not None:
-        ttl_ch_1based = int(ttl_channel_0based) + 1
         if digital_channels_for_export is None:
-            digital_channels_for_export = [ttl_ch_1based]
-        elif ttl_ch_1based not in digital_channels_for_export:
-            digital_channels_for_export = [*digital_channels_for_export, ttl_ch_1based]
+            digital_channels_for_export = [ttl_channel_0based]
+        elif ttl_channel_0based not in digital_channels_for_export:
+            digital_channels_for_export = [*digital_channels_for_export, ttl_channel_0based]
 
     _step("Export analog/digital events")
     analog_event_paths, digital_event_paths = export_analog_digital_events(

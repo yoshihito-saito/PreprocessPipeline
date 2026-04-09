@@ -765,12 +765,12 @@ def discover_subsessions(
 def _normalize_alt_sort_indices(alt_sort: list[int], n: int) -> list[int]:
     if not alt_sort:
         return list(range(n))
-    if min(alt_sort) >= 1 and max(alt_sort) <= n:
-        idx = [i - 1 for i in alt_sort]
-    else:
-        idx = alt_sort
+    idx = [int(i) for i in alt_sort]
     if sorted(idx) != list(range(n)):
-        raise ValueError(f"Invalid alt_sort for {n} subsessions: {alt_sort}")
+        raise ValueError(
+            f"Invalid alt_sort for {n} subsessions: {alt_sort}. "
+            f"Expected a 0-based permutation of [0, {n - 1}]."
+        )
     return idx
 
 

@@ -66,6 +66,14 @@ def _conda_run(conda: str, env_name: str, cmd: list[str]) -> None:
     _run([conda, "run", "--no-capture-output", "-n", env_name, *cmd], cwd=REPO_ROOT)
 
 
+def _verify_unix_stack(conda: str, env_name: str) -> None:
+    code = (
+        "import torch; import numpy; import scipy; import spikeinterface; "
+        "print('stack_ok', torch.__version__, torch.cuda.is_available())"
+    )
+    _conda_run(conda, env_name, ["python", "-c", code])
+
+
 def _verify_windows_stack(conda: str, env_name: str) -> None:
     checks = (
         "import torch; import numpy; import scipy; import spikeinterface; print('torch_then_numpy_ok')",
@@ -73,14 +81,6 @@ def _verify_windows_stack(conda: str, env_name: str) -> None:
     )
     for code in checks:
         _conda_run(conda, env_name, ["python", "-c", code])
-
-
-def _verify_unix_stack(conda: str, env_name: str) -> None:
-    code = (
-        "import torch; import numpy; import scipy; import spikeinterface; "
-        "print('stack_ok', torch.__version__, torch.cuda.is_available())"
-    )
-    _conda_run(conda, env_name, ["python", "-c", code])
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,6 +121,7 @@ def main() -> None:
     _create_or_update_env(conda, env_file, env_name)
 
     if strategy == "windows":
+        _conda_run(conda, env_name, ["python", "-m", "pip", "install", "--upgrade", "pip"])
         _conda_run(conda, env_name, ["python", "scripts/install_torch.py", "--compute-platform", args.torch_channel])
         _conda_run(conda, env_name, ["python", "-m", "pip", "install", "-e", ".[dev,notebook]"])
         _verify_windows_stack(conda, env_name)

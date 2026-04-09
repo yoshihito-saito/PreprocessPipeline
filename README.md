@@ -37,6 +37,7 @@ The setup helper uses a different strategy on Windows to avoid the `conda-forge`
 - Windows creates a minimal conda env from `environment.windows.yml`
 - PyTorch is installed first with `scripts/install_torch.py`
 - the project dependencies are then installed with `pip install -e .[dev,notebook]`
+- Linux/macOS continues to use `conda` with `environment.yml`
 
 PyTorch wheel selection is automatic:
 
@@ -66,6 +67,7 @@ pip install git+https://github.com/cortex-lab/phy.git
      - x64: `https://www.microsoft.com/en-us/download/details.aspx?id=40784`
 - Kilosort / Torch:
   - the recommended path in this repository is `setup_env_windows.bat` on Windows or `python scripts/setup_env.py` on Linux/macOS
+  - on Windows the setup script keeps `conda`, but only for a minimal env; `torch`, `numpy`, `scipy`, and `spikeinterface` are then installed by `pip` to avoid mixed OpenMP runtimes
   - `scripts/install_torch.py` auto-selects a PyTorch wheel from the NVIDIA driver's reported CUDA compatibility and falls back to CPU when needed
   - manual wheel selection is still available if you need it:
     - https://pytorch.org/get-started/locally/
@@ -130,13 +132,14 @@ This is only needed for Kilosort1 MATLAB/CUDA compilation on Windows. It is not 
 ## Artifact Removal
 
 - TTL artifact removal: `remove_artifact_TTL=True`
-- TTL channel selection: `artifact_TTL_channel` (0-based `[0..15]` or 1-based `[1..16]`)
+- TTL channel selection: `artifact_TTL_channel` (0-based `[0..15]`)
 - TTL edge behavior:
   - default: rising edges (`digitalIn.timestampsOn`)
   - include falling edges: `artifact_TTL_include_offset=True` (`timestampsOn + timestampsOff`)
 - TTL cleaning params: `artifact_TTL_ms_before`, `artifact_TTL_ms_after`, `artifact_TTL_mode`, `artifact_TTL_by_group`
 - High-amplitude artifact removal: `remove_highamp_artifact=True`
 - High-amplitude params: `highamp_*`, `highamp_ms_before`, `highamp_ms_after`, `highamp_mode`, `highamp_remove_by_group`
+- Config index inputs are 0-based: `artifact_TTL_channel`, `analog_channels`, `digital_channels`, `sw_channels`, `theta_channels`, `reject_channels`, `alt_sort`
 - Output files:
   - `basename.artifactTTL.events.mat`
   - `basename.artifactHigh.events.mat`

@@ -85,10 +85,20 @@ def _normalize_channel_indices(channels: list[int] | None, n_channels: int) -> l
         return list(range(n_channels))
 
     vals = [int(ch) for ch in channels]
-    if min(vals) >= 1 and max(vals) <= n_channels:
-        vals = [v - 1 for v in vals]
-    vals = sorted(set(v for v in vals if 0 <= v < n_channels))
-    return vals
+    invalid = [v for v in vals if v < 0 or v >= n_channels]
+    if invalid:
+        raise ValueError(
+            f"Channel indices must be 0-based and within [0, {n_channels - 1}]. "
+            f"Got invalid values: {sorted(set(invalid))}"
+        )
+    seen: set[int] = set()
+    normalized: list[int] = []
+    for v in vals:
+        if v in seen:
+            continue
+        seen.add(v)
+        normalized.append(v)
+    return normalized
 
 
 def _build_analog_behavior_struct(
@@ -573,6 +583,8 @@ def export_analog_digital_events(
     openephys_ttl_paths: list[Path] | None = None,
     openephys_sample_counts: list[int] | None = None,
 ) -> tuple[list[Path], list[Path]]:
+    if analog_channels:
+        _normalize_channel_indices(analog_channels, max(int(analog_num_channels), 1))
     del analog_channels  # neurocode preprocessSession computes analogInp/pulses on all active ADC channels
     del digital_active_channels_1based  # neurocode getDigitalIn decodes 16-bit word space
 
