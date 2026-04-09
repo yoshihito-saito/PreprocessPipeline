@@ -67,9 +67,7 @@ class PreprocessConfig:
     state_block_wake_to_rem: bool = False
 
     analog_inputs: bool = False
-    analog_channels: list[int] | None = None
     digital_inputs: bool = False
-    digital_channels: list[int] | None = None
 
     chanmap_mat_path: Path | None = None
     reject_channels: list[int] = field(default_factory=list)

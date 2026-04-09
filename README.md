@@ -139,7 +139,7 @@ This is only needed for Kilosort1 MATLAB/CUDA compilation on Windows. It is not 
 - TTL cleaning params: `artifact_TTL_ms_before`, `artifact_TTL_ms_after`, `artifact_TTL_mode`, `artifact_TTL_by_group`
 - High-amplitude artifact removal: `remove_highamp_artifact=True`
 - High-amplitude params: `highamp_*`, `highamp_ms_before`, `highamp_ms_after`, `highamp_mode`, `highamp_remove_by_group`
-- Config index inputs are 0-based: `artifact_TTL_channel`, `analog_channels`, `digital_channels`, `sw_channels`, `theta_channels`, `reject_channels`, `alt_sort`
+- Config index inputs are 0-based: `artifact_TTL_channel`, `sw_channels`, `theta_channels`, `reject_channels`, `alt_sort`
 - Output files:
   - `basename.artifactTTL.events.mat`
   - `basename.artifactHigh.events.mat`
@@ -213,6 +213,7 @@ noise thresholds:
 - [ ] Denoise (`removeNoise`)
 - [x] State scoring
 - [x] Spike sorting
+- [ ] Open Ephys `analog_inputs` support (currently TTL/digital only; no analog event export path)
 - [ ] Acceleration extraction (`getAcceleration` / `computeIntanAccel`)
 - [ ] Tracking/DLC (`getPos`, `path_to_dlc_bat_file`, `general_behavior_file`)
 - [ ] Session summary (`runSummary` / `sessionSummary`)

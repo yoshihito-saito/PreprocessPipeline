@@ -247,7 +247,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         analog_ch = (
             int(catalog.board_adc_channels)
             if int(catalog.board_adc_channels) > 0
-            else (len(config.analog_channels) if config.analog_channels else 1)
+            else 1
         )
         digital_word_ch = (
             int(catalog.board_digital_word_channels)
@@ -294,7 +294,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     analog_num_channels = (
         int(catalog.board_adc_channels)
         if int(catalog.board_adc_channels) > 0
-        else (len(config.analog_channels) if config.analog_channels else 1)
+        else 1
     )
     digital_word_channels = (
         int(catalog.board_digital_word_channels)
@@ -302,7 +302,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         else 1
     )
     digital_inputs_for_export = bool(config.digital_inputs or ttl_artifact_enabled)
-    digital_channels_for_export = list(config.digital_channels) if config.digital_channels else None
+    digital_channels_for_export: list[int] | None = None
     if ttl_channel_0based is not None:
         if digital_channels_for_export is None:
             digital_channels_for_export = [ttl_channel_0based]
@@ -314,7 +314,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         output_dir=output_dir,
         basename=basename,
         analog_inputs=config.analog_inputs,
-        analog_channels=config.analog_channels,
+        analog_channels=None,
         analog_num_channels=analog_num_channels,
         analog_active_channels_1based=(
             [int(ch) + 1 for ch in catalog.board_adc_native_orders]
