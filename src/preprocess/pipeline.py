@@ -255,24 +255,35 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             else 1
         )
 
+        analog_sidecar_paths = [
+            (p.parent / "analogin.dat") if (p.parent / "analogin.dat").exists() else None
+            for p in catalog.amplifier_paths
+        ]
+        digital_sidecar_paths = [
+            (p.parent / "digitalin.dat") if (p.parent / "digitalin.dat").exists() else None
+            for p in catalog.amplifier_paths
+        ]
+
         analog_concat = write_concatenated_dat_analogin(
-            dat_paths=catalog.analogin_paths,
+            dat_paths=analog_sidecar_paths,
             output_dat_path=output_dir / "analogin.dat",
             sampling_frequency=analog_sr,
             num_channels=analog_ch,
             overwrite=config.overwrite,
             job_kwargs=config.job_kwargs,
+            sample_counts=catalog.sample_counts,
         )
         if analog_concat is not None:
             intermediate_dat_paths["analogin"] = analog_concat
 
         digital_concat = write_concatenated_dat_digitalin(
-            dat_paths=catalog.digitalin_paths,
+            dat_paths=digital_sidecar_paths,
             output_dat_path=output_dir / "digitalin.dat",
             sampling_frequency=digital_sr,
             num_channels=digital_word_ch,
             overwrite=config.overwrite,
             job_kwargs=config.job_kwargs,
+            sample_counts=catalog.sample_counts,
         )
         if digital_concat is not None:
             intermediate_dat_paths["digitalin"] = digital_concat

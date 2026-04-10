@@ -306,38 +306,20 @@ def write_concatenated_dat(
     return output_dat_path
 
 
-def _load_sidecar_recordings_si(
-    *,
-    dat_paths: list[Path],
-    sampling_frequency: float,
-    num_channels: int,
-    dtype: str,
-) -> list[Any]:
-    recordings: list[Any] = []
-    for p in dat_paths:
-        rec = se.read_binary(
-            str(p),
-            sampling_frequency=sampling_frequency,
-            dtype=dtype,
-            num_channels=num_channels,
-            gain_to_uV=1.0,
-            offset_to_uV=0.0,
-        )
-        recordings.append(rec)
-    return recordings
-
-
 def _write_concatenated_sidecar_dat(
     *,
-    dat_paths: list[Path],
+    dat_paths: list[Path | None],
     output_dat_path: Path,
     sampling_frequency: float,
     num_channels: int,
     dtype: str,
     overwrite: bool,
     job_kwargs: dict[str, Any],
+    sample_counts: list[int] | None = None,
 ) -> Path | None:
     if not dat_paths:
+        return None
+    if not any(p is not None and Path(p).exists() for p in dat_paths):
         return None
     if output_dat_path.exists() and not overwrite:
         return output_dat_path
@@ -345,32 +327,106 @@ def _write_concatenated_sidecar_dat(
     if num_channels <= 0:
         raise ValueError(f"num_channels must be > 0 for sidecar concat: {num_channels}")
 
-    recs = _load_sidecar_recordings_si(
+    if sample_counts is not None and len(sample_counts) != len(dat_paths):
+        raise ValueError(
+            "sample_counts must have the same length as sidecar dat_paths: "
+            f"{len(sample_counts)} != {len(dat_paths)}"
+        )
+
+    dtype_np = np.dtype(dtype)
+    frame_bytes = int(dtype_np.itemsize) * int(num_channels)
+    if frame_bytes <= 0:
+        raise ValueError(f"Invalid sidecar frame size: dtype={dtype}, num_channels={num_channels}")
+
+    # Direct binary concatenation preserves exact uint16 sidecar words and lets us
+    # fill missing epochs with zeros so sidecar timestamps stay on the merged timebase.
+    output_dat_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_dat_path, "wb") as fout:
+        for idx, path in enumerate(dat_paths):
+            expected_samples = None if sample_counts is None else int(sample_counts[idx])
+            if path is None or not Path(path).exists():
+                if expected_samples is None:
+                    continue
+                _write_zero_sidecar_frames(
+                    fout,
+                    n_samples=expected_samples,
+                    num_channels=int(num_channels),
+                    dtype=dtype_np,
+                )
+                continue
+
+            p = Path(path)
+            size = p.stat().st_size
+            if size % frame_bytes != 0:
+                raise ValueError(
+                    f"{p} size is not divisible by sidecar frame size: "
+                    f"size={size}, frame_bytes={frame_bytes}"
+                )
+            actual_samples = size // frame_bytes
+            if expected_samples is not None and int(actual_samples) != int(expected_samples):
+                raise ValueError(
+                    f"{p} sample count does not match amplifier epoch length: "
+                    f"{actual_samples} != {expected_samples}"
+                )
+            with open(p, "rb") as fin:
+                while True:
+                    chunk = fin.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+    return output_dat_path
+
+
+def _write_zero_sidecar_frames(
+    fout: Any,
+    *,
+    n_samples: int,
+    num_channels: int,
+    dtype: np.dtype,
+) -> None:
+    remaining = max(0, int(n_samples))
+    if remaining == 0:
+        return
+    chunk_frames = 1_000_000
+    zeros = np.zeros((min(chunk_frames, remaining), int(num_channels)), dtype=dtype)
+    while remaining > 0:
+        n = min(chunk_frames, remaining)
+        if n != zeros.shape[0]:
+            zeros = np.zeros((n, int(num_channels)), dtype=dtype)
+        fout.write(zeros.tobytes(order="C"))
+        remaining -= n
+
+
+def concatenate_binary_files(
+    *,
+    dat_paths: list[Path | None],
+    output_dat_path: Path,
+    overwrite: bool,
+    dtype: str,
+    num_channels: int,
+    sample_counts: list[int] | None = None,
+) -> Path | None:
+    return _write_concatenated_sidecar_dat(
         dat_paths=dat_paths,
-        sampling_frequency=sampling_frequency,
+        output_dat_path=output_dat_path,
+        sampling_frequency=1.0,
         num_channels=num_channels,
         dtype=dtype,
+        overwrite=overwrite,
+        job_kwargs={},
+        sample_counts=sample_counts,
     )
-    rec_concat = si.concatenate_recordings(recs)
-    si.write_binary_recording(
-        rec_concat,
-        file_paths=str(output_dat_path),
-        add_file_extension=False,
-        dtype=dtype,
-        verbose=True,
-        **job_kwargs,
-    )
-    return output_dat_path
 
 
 def write_concatenated_dat_analogin(
     *,
-    dat_paths: list[Path],
+    dat_paths: list[Path | None],
     output_dat_path: Path,
     sampling_frequency: float,
     num_channels: int,
     overwrite: bool,
     job_kwargs: dict[str, Any],
+    sample_counts: list[int] | None = None,
 ) -> Path | None:
     return _write_concatenated_sidecar_dat(
         dat_paths=dat_paths,
@@ -380,17 +436,19 @@ def write_concatenated_dat_analogin(
         dtype="uint16",
         overwrite=overwrite,
         job_kwargs=job_kwargs,
+        sample_counts=sample_counts,
     )
 
 
 def write_concatenated_dat_digitalin(
     *,
-    dat_paths: list[Path],
+    dat_paths: list[Path | None],
     output_dat_path: Path,
     sampling_frequency: float,
     num_channels: int,
     overwrite: bool,
     job_kwargs: dict[str, Any],
+    sample_counts: list[int] | None = None,
 ) -> Path | None:
     return _write_concatenated_sidecar_dat(
         dat_paths=dat_paths,
@@ -400,6 +458,7 @@ def write_concatenated_dat_digitalin(
         dtype="uint16",
         overwrite=overwrite,
         job_kwargs=job_kwargs,
+        sample_counts=sample_counts,
     )
 
 

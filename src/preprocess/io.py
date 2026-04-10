@@ -904,9 +904,17 @@ def build_acquisition_catalog(
         if tdat.exists():
             time_paths.append(tdat)
 
-    aux_ch = _infer_channels_from_file(auxiliary_paths[0], sample_counts[0]) if auxiliary_paths else 0
-    supply_ch = _infer_channels_from_file(supply_paths[0], sample_counts[0]) if supply_paths else 0
-    adc_ch = _infer_channels_from_file(analogin_paths[0], sample_counts[0]) if analogin_paths else 0
+    sidecar_sample_counts = {p.parent: int(n) for p, n in zip(amplifier_paths, sample_counts, strict=True)}
+
+    def _infer_channels_for_sidecar(paths: list[Path]) -> int:
+        if not paths:
+            return 0
+        p = paths[0]
+        return _infer_channels_from_file(p, sidecar_sample_counts.get(p.parent, sample_counts[0]))
+
+    aux_ch = _infer_channels_for_sidecar(auxiliary_paths)
+    supply_ch = _infer_channels_for_sidecar(supply_paths)
+    adc_ch = _infer_channels_for_sidecar(analogin_paths)
     adc_native_orders: list[int] = []
 
     if intan_header is not None:
@@ -925,7 +933,7 @@ def build_acquisition_catalog(
     dig_word_ch = 0
     dig_native_orders: list[int] = []
     if digitalin_paths:
-        raw_words = _infer_channels_from_file(digitalin_paths[0], sample_counts[0])
+        raw_words = _infer_channels_for_sidecar(digitalin_paths)
         dig_word_ch = raw_words if raw_words > 0 else 1
         dig_ch = 16 if raw_words in (0, 1, 16) else raw_words
     if intan_header is not None:

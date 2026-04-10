@@ -351,9 +351,9 @@ def _build_empty_cell_row(n_cells: int, shape: tuple[int, int]) -> np.ndarray:
     return out
 
 
-def _build_openephys_digital_word_segment(ttl_path: Path, sample_count: int) -> np.ndarray:
+def _build_openephys_digital_word_segment(ttl_path: Path | None, sample_count: int) -> np.ndarray:
     segment = np.zeros(max(0, int(sample_count)), dtype=np.uint16)
-    if segment.size == 0 or not ttl_path.exists():
+    if segment.size == 0 or ttl_path is None or not ttl_path.exists():
         return segment
 
     sample_numbers_path = ttl_path / "sample_numbers.npy"
@@ -391,9 +391,10 @@ def _build_openephys_digital_word_segment(ttl_path: Path, sample_count: int) -> 
 
 
 def build_openephys_digital_word_signal(
-    ttl_paths: list[Path],
+    ttl_paths: list[Path | None],
     sample_counts: list[int],
 ) -> np.ndarray | None:
+    """Build a merged Open Ephys digital word, zero-filling epochs without TTL."""
     if not ttl_paths or not sample_counts:
         return None
     if len(ttl_paths) != len(sample_counts):

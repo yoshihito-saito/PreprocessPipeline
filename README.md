@@ -83,7 +83,16 @@ sorter_config_path=Path('sorter') / 'Kilosort4_config.yaml'
 - MATLAB integration:
   - MATLAB is not installed by `environment.yml`; it must be installed separately and available on the system path if you use MATLAB-dependent steps.
 
-### Kilosort1 on Windows
+### Kilosort1 MATLAB/CUDA compilation
+
+Compile the Kilosort1 copy bundled with this repository.
+
+Repository paths:
+
+- Kilosort1 root: `sorter/KiloSort1`
+- CUDA source and `mexGPUall.m`: `sorter/KiloSort1/CUDA`
+
+#### Windows
 
 If you need to compile Kilosort1 on a newer Windows PC, use an older MSVC toolset that is known to work with the legacy CUDA/MATLAB build.
 
@@ -94,8 +103,14 @@ If you need to compile Kilosort1 on a newer Windows PC, use an older MSVC toolse
    - Search for `MSVC`.
    - Enable `MSVC v143 - VS 2022 C++ x64/x86 build tools (v14.36-17.6)`.
 2. Open MATLAB.
-3. Edit `mexGPUall.m` in the Kilosort1 folder so that the `mexcuda` lines include `NVCC_FLAGS="-allow-unsupported-compiler"`.
-4. Run the modified commands:
+3. In MATLAB, go to this repository's Kilosort1 CUDA folder:
+
+```matlab
+cd(fullfile('<PreprocessPipeline repo root>', 'sorter', 'KiloSort1', 'CUDA'))
+```
+
+4. Edit this repository's `sorter/KiloSort1/CUDA/mexGPUall.m` so that the `mexcuda` lines include `NVCC_FLAGS="-allow-unsupported-compiler"`.
+5. Run the modified commands from `sorter/KiloSort1/CUDA`:
 
 ```matlab
 mexcuda -largeArrayDims mexMPmuFEAT.cu NVCC_FLAGS="-allow-unsupported-compiler"
@@ -103,7 +118,21 @@ mexcuda -largeArrayDims mexMPregMU.cu NVCC_FLAGS="-allow-unsupported-compiler"
 mexcuda -largeArrayDims mexWtW2.cu NVCC_FLAGS="-allow-unsupported-compiler"
 ```
 
+The generated `.mex*` files should remain under this repository's `sorter/KiloSort1/CUDA` folder so pipeline runs use the same compiled binaries.
 This is only needed for Kilosort1 MATLAB/CUDA compilation on Windows. It is not required for the base Python environment in `environment.yml`.
+
+#### Linux
+
+Visual Studio is not needed on Linux. Use a MATLAB-supported Linux C++ host compiler plus a CUDA toolkit version compatible with your MATLAB release.
+
+1. Compile this repository's Kilosort1 CUDA files from MATLAB:
+
+```matlab
+cd(fullfile('<PreprocessPipeline repo root>', 'sorter', 'KiloSort1', 'CUDA'))
+mexGPUall
+```
+
+The generated `.mexa64` files should remain under this repository's `sorter/KiloSort1/CUDA` folder.
 
 ## Pipeline Workflow
 
