@@ -4,35 +4,35 @@ A  preprocessing pipeline for spike sorting and neural data analysis.
 This project provides a streamlined workflow for loading raw electrophysiological recordings, applying preprocessing steps (such as filtering, artifact removal, and spike detection), and preparing data for downstream analysis or sorting algorithms.
 
 # ⚙️ Installation
-### Base environment
-```
-conda env create -f environment.yml
+Use the OS-specific setup command below. These commands create or update the `preprocess` conda environment and install PyTorch automatically, so you do not need to run `conda env create -f environment.yml` first.
+
+### Windows
+```bat
+setup_env_windows.bat
 conda activate preprocess
 ```
 
-### Rebuild with automatic PyTorch setup
+To fully rebuild the environment from scratch instead of updating it:
 
-- Windows:
-```bat
-setup_env_windows.bat
-```
-- Linux/macOS:
-```bash
-python scripts/setup_env.py
-```
-
-To fully rebuild an environment instead of updating an existing one:
-
-- Windows:
 ```bat
 setup_env_windows.bat --force-recreate
-```
-- Linux/macOS:
-```bash
-python scripts/setup_env.py --force-recreate
+conda activate preprocess
 ```
 
-The setup helper uses a different strategy on Windows to avoid the `conda-forge` plus `pip torch` OpenMP conflict:
+### Linux/macOS
+```bash
+python scripts/setup_env.py
+conda activate preprocess
+```
+
+To fully rebuild the environment from scratch instead of updating it:
+
+```bash
+python scripts/setup_env.py --force-recreate
+conda activate preprocess
+```
+
+Under the hood, the setup helper uses a different strategy on Windows to avoid the `conda-forge` plus `pip torch` OpenMP conflict:
 
 - Windows creates a minimal conda env from `environment.windows.yml`
 - PyTorch is installed first with `scripts/install_torch.py`
