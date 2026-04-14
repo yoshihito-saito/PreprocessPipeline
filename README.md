@@ -38,6 +38,14 @@ conda activate preprocess
 
 ## Optional Tools
 
+### marimo
+
+`marimo` is included in the `preprocess` environment, and `Run_preprocessSession.py` can be opened in marimo:
+
+```bash
+python -m marimo edit Run_preprocessSession.py
+```
+
 ### Phy GUI
 
 Install this only if you want to inspect or curate sorting results in the Phy GUI.

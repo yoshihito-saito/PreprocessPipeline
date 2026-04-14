@@ -15,5 +15,6 @@ dependencies:
   - pytest>=8
   - ipykernel>=6
   - jupyterlab>=4
+  - marimo
   - pip:
       - -e .

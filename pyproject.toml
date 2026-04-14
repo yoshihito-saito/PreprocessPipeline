@@ -26,6 +26,7 @@ dev = [
 notebook = [
     "ipykernel>=6",
     "jupyterlab>=4",
+    "marimo",
 ]
 
 [tool.setuptools.packages.find]

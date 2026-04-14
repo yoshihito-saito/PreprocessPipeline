@@ -16,6 +16,7 @@ env/
 
 # --- Jupyter ---
 .ipynb_checkpoints/
+__marimo__/
 
 # --- OS ---
 .DS_Store
