@@ -44,13 +44,6 @@ PyTorch wheel selection is automatic:
 - if `nvidia-smi` reports a supported NVIDIA CUDA level, the highest compatible `cu*` wheel is selected
 - if no supported GPU is detected, the installer falls back to CPU wheels
 - if you are replacing an older Windows environment, prefer `--force-recreate` so stale pip packages and DLLs do not survive the rebuild
-- you can override the choice with `--torch-channel`, for example:
-```bat
-setup_env_windows.bat --torch-channel cu124
-```
-```bash
-python scripts/setup_env.py --torch-channel cpu
-```
 
 - Phy GUI:
 ```bash
