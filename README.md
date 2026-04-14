@@ -70,13 +70,11 @@ Only needed if you want to compile the bundled Kilosort1 copy in `sorter/KiloSor
 
 1. Install Visual Studio 2022 with `MSVC v143 - VS 2022 C++ x64/x86 build tools (v14.36-17.6)`.
 2. In MATLAB, go to `sorter/KiloSort1/CUDA`.
-3. Edit `mexGPUall.m` so the `mexcuda` lines include `NVCC_FLAGS="-allow-unsupported-compiler"`.
-4. Run:
+3. Run:
 
 ```matlab
-mexcuda -largeArrayDims mexMPmuFEAT.cu NVCC_FLAGS="-allow-unsupported-compiler"
-mexcuda -largeArrayDims mexMPregMU.cu NVCC_FLAGS="-allow-unsupported-compiler"
-mexcuda -largeArrayDims mexWtW2.cu NVCC_FLAGS="-allow-unsupported-compiler"
+cd(fullfile('<PreprocessPipeline repo root>', 'sorter', 'KiloSort1', 'CUDA'))
+mexGPUall
 ```
 
 ### Linux
