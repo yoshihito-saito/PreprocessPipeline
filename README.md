@@ -8,14 +8,14 @@ Use the OS-specific setup command below. These commands create or update the `pr
 
 ### Windows
 ```bat
-setup_env_windows.bat
+.\setup_env_windows.bat
 conda activate preprocess
 ```
 
 To fully rebuild the environment from scratch instead of updating it:
 
 ```bat
-setup_env_windows.bat --force-recreate
+.\setup_env_windows.bat --force-recreate
 conda activate preprocess
 ```
 
@@ -59,7 +59,7 @@ pip install git+https://github.com/cortex-lab/phy.git
   4. If you use KlustaKwik on Windows, install `Visual C++ Redistributable for Visual Studio 2013`:
      - x64: `https://www.microsoft.com/en-us/download/details.aspx?id=40784`
 - Kilosort / Torch:
-  - the recommended path in this repository is `setup_env_windows.bat` on Windows or `python scripts/setup_env.py` on Linux/macOS
+  - the recommended path in this repository is `.\setup_env_windows.bat` on Windows PowerShell or `python scripts/setup_env.py` on Linux/macOS
   - on Windows the setup script keeps `conda`, but only for a minimal env; `torch`, `numpy`, `scipy`, and `spikeinterface` are then installed by `pip` to avoid mixed OpenMP runtimes
   - `scripts/install_torch.py` auto-selects a PyTorch wheel from the NVIDIA driver's reported CUDA compatibility and falls back to CPU when needed
   - manual wheel selection is still available if you need it:
