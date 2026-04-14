@@ -178,6 +178,15 @@ def _(mo):
 
 @app.cell
 def _(Path, PreprocessConfig, basepath, chanmap_path, local_output_dir):
+    import os
+
+    cpu_count = os.cpu_count() or 1
+    fallback_workers = max(1, cpu_count - 8)
+    requested_matlab_max_workers = 256
+    requested_n_jobs = 384
+    matlab_max_workers = requested_matlab_max_workers if cpu_count >= requested_matlab_max_workers else fallback_workers
+    n_jobs = requested_n_jobs if cpu_count >= requested_n_jobs else fallback_workers
+
     pre_config = PreprocessConfig(
         basepath=basepath,                         # Session source folder
         localpath=local_output_dir.parent,         # Parent directory for local output
@@ -233,7 +242,7 @@ def _(Path, PreprocessConfig, basepath, chanmap_path, local_output_dir):
         export_intermediate_dat=True,              # Save sidecar dat files (analogin/digitalin/etc)
 
         matlab_path=Path('/local/workdir/ys2375/MATLAB/R2024b/bin/matlab'),  # MATLAB executable
-        matlab_max_workers=256,  # Max parallel workers for MATLAB-based steps (e.g. Kilosort)
+        matlab_max_workers=matlab_max_workers,  # Use requested value unless CPU is lower, then cpu_count - 8
 
         # Sorter settings
         sorter='Kilosort',
@@ -256,7 +265,7 @@ def _(Path, PreprocessConfig, basepath, chanmap_path, local_output_dir):
 
         job_kwargs={
             "pool_engine": "process",              # Parallel backend
-            "n_jobs": 384,                          # Worker count
+            "n_jobs": n_jobs,                      # Use requested value unless CPU is lower, then cpu_count - 8
             "chunk_duration": "1s",
             "progress_bar": True,                  # Show progress bar
             "max_threads_per_worker": 1,           # Limit threads per worker
