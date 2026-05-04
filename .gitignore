@@ -41,3 +41,4 @@ tests
 PreprocessPipeline.code-workspace
 Sorting_comparison_KS.ipynb
 .codex
+.speedtest_workdir.bin
