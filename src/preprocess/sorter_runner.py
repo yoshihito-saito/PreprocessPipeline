@@ -1,12 +1,15 @@
 ﻿from __future__ import annotations
 
 import argparse
+import signal
+import subprocess
 from contextlib import contextmanager, nullcontext
 import json
 import os
 from pathlib import Path
 import shutil
 import sys
+import time
 from typing import Any
 import ast
 
@@ -23,9 +26,9 @@ from .recording import apply_preprocessing, attach_probe_from_chanmap, select_re
 
 def _default_parallel_n_jobs() -> int:
     cpu_count = os.cpu_count() or 1
-    if cpu_count <= 128:
-        return max(1, int(cpu_count) - 4)
-    return 128
+    fallback_workers = max(1, int(cpu_count) - 8)
+    requested_n_jobs = 128
+    return requested_n_jobs if cpu_count >= requested_n_jobs else fallback_workers
 
 
 _SORTER_ALIASES = {
@@ -981,6 +984,100 @@ def _patch_phy_outputs_for_raw_dat(
             hp_filtered=hp_filtered,
         )
 
+
+def _list_process_table() -> list[dict[str, Any]]:
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,cmd="],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return []
+
+    processes: list[dict[str, Any]] = []
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        processes.append({"pid": pid, "ppid": ppid, "cmd": parts[2]})
+    return processes
+
+
+def _find_sorter_runtime_root_pids(output_folder: Path) -> list[int]:
+    output_str = str(Path(output_folder).resolve())
+    roots: list[int] = []
+    for proc in _list_process_table():
+        cmd = str(proc.get("cmd", ""))
+        if output_str not in cmd:
+            continue
+        if (
+            "run_kilosort.sh" in cmd
+            or "kilosort_master(" in cmd
+            or ".matlab_shim/matlab" in cmd
+        ):
+            roots.append(int(proc["pid"]))
+    return sorted(set(roots))
+
+
+def _collect_descendant_pids(root_pids: list[int]) -> list[int]:
+    if not root_pids:
+        return []
+    by_ppid: dict[int, list[int]] = {}
+    for proc in _list_process_table():
+        by_ppid.setdefault(int(proc["ppid"]), []).append(int(proc["pid"]))
+
+    seen: set[int] = set()
+    stack = list(root_pids)
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        stack.extend(by_ppid.get(pid, []))
+    return sorted(seen)
+
+
+def _kill_processes(pids: list[int], sig: int) -> None:
+    for pid in pids:
+        try:
+            os.kill(int(pid), sig)
+        except ProcessLookupError:
+            continue
+        except Exception:
+            continue
+
+
+def _cleanup_sorter_runtime_processes(output_folder: Path, *, wait_timeout_s: float = 5.0) -> None:
+    root_pids = _find_sorter_runtime_root_pids(output_folder)
+    if not root_pids:
+        return
+
+    target_pids = _collect_descendant_pids(root_pids)
+    if not target_pids:
+        return
+
+    _kill_processes(list(reversed(target_pids)), signal.SIGTERM)
+    deadline = time.time() + float(wait_timeout_s)
+    while time.time() < deadline:
+        survivors = [pid for pid in target_pids if Path(f"/proc/{pid}").exists()]
+        if not survivors:
+            return
+        time.sleep(0.2)
+
+    survivors = [pid for pid in target_pids if Path(f"/proc/{pid}").exists()]
+    if survivors:
+        _kill_processes(list(reversed(survivors)), signal.SIGKILL)
+
 def _flatten_sorter_output_folder(output_folder: Path) -> None:
     sorter_output = output_folder / "sorter_output"
     if not sorter_output.exists() or not sorter_output.is_dir():
@@ -1455,6 +1552,9 @@ def execute_sorting_job(
             f"Kilosort failed ({cause}). "
             f"Check MATLAB log at: {matlab_log}, then re-run the cell.{hint}\nOriginal error: {err}"
         ) from err
+    finally:
+        if sorter_input in _MATLAB_SORTER_INPUTS:
+            _cleanup_sorter_runtime_processes(output_folder)
     _flatten_sorter_output_folder(output_folder)
     _patch_phy_outputs_for_raw_dat(
         output_folder=output_folder,

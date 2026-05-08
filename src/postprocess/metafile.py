@@ -8,9 +8,9 @@ from typing import Any
 
 def _default_parallel_n_jobs() -> int:
     cpu_count = os.cpu_count() or 1
-    if cpu_count <= 128:
-        return max(1, int(cpu_count) - 4)
-    return 128
+    fallback_workers = max(1, int(cpu_count) - 8)
+    requested_n_jobs = 128
+    return requested_n_jobs if cpu_count >= requested_n_jobs else fallback_workers
 
 
 @dataclass
