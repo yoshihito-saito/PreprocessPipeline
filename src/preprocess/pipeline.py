@@ -599,6 +599,11 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             recording_raw=recording_preprocessed,
             selected_channel_ids=bad_0,
         )
+    output_n_channels = (
+        int(recording_preprocessed.get_num_channels())
+        if hasattr(recording_preprocessed, "get_num_channels")
+        else int(effective_n_channels)
+    )
     dat_path: Path | None = output_dir / f"{basename}.dat"
     write_concatenated_dat(
         recording=recording_preprocessed,
@@ -637,7 +642,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         dat_dtype=config.dtype,
         sr=effective_sr,
         sr_lfp=(xml_meta.sr_lfp if xml_meta.sr_lfp is not None else config.lfp_fs),
-        n_channels=effective_n_channels,
+        n_channels=output_n_channels,
         bad_channels_1based=bad_1,
         merge_data=merge_data,
         xml_meta=session_xml_meta,
@@ -743,7 +748,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         analog_event_paths=analog_event_paths,
         digital_event_paths=digital_event_paths,
         intermediate_dat_paths=intermediate_dat_paths,
-        n_channels=effective_n_channels,
+        n_channels=output_n_channels,
         sr=effective_sr,
         sr_lfp=config.lfp_fs if config.make_lfp else None,
         bad_channels_0based=bad_0,
