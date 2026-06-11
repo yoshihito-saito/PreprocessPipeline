@@ -1078,6 +1078,20 @@ def _cleanup_sorter_runtime_processes(output_folder: Path, *, wait_timeout_s: fl
     if survivors:
         _kill_processes(list(reversed(survivors)), signal.SIGKILL)
 
+
+def _trace_sorter_stage(
+    stage: str,
+    *,
+    output_folder: Path,
+    sorter_name: str,
+) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    runtime_root_pids = _find_sorter_runtime_root_pids(output_folder)
+    print(
+        f"[sorter-trace {timestamp}] {stage} "
+        f"sorter={sorter_name} output_folder={output_folder} runtime_root_pids={runtime_root_pids}"
+    )
+
 def _flatten_sorter_output_folder(output_folder: Path) -> None:
     sorter_output = output_folder / "sorter_output"
     if not sorter_output.exists() or not sorter_output.is_dir():
@@ -1503,9 +1517,24 @@ def execute_sorting_job(
             )
         else:
             override_ctx = nullcontext()
+        _trace_sorter_stage(
+            "before ss.run_sorter",
+            output_folder=output_folder,
+            sorter_name=sorter_name,
+        )
         with override_ctx:
             _ = ss.run_sorter(**run_kwargs)
+        _trace_sorter_stage(
+            "after ss.run_sorter",
+            output_folder=output_folder,
+            sorter_name=sorter_name,
+        )
     except Exception as err:
+        _trace_sorter_stage(
+            f"ss.run_sorter raised {type(err).__name__}",
+            output_folder=output_folder,
+            sorter_name=sorter_name,
+        )
         if sorter_input not in _MATLAB_SORTER_INPUTS:
             raise RuntimeError(
                 f"Sorting failed for sorter={sorter_name}. Original error: {err}"
@@ -1554,7 +1583,17 @@ def execute_sorting_job(
         ) from err
     finally:
         if sorter_input in _MATLAB_SORTER_INPUTS:
+            _trace_sorter_stage(
+                "before runtime cleanup",
+                output_folder=output_folder,
+                sorter_name=sorter_name,
+            )
             _cleanup_sorter_runtime_processes(output_folder)
+            _trace_sorter_stage(
+                "after runtime cleanup",
+                output_folder=output_folder,
+                sorter_name=sorter_name,
+            )
     _flatten_sorter_output_folder(output_folder)
     _patch_phy_outputs_for_raw_dat(
         output_folder=output_folder,
@@ -1567,6 +1606,11 @@ def execute_sorting_job(
     print(
         "Patched output metadata for raw.dat compatibility: "
         f"n_channels_dat={int(nch)}, active={len(resolved_active_channels_0based)}"
+    )
+    _trace_sorter_stage(
+        "before return output folder",
+        output_folder=output_folder,
+        sorter_name=sorter_name,
     )
     print("Sorter finished")
     return output_folder
