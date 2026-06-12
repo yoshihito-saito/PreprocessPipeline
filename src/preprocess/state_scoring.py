@@ -31,7 +31,7 @@ Algorithm overview (high level)
 5) Thresholding (histogram dip logic)
    - Estimate `swthresh`, `EMGthresh`, `THthresh` from histogram valleys.
    - Initial state assignment:
-     - NREM: SW above threshold
+     - NREM: SW above threshold (optionally excluding high EMG)
      - REM: not NREM, low EMG, high theta
      - WAKE: remaining points
 
@@ -1643,6 +1643,7 @@ def _suppress_wake_to_rem_transitions(
     timestamps: np.ndarray,
     *,
     min_wake_before_rem_secs: float = 0.0,
+    preserve_rem_interruption: bool = True,
 ) -> np.ndarray:
     arr = np.asarray(states, dtype=np.uint8).reshape(-1).copy()
     ts = np.asarray(timestamps, dtype=np.float64).reshape(-1)
@@ -1657,8 +1658,11 @@ def _suppress_wake_to_rem_transitions(
             w_start = i - 1
             while w_start - 1 >= 0 and arr[w_start - 1] == 1:
                 w_start -= 1
+            if bool(preserve_rem_interruption) and w_start > 0 and arr[w_start - 1] == 5:
+                i += 1
+                continue
             wake_dur = float(ts[i - 1] - ts[w_start]) if i - 1 >= w_start else 0.0
-            if wake_dur < min_wake:
+            if wake_dur <= min_wake:
                 i += 1
                 continue
             j = i + 1
@@ -1669,6 +1673,29 @@ def _suppress_wake_to_rem_transitions(
             continue
         i += 1
     return arr
+
+
+def _classify_sleep_states(
+    *,
+    broadband: np.ndarray,
+    thratio: np.ndarray,
+    emg: np.ndarray,
+    swthresh: float,
+    emgthresh: float,
+    ththresh: float,
+    use_emg_nrem: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    sw_high = np.asarray(broadband, dtype=np.float64).reshape(-1) > float(swthresh)
+    high_theta = np.asarray(thratio, dtype=np.float64).reshape(-1) > float(ththresh)
+    high_emg = np.asarray(emg, dtype=np.float64).reshape(-1) > float(emgthresh)
+    emg_forced_wake = sw_high & high_emg if bool(use_emg_nrem) else np.zeros(sw_high.shape, dtype=bool)
+    if bool(use_emg_nrem):
+        nrem = sw_high & (~high_emg)
+    else:
+        nrem = sw_high
+    rem = (~nrem) & (~high_emg) & high_theta
+    wake = (~nrem) & (~rem)
+    return nrem, rem, wake, emg_forced_wake
 
 
 def _compute_sleep_state(
@@ -1687,7 +1714,9 @@ def _compute_sleep_state(
     state_ignore_manual: bool,
     state_save_lfp_mat: bool,
     emg_th_alpha: float,
+    use_emg_nrem: bool,
     min_state_length: float,
+    microarousal_sec: float,
     block_wake_to_rem: bool,
     overwrite: bool,
     pss_cache: dict[tuple[Any, ...], dict[str, np.ndarray]] | None = None,
@@ -1855,11 +1884,20 @@ def _compute_sleep_state(
             numbins += 1
     ththresh = _find_hist_dip_threshold_between(thhist, thhistbins, th_locs) if numpeaks == 2 else 0.0
 
-    nrem = broadband > swthresh
-    high_theta = thratio > ththresh
-    high_emg = emg_interp > emgthresh
-    rem = (~nrem) & (~high_emg) & high_theta
-    wake = (~nrem) & (~rem)
+    nrem, rem, wake, emg_forced_wake = _classify_sleep_states(
+        broadband=broadband,
+        thratio=thratio,
+        emg=emg_interp,
+        swthresh=swthresh,
+        emgthresh=emgthresh,
+        ththresh=ththresh,
+        use_emg_nrem=use_emg_nrem,
+    )
+    emg_forced_wake_int = (
+        _intervals_from_mask(emg_forced_wake, t_clus)
+        if bool(use_emg_nrem) and np.any(emg_forced_wake)
+        else np.empty((0, 2), dtype=np.float64)
+    )
 
     states = np.zeros((t_clus.size,), dtype=np.uint8)
     states[wake] = 1
@@ -1873,12 +1911,7 @@ def _compute_sleep_state(
     idx_timestamps = np.asarray(idx_round["timestamps"], dtype=np.float64).reshape(-1)
 
     min_len = float(max(0.0, min_state_length))
-    if block_wake_to_rem:
-        states = _suppress_wake_to_rem_transitions(
-            states,
-            idx_timestamps,
-            min_wake_before_rem_secs=min_len,
-        )
+    microarousal_len = float(max(0.0, microarousal_sec))
     ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
 
     # Minimum interruption passes (approximation of ClusterStates_DetermineStates)
@@ -1937,6 +1970,17 @@ def _compute_sleep_state(
     if short_nrem2.size and np.any(short_nrem2):
         _assign_state_on_intervals(states, idx_timestamps, nrem_int[short_nrem2], 1)
 
+    if block_wake_to_rem:
+        states = _suppress_wake_to_rem_transitions(
+            states,
+            idx_timestamps,
+            min_wake_before_rem_secs=microarousal_len,
+            preserve_rem_interruption=True,
+        )
+
+    if emg_forced_wake_int.size:
+        _assign_state_on_intervals(states, idx_timestamps, emg_forced_wake_int, 1)
+
     ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
 
     statenames = np.asarray(statename_list, dtype=object).reshape(1, -1)
@@ -1970,6 +2014,7 @@ def _compute_sleep_state(
         "broadbandSlowWave": np.asarray(broadband, dtype=np.float64).reshape(-1, 1),
         "thratio": np.asarray(thratio, dtype=np.float64).reshape(-1, 1),
         "EMG": np.asarray(emg_interp, dtype=np.float64).reshape(-1, 1),
+        "EMGForcedWake": np.asarray(emg_forced_wake, dtype=np.uint8).reshape(-1, 1),
         "t_clus": np.asarray(t_clus, dtype=np.float64).reshape(-1, 1),
         "badtimes": (np.asarray(badtimes, dtype=np.float64) + 1.0).reshape(-1, 1),
         "badtimes_TH": (np.asarray(badtimes_th, dtype=np.float64) + 1.0).reshape(-1, 1),
@@ -1998,6 +2043,7 @@ def _compute_sleep_state(
         "ignoretime": np.asarray(ignoretime, dtype=np.float64).reshape(-1, 2) if np.asarray(ignoretime).size else np.empty((0,), dtype=np.uint8),
         "noPrompts": True,
         "EMGthAlpha": float(emg_th_alpha),
+        "useEMG_NREM": bool(use_emg_nrem),
         "Notch60Hz": np.uint8(0),
         "NotchHVS": np.uint8(0),
         "NotchTheta": np.uint8(0),
@@ -2010,6 +2056,7 @@ def _compute_sleep_state(
         "scoretime": np.asarray([0.0, np.inf], dtype=np.float64),
         "stickytrigger": bool(sticky_trigger),
         "minStateLength": float(min_len),
+        "microarousalSec": float(microarousal_len),
         "blockWakeToREM": bool(block_wake_to_rem),
         "SWChannels": np.asarray(sw_channels_1based if sw_channels_1based is not None else [0]).reshape(-1),
         "SWWeightsName": "PSS",
@@ -2292,7 +2339,13 @@ def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, An
     return [p_results, p_2d, p_3d]
 
 
-def _states_to_episodes(sleep_state: dict[str, Any], basepath: Path, basename: str) -> tuple[dict[str, Any], Path]:
+def _states_to_episodes(
+    sleep_state: dict[str, Any],
+    basepath: Path,
+    basename: str,
+    *,
+    microarousal_sec: float = 100.0,
+) -> tuple[dict[str, Any], Path]:
     ints = sleep_state.get("ints", {})
     nrem = np.asarray(ints.get("NREMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
     wake = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
@@ -2302,7 +2355,7 @@ def _states_to_episodes(sleep_state: dict[str, Any], basepath: Path, basename: s
     min_w_episode = 20.0
     min_n_episode = 20.0
     min_r_episode = 20.0
-    max_micro = 100.0
+    max_micro = float(max(0.0, microarousal_sec))
     max_w_interrupt = 40.0
     max_n_interrupt = max_micro
     max_r_interrupt = 40.0
@@ -2532,13 +2585,20 @@ def run_state_scoring(
         state_ignore_manual=config.state_ignore_manual,
         state_save_lfp_mat=config.state_save_lfp_mat,
         emg_th_alpha=float(config.emg_th_alpha),
+        use_emg_nrem=bool(config.useEMG_NREM),
         min_state_length=float(config.state_min_state_length),
+        microarousal_sec=float(config.state_microarousal_sec),
         block_wake_to_rem=bool(config.state_block_wake_to_rem),
         overwrite=config.overwrite,
         pss_cache=pss_cache,
     )
     fig_paths = _save_state_figures(basepath, basename, sleep_state)
-    episodes, episodes_path = _states_to_episodes(sleep_state, basepath, basename)
+    episodes, episodes_path = _states_to_episodes(
+        sleep_state,
+        basepath,
+        basename,
+        microarousal_sec=float(config.state_microarousal_sec),
+    )
     if not episodes:
         warnings.warn("Failed to build SleepStateEpisodes.", RuntimeWarning, stacklevel=2)
     sleep_state, sleep_state_path = _append_theta_epochs(sleep_state, basepath, basename)

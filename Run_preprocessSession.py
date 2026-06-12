@@ -182,8 +182,8 @@ def _(Path, PreprocessConfig, basepath, chanmap_path, local_output_dir):
 
     cpu_count = os.cpu_count() or 1
     fallback_workers = max(1, cpu_count - 8)
-    requested_matlab_max_workers = 256
-    requested_n_jobs = 384
+    requested_matlab_max_workers = 128
+    requested_n_jobs = 128
     matlab_max_workers = requested_matlab_max_workers if cpu_count >= requested_matlab_max_workers else fallback_workers
     n_jobs = requested_n_jobs if cpu_count >= requested_n_jobs else fallback_workers
 
@@ -233,7 +233,9 @@ def _(Path, PreprocessConfig, basepath, chanmap_path, local_output_dir):
         theta_channels=None,                       # Optional theta channels (0-based)
         state_block_wake_to_rem=False,             # Block direct wake->REM transitions
         state_min_state_length=6.0,                # Minimum state duration (s)
+        state_microarousal_sec=100.0,              # Wake <= this is treated as microarousal/interruption
         emg_th_alpha=1,                            # EMG threshold alpha (higher=stricter)
+        useEMG_NREM=True,                          # Require low EMG for NREM; high EMG stays awake
 
 
         chanmap_mat_path=chanmap_path,             # chanMap .mat for geometry + bad channels
@@ -675,5 +677,3 @@ def _():
 
 if __name__ == "__main__":
     app.run()
-
-

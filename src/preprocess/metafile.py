@@ -63,7 +63,9 @@ class PreprocessConfig:
     state_sticky_trigger: bool = False
     state_winparms: tuple[float, float] = (2.0, 15.0)
     emg_th_alpha: float = 1.0
+    useEMG_NREM: bool = False
     state_min_state_length: float = 6.0
+    state_microarousal_sec: float = 100.0
     state_block_wake_to_rem: bool = False
 
     analog_inputs: bool = False
