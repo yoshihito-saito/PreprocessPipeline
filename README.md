@@ -100,6 +100,12 @@ For VS Code Remote sessions, run the same launcher in the remote terminal. If VS
 
 If port `8765` is busy, the GUI automatically tries the next available port and prints the actual URL.
 
+To use a specific GUI default parameter file:
+
+```bash
+python launch_gui.py --config config/preprocess_gui_default_config.json
+```
+
 Advanced direct command:
 
 ```bash
