@@ -8,6 +8,29 @@ PreprocessPipeline is a preprocessing and postprocessing pipeline for spike sort
 
 Run the command for your OS, then activate the environment.
 
+### Locked Environment
+
+For the current working server environment, use the lock files in `env_locks/`.
+This is the safest option when NumPy/SciPy dependency changes cause errors.
+
+Files:
+
+- `env_locks/environment-linux-64.lock.yml`: full conda export including pip packages.
+- `env_locks/conda-linux-64.explicit.txt`: exact conda package URLs for linux-64.
+- `env_locks/pip-freeze.txt`: raw `pip freeze` output for auditing.
+
+Linux exact recreate:
+
+```bash
+conda env create -n preprocess-locked -f env_locks/environment-linux-64.lock.yml
+conda activate preprocess-locked
+python -m pip install -e .
+```
+
+Known working core versions are Python `3.11.14`, NumPy `1.26.4`, SciPy
+`1.16.3`, Numba `0.62.1`, llvmlite `0.45.1`, SpikeInterface `0.103.2`, and
+PySide6 `6.9.2`.
+
 ### Windows
 
 ```powershell
