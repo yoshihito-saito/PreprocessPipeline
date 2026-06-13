@@ -419,6 +419,73 @@ def _probe_assignments_from_chanmap_data(data: dict[str, Any]) -> list[dict[str,
     return assignments
 
 
+def _normalize_probe_assignments_for_compare(
+    assignments: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for probe in assignments or []:
+        groups = [int(group) for group in probe.get("groups", [])]
+        normalized.append(
+            {
+                "type": str(probe.get("type", "staggered")),
+                "groups": groups,
+                "x_offset": int(round(float(probe.get("x_offset", 0) or 0))),
+            }
+        )
+    return normalized
+
+
+def _probe_assignments_json_from_chanmap(path: Path) -> list[dict[str, Any]] | None:
+    data = loadmat(path)
+    raw_json = data.get("probe_assignments_json")
+    if raw_json is None:
+        return None
+    text = _decode_matlab_string(raw_json)
+    if not text:
+        return None
+    loaded = json.loads(text)
+    if not isinstance(loaded, list):
+        return None
+    return loaded
+
+
+def _chanmap_has_current_gui_settings(
+    path: Path,
+    settings: PipelineGuiSettings,
+) -> bool:
+    try:
+        existing = loadmat(path)
+        stored = _probe_assignments_json_from_chanmap(path)
+    except Exception:
+        return False
+    if _normalize_probe_assignments_for_compare(
+        stored
+    ) != _normalize_probe_assignments_for_compare(settings.preprocess.probe_assignments):
+        return False
+
+    basepath = settings.basepath_path
+    if basepath is None:
+        return False
+    expected = build_channel_map_data(
+        basepath=basepath,
+        basename=settings.basename,
+        probe_assignments=settings.preprocess.probe_assignments,
+        reject_channels=settings.preprocess.reject_channels,
+    )
+    if expected is None:
+        return False
+
+    for key in ("chanMap0ind", "connected", "xcoords", "ycoords", "kcoords", "probe_ids"):
+        if key not in existing or key not in expected:
+            return False
+        left = np.asarray(existing[key]).reshape(-1)
+        right = np.asarray(expected[key]).reshape(-1)
+        if left.shape != right.shape or not np.allclose(left, right, equal_nan=True):
+            return False
+    return True
+
+
+
 def _infer_probe_assignments_from_geometry(
     kcoords: np.ndarray, xcoords: np.ndarray
 ) -> list[dict[str, Any]]:
@@ -508,30 +575,51 @@ def _postprocess_config_from_preprocess_result(
     return post_config
 
 
+def _ensure_gui_chanmap_for_preprocess(settings: PipelineGuiSettings) -> Path:
+    if settings.basepath_path is None:
+        raise ValueError("basepath is required.")
+
+    chanmap_path = settings.resolved_chanmap_path()
+    if (
+        chanmap_path is not None
+        and chanmap_path.exists()
+        and _chanmap_has_current_gui_settings(chanmap_path, settings)
+    ):
+        settings.chanmap_path = str(chanmap_path)
+        print(f"Using chanMap: {chanmap_path}")
+        return chanmap_path
+
+    if chanmap_path is None or not chanmap_path.exists():
+        print("chanMap is missing; generating before preprocess.")
+    else:
+        print(
+            "Existing chanMap has no GUI probe assignment metadata or differs from "
+            "the current GUI settings; regenerating local chanMap before preprocess."
+        )
+
+    basepath, basename, local_output_dir, _xml_path = select_paths_with_gui(
+        use_gui=False,
+        manual_basepath=settings.basepath_path,
+        local_root=settings.local_root_path,
+    )
+    generated_path, bad_channels = prepare_chanmap(
+        basepath=basepath,
+        basename=basename,
+        local_output_dir=local_output_dir,
+        probe_assignments=settings.preprocess.probe_assignments,
+        reject_channels=settings.preprocess.reject_channels,
+    )
+    settings.chanmap_path = str(generated_path)
+    print(f"Generated chanMap: {generated_path}")
+    print(f"Bad channels: {bad_channels}")
+    return generated_path
+
+
 def _run_pipeline(settings: PipelineGuiSettings, mode: RunMode) -> dict[str, Any]:
     payload: dict[str, Any] = {"mode": mode}
     pre_result = None
     if mode in ("all", "preprocess"):
-        if settings.basepath_path is None:
-            raise ValueError("basepath is required.")
-        chanmap_path = settings.resolved_chanmap_path()
-        if chanmap_path is None or not chanmap_path.exists():
-            print("chanMap is missing; generating before preprocess.")
-            basepath, basename, local_output_dir, _xml_path = select_paths_with_gui(
-                use_gui=False,
-                manual_basepath=settings.basepath_path,
-                local_root=settings.local_root_path,
-            )
-            chanmap_path, bad_channels = prepare_chanmap(
-                basepath=basepath,
-                basename=basename,
-                local_output_dir=local_output_dir,
-                probe_assignments=settings.preprocess.probe_assignments,
-                reject_channels=settings.preprocess.reject_channels,
-            )
-            settings.chanmap_path = str(chanmap_path)
-            print(f"Generated chanMap: {chanmap_path}")
-            print(f"Bad channels: {bad_channels}")
+        _ensure_gui_chanmap_for_preprocess(settings)
         pre_result = run_preprocess_session(settings.to_preprocess_config())
         payload["preprocess_result"] = _preprocess_result_summary(pre_result)
 
@@ -1143,6 +1231,7 @@ INDEX_HTML = r"""<!doctype html>
     let configBrowserMode = "load";
     let lastAppliedChanmapPath = null;
     let chanmapZoom = 1;
+    let runWasRunning = false;
 
     async function api(path, body=null) {
       const opts = body ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)} : {};
@@ -1157,6 +1246,22 @@ INDEX_HTML = r"""<!doctype html>
     function num(x) { return Number(id(x).value); }
     function intList(text) { return text.split(',').map(s => s.trim()).filter(Boolean).map(Number); }
     function jsString(value) { return String(value).replaceAll("\\", "\\\\").replaceAll("'", "\\'"); }
+    function cloneSettings(value) { return JSON.parse(JSON.stringify(value)); }
+    function resetChanmapAutoload() { lastAppliedChanmapPath = null; }
+    function isChanmapContextField(target) {
+      return target && ['basepath', 'local_root', 'sorting_phy_folder', 'sorting_search_root'].includes(target.id);
+    }
+    function mergeDefaultSettingsWithSession(defaultSettings, currentSettings) {
+      const merged = cloneSettings(defaultSettings);
+      merged.basepath = currentSettings.basepath || '';
+      merged.local_root = currentSettings.local_root || '';
+      merged.chanmap_path = currentSettings.chanmap_path || '';
+      merged.postprocess = merged.postprocess || {};
+      const currentPost = currentSettings.postprocess || {};
+      merged.postprocess.sorting_phy_folder = currentPost.sorting_phy_folder || '';
+      merged.postprocess.sorting_search_root = currentPost.sorting_search_root || '';
+      return merged;
+    }
     const probeTypes = ['middle_finger', 'staggered', 'poly2', 'poly3', 'poly5', 'linear', 'neurogrid', 'double_sided', 'NeuroPixel'];
     const noiseThresholdKeys = [
       'isi_violations_ratio_gt',
@@ -1345,7 +1450,7 @@ INDEX_HTML = r"""<!doctype html>
         }
       };
     }
-    function applySettings(s) {
+    function applySettings(s, refresh = true) {
       settings = s;
       id('basepath').value = s.basepath || '';
       id('local_root').value = s.local_root || '';
@@ -1377,7 +1482,7 @@ INDEX_HTML = r"""<!doctype html>
       for (const k of ['duplicate_censored_period_ms','duplicate_threshold','merge_min_spikes','merge_corr_diff_thresh','merge_template_diff_thresh','split_contamination','split_wf_threshold','split_wf_n_chans','split_amp_mad_scale']) id(k).value = pp[k];
       applyNoiseThresholds(pp.noise_thresholds || {});
       id('split_threshold_mode').value = pp.split_threshold_mode; id('post_overwrite').checked = !!pp.overwrite; id('post_worker_count').value = pp.worker_count;
-      refreshPreview();
+      if (refresh) refreshPreview();
     }
     function showTab(name) {
       document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
@@ -1398,7 +1503,9 @@ INDEX_HTML = r"""<!doctype html>
           await refreshPreview();
           return;
         }
-        const lines = [`Basepath: ${s.basepath || '-'}`, `Basename: ${data.basename || '-'}`, `Local output: ${data.local_output_dir || '-'}`, `chanMap target: ${data.chanmap.path || '-'}`, '', 'Preflight:'];
+        const lines = [`Basepath: ${s.basepath || '-'}`, `Basename: ${data.basename || '-'}`, `Local output: ${data.local_output_dir || '-'}`, `chanMap target: ${data.chanmap.path || '-'}`];
+        if (existing.exists && existing.path) lines.push(`Existing chanMap loaded from: ${existing.path}`);
+        lines.push('', 'Preflight:');
         for (const c of data.checks) lines.push(`[${c.status.toUpperCase()}] ${c.label}: ${c.detail}`);
         if (data.chanmap.exists) {
           lines.push('', `chanMap channels=${data.chanmap.channels}, connected=${data.chanmap.connected}, bad=${data.chanmap.bad_count}`);
@@ -1433,6 +1540,7 @@ INDEX_HTML = r"""<!doctype html>
           return;
         }
         await api('/api/run', {settings: current, mode});
+        runWasRunning = true;
       } catch (e) { alert(e.message); }
     }
     async function moveToBasepath() {
@@ -1486,6 +1594,13 @@ INDEX_HTML = r"""<!doctype html>
         const data = await api('/api/log');
         id('log').textContent = data.log || '';
         id('log').scrollTop = id('log').scrollHeight;
+        if (data.running) {
+          runWasRunning = true;
+        } else if (runWasRunning) {
+          runWasRunning = false;
+          resetChanmapAutoload();
+          refreshPreview();
+        }
       } catch (e) {}
       setTimeout(pollLog, 1500);
     }
@@ -1500,8 +1615,12 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const url = path ? '/api/defaults?path=' + encodeURIComponent(path) : '/api/defaults';
         const data = await api(url);
-        applySettings(data.settings);
+        const current = settings ? collectSettings() : null;
+        const nextSettings = current ? mergeDefaultSettingsWithSession(data.settings, current) : data.settings;
+        resetChanmapAutoload();
+        applySettings(nextSettings, false);
         id('preview').textContent = `${data.exists ? 'Loaded' : 'Using built-in'} default config:\n${data.path}`;
+        await refreshPreview();
       } catch (e) { alert(e.message); }
     }
     function sorterChanged() {
@@ -1523,7 +1642,14 @@ INDEX_HTML = r"""<!doctype html>
       id('dirlist').innerHTML = data.dirs.map(d => `<button class="dirrow" onclick="loadDirs('${jsString(d)}')">${d}</button>`).join('');
     }
     function browseUp() { loadDirs(currentBrowsePath.split('/').slice(0, -1).join('/') || '/'); }
-    function chooseCurrentDir() { if (browseTarget) id(browseTarget).value = currentBrowsePath; closeBrowser(); refreshPreview(); }
+    function chooseCurrentDir() {
+      if (browseTarget) {
+        id(browseTarget).value = currentBrowsePath;
+        if (['basepath', 'local_root', 'sorting_phy_folder', 'sorting_search_root'].includes(browseTarget)) resetChanmapAutoload();
+      }
+      closeBrowser();
+      refreshPreview();
+    }
     async function openConfigBrowser(mode) {
       configBrowserMode = mode;
       id('config_confirm').textContent = mode === 'save' ? 'Save' : 'Load';
@@ -1549,8 +1675,16 @@ INDEX_HTML = r"""<!doctype html>
         await loadDefaultConfig(path);
       }
     }
-    document.addEventListener('input', (e) => { if (e.target.id === 'run_sorter') updateSorterEnabled(); if (e.target.matches('input,select,textarea')) refreshPreview(); });
-    document.addEventListener('change', (e) => { if (e.target.id === 'run_sorter') updateSorterEnabled(); if (e.target.matches('input,select,textarea')) refreshPreview(); });
+    document.addEventListener('input', (e) => {
+      if (e.target.id === 'run_sorter') updateSorterEnabled();
+      if (isChanmapContextField(e.target)) resetChanmapAutoload();
+      if (e.target.matches('input,select,textarea')) refreshPreview();
+    });
+    document.addEventListener('change', (e) => {
+      if (e.target.id === 'run_sorter') updateSorterEnabled();
+      if (isChanmapContextField(e.target)) resetChanmapAutoload();
+      if (e.target.matches('input,select,textarea')) refreshPreview();
+    });
     installChanmapWheelZoom();
     installChanmapDragPan();
     api('/api/defaults').then(data => applySettings(data.settings)); pollLog();
