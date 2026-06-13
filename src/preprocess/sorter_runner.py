@@ -492,11 +492,21 @@ def _get_active_channel_count(chanmap_mat_path: Path | None, num_channels: int) 
         return int(num_channels)
     try:
         mat = loadmat(str(chanmap_mat_path), simplify_cells=True)
+        chanmap_raw = mat.get("chanMap0ind", mat.get("chanMap", None))
+        if chanmap_raw is not None:
+            chanmap = np.asarray(chanmap_raw).reshape(-1).astype(np.int64)
+            if "chanMap0ind" not in mat:
+                chanmap = chanmap - 1
+            valid = (chanmap >= 0) & (chanmap < int(num_channels))
+        else:
+            valid = np.ones((int(num_channels),), dtype=bool)
         connected = mat.get("connected")
         if connected is None:
-            return int(num_channels)
-        connected_arr = (connected > 0).astype(int)
-        active = int(connected_arr.sum())
+            active = int(np.count_nonzero(valid))
+            return active if active > 0 else int(num_channels)
+        connected_arr = (np.asarray(connected).reshape(-1).astype(float) > 0)
+        n = min(valid.size, connected_arr.size)
+        active = int(np.count_nonzero(valid[:n] & connected_arr[:n]))
         return active if active > 0 else int(num_channels)
     except Exception:
         return int(num_channels)
@@ -886,11 +896,13 @@ def _resolve_active_channels_0based(
     if chanmap_mat_path is not None and chanmap_mat_path.exists():
         try:
             mat = loadmat(str(chanmap_mat_path), simplify_cells=True)
-            chanmap_raw = mat.get("chanMap", None)
+            chanmap_raw = mat.get("chanMap0ind", mat.get("chanMap", None))
             connected_raw = mat.get("connected", None)
 
             if chanmap_raw is not None:
-                chanmap = np.asarray(chanmap_raw).reshape(-1).astype(np.int64) - 1
+                chanmap = np.asarray(chanmap_raw).reshape(-1).astype(np.int64)
+                if "chanMap0ind" not in mat:
+                    chanmap = chanmap - 1
                 chanmap = chanmap[(chanmap >= 0) & (chanmap < int(num_channels))]
             else:
                 chanmap = np.arange(int(num_channels), dtype=np.int64)
@@ -983,6 +995,31 @@ def _patch_phy_outputs_for_raw_dat(
             n_channels_dat=n_channels_dat,
             hp_filtered=hp_filtered,
         )
+
+
+def _patch_channel_map_for_raw_dat(
+    *,
+    output_folder: Path,
+    active_channels_0based: list[int],
+    n_channels_dat: int,
+) -> None:
+    active = np.asarray(active_channels_0based, dtype=np.int64)
+    if active.size == 0 or active.size == int(n_channels_dat):
+        return
+    for channel_map_path in output_folder.rglob("channel_map.npy"):
+        try:
+            channel_map = np.load(str(channel_map_path)).astype(np.int64, copy=False)
+            if channel_map.size == 0:
+                continue
+            if np.all((channel_map >= 0) & (channel_map < active.size)):
+                mapped = active[channel_map]
+            elif np.all((channel_map >= 0) & (channel_map < int(n_channels_dat))):
+                mapped = channel_map
+            else:
+                continue
+            np.save(str(channel_map_path), mapped.astype(np.int64, copy=False))
+        except Exception as exc:
+            print(f"Warning: failed to patch channel_map.npy for raw dat: {exc}")
 
 
 def _list_process_table() -> list[dict[str, Any]]:
@@ -1169,6 +1206,21 @@ def _apply_kilosort_ops_overrides(*, sorter_output_folder: Path, ops_overrides: 
         print(f"Warning: failed to apply Kilosort ops overrides: {exc}")
 
 
+def _copy_chanmap_for_kilosort(chanmap_mat_path: Path, dst: Path) -> None:
+    loaded = loadmat(str(chanmap_mat_path))
+    payload = {k: v for k, v in loaded.items() if not k.startswith("__")}
+    chanmap0ind = payload.get("chanMap0ind")
+    if chanmap0ind is None:
+        shutil.copy2(str(chanmap_mat_path.resolve()), str(dst))
+        return
+
+    # Kilosort reads `chanMap` directly. Older pipeline outputs could have
+    # chanMap=1..N while chanMap0ind held the real .dat channel ids; normalize
+    # the copied file so existing chanMaps are safe for non-contiguous groups.
+    payload["chanMap"] = np.asarray(chanmap0ind).astype(np.float64) + 1.0
+    savemat(str(dst), payload)
+
+
 @contextmanager
 def _kilosort_chanmap_override(
     sorter_cls: type,
@@ -1185,7 +1237,7 @@ def _kilosort_chanmap_override(
 
     def _copy_channel_map(_recording, sorter_output_folder):
         dst = Path(sorter_output_folder) / "chanMap.mat"
-        shutil.copy2(str(Path(chanmap_mat_path).resolve()), str(dst))
+        _copy_chanmap_for_kilosort(Path(chanmap_mat_path), dst)
 
     def _patched_generate_ops_file(_cls, recording, params, sorter_output_folder, binary_file_path):
         original_ops(recording, params, sorter_output_folder, binary_file_path)
@@ -1420,6 +1472,7 @@ def execute_sorting_job(
     active_channels_0based = (
         list(range(int(nch))) if input_is_preprocessed else resolved_active_channels_0based
     )
+    sorter_uses_channel_subset = len(active_channels_0based) != int(nch)
 
     if sorter_input == "kilosort":
         params = _normalize_kilosort_params(
@@ -1498,7 +1551,11 @@ def execute_sorting_job(
 
     print(f"Running sorter={sorter_name} -> {output_folder}")
     try:
-        chanmap_override_path = Path(chanmap_mat_path) if chanmap_mat_path is not None else None
+        chanmap_override_path = (
+            Path(chanmap_mat_path)
+            if chanmap_mat_path is not None and not sorter_uses_channel_subset
+            else None
+        )
         if sorter_input == "kilosort":
             override_ctx = _kilosort_chanmap_override(
                 ss.KilosortSorter,
@@ -1601,6 +1658,12 @@ def execute_sorting_job(
         n_channels_dat=int(nch),
         hp_filtered=bool(input_is_preprocessed),
     )
+    if sorter_uses_channel_subset:
+        _patch_channel_map_for_raw_dat(
+            output_folder=output_folder,
+            active_channels_0based=active_channels_0based,
+            n_channels_dat=int(nch),
+        )
     if sorter_input in _MATLAB_SORTER_INPUTS and cleanup_temp_wh:
         _cleanup_temp_wh_dat(output_folder)
     print(

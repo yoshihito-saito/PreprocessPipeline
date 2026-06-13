@@ -133,6 +133,59 @@ def _artifact_windows_from_peaks(
     return timestamps, peaks, duration
 
 
+def _load_artifact_event_peaks_sec(event_path: Path, struct_name: str) -> np.ndarray:
+    loaded = loadmat(event_path, simplify_cells=True)
+    event_struct = loaded.get(struct_name)
+    if not isinstance(event_struct, dict):
+        raise ValueError(f"Invalid {struct_name} structure in {event_path}")
+    peaks = event_struct.get("peaks")
+    if peaks is None:
+        raise ValueError(f"{struct_name}.peaks is missing in {event_path}")
+    peaks_sec = np.asarray(peaks, dtype=np.float64).reshape(-1)
+    return peaks_sec[np.isfinite(peaks_sec)]
+
+
+def _load_highamp_frames_by_group(
+    event_path: Path,
+    *,
+    sampling_frequency: float,
+    group_mode: str,
+) -> dict[int, list[int]]:
+    loaded = loadmat(event_path, simplify_cells=True)
+    event_struct = loaded.get("artifactHigh")
+    if not isinstance(event_struct, dict):
+        raise ValueError(f"Invalid artifactHigh structure in {event_path}")
+
+    peaks = event_struct.get("peaks")
+    if peaks is None:
+        raise ValueError(f"artifactHigh.peaks is missing in {event_path}")
+    peaks_sec = np.asarray(peaks, dtype=np.float64).reshape(-1)
+    finite_mask = np.isfinite(peaks_sec)
+    frames = np.rint(peaks_sec[finite_mask] * float(sampling_frequency)).astype(np.int64)
+
+    if group_mode == "all":
+        return {0: np.unique(frames).astype(int).tolist()}
+
+    group_ids = event_struct.get("group_id")
+    if group_ids is None:
+        raise ValueError(
+            f"artifactHigh.group_id is missing in {event_path}; cannot reuse grouped "
+            f"artifact events for artifact_highamp_group_mode='{group_mode}'."
+        )
+    group_ids_arr = np.asarray(group_ids).reshape(-1)
+    if group_ids_arr.size != peaks_sec.size:
+        raise ValueError(
+            f"artifactHigh.group_id length ({group_ids_arr.size}) does not match "
+            f"artifactHigh.peaks length ({peaks_sec.size}) in {event_path}."
+        )
+    group_ids_arr = group_ids_arr[finite_mask].astype(np.int64)
+
+    by_group: dict[int, list[int]] = {}
+    for gid in np.unique(group_ids_arr):
+        by_group[int(gid)] = np.unique(frames[group_ids_arr == gid]).astype(int).tolist()
+    return by_group
+
+
 def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     step_idx = 0
     total_steps = 17
@@ -371,6 +424,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         write_concatenated_dat(
             recording=recording_concat,
             output_dat_path=raw_dat_path,
+            dtype=config.dtype,
             overwrite=config.overwrite,
             job_kwargs=config.job_kwargs,
         )
@@ -431,7 +485,36 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     if ttl_artifact_enabled:
         existing_ttl_events_path = output_dir / f"{basename}.artifactTTL.events.mat"
         if existing_ttl_events_path.exists() and not config.overwrite:
-            print(f"Skipping TTL artifact removal: existing file found ({existing_ttl_events_path})")
+            print(f"Reusing TTL artifact events and applying removal: {existing_ttl_events_path}")
+            ttl_peaks_sec = _load_artifact_event_peaks_sec(existing_ttl_events_path, "artifactTTL")
+            if ttl_peaks_sec.size == 0:
+                raise ValueError(
+                    "artifact_ttl_group_mode != 'none' but existing artifactTTL.events.mat "
+                    f"contains no peaks: {existing_ttl_events_path}"
+                )
+            artifact_ttl_timestamps_sec = np.unique(ttl_peaks_sec.astype(np.float64))
+            artifact_ttl = np.unique(
+                np.rint(artifact_ttl_timestamps_sec * float(effective_sr)).astype(np.int64)
+            ).tolist()
+
+            recording_for_ttl = apply_artifact_group_mode(
+                recording_preprocessed,
+                chanmap_mat_path=config.chanmap_mat_path,
+                mode=ttl_group_mode,
+            )
+
+            recording_preprocessed = apply_transform_to_selected_channels_preserve_shape(
+                recording_raw=recording_for_ttl,
+                selected_channel_ids=good_channels_0based,
+                transform_fn=lambda rec_sel: remove_artifacts(
+                    recording_in=rec_sel,
+                    artifact_per_group=artifact_ttl,
+                    by_group=(ttl_group_mode != "all"),
+                    ms_before=config.artifact_TTL_ms_before,
+                    ms_after=config.artifact_TTL_ms_after,
+                    mode=config.artifact_TTL_mode,
+                )[0],
+            )
             intermediate_dat_paths["artifact_ttl_events"] = existing_ttl_events_path
         else:
             ttl_events_path = next((p for p in digital_event_paths if "digitalIn.events.mat" in p.name), None)
@@ -526,7 +609,44 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     if highamp_artifact_enabled:
         existing_high_events_path = output_dir / f"{basename}.artifactHigh.events.mat"
         if existing_high_events_path.exists() and not config.overwrite:
-            print(f"Skipping high-amplitude artifact removal: existing file found ({existing_high_events_path})")
+            print(f"Reusing high-amplitude artifact events and applying removal: {existing_high_events_path}")
+            highamp_frames_by_group = _load_highamp_frames_by_group(
+                existing_high_events_path,
+                sampling_frequency=effective_sr,
+                group_mode=highamp_group_mode,
+            )
+            pairs = sorted(
+                (frame, gid)
+                for gid, frames in highamp_frames_by_group.items()
+                for frame in frames
+            )
+            if not pairs:
+                raise ValueError(
+                    "artifact_highamp_group_mode != 'none' but existing artifactHigh.events.mat "
+                    f"contains no peaks: {existing_high_events_path}"
+                )
+            artifact_high_frames = np.asarray([p[0] for p in pairs], dtype=np.int64)
+            artifact_high_group_ids = np.asarray([p[1] for p in pairs], dtype=np.int64)
+            artifact_high_timestamps_sec = artifact_high_frames.astype(np.float64) / float(effective_sr)
+
+            recording_for_highamp = apply_artifact_group_mode(
+                recording_preprocessed,
+                chanmap_mat_path=config.chanmap_mat_path,
+                mode=highamp_group_mode,
+            )
+
+            recording_preprocessed = apply_transform_to_selected_channels_preserve_shape(
+                recording_raw=recording_for_highamp,
+                selected_channel_ids=good_channels_0based,
+                transform_fn=lambda rec_sel: remove_artifacts(
+                    recording_in=rec_sel,
+                    artifact_per_group=highamp_frames_by_group,
+                    by_group=(highamp_group_mode != "all"),
+                    ms_before=config.highamp_ms_before,
+                    ms_after=config.highamp_ms_after,
+                    mode=config.highamp_mode,
+                )[0],
+            )
             intermediate_dat_paths["artifact_high_events"] = existing_high_events_path
         else:
             highamp_frames_by_group: dict[int, list[int]] = {}
@@ -608,6 +728,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     write_concatenated_dat(
         recording=recording_preprocessed,
         output_dat_path=dat_path,
+        dtype=config.dtype,
         overwrite=config.overwrite,
         job_kwargs=config.job_kwargs,
     )
@@ -633,6 +754,9 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         )
 
     _step("Build session.mat")
+    session_sr_lfp = float(config.lfp_fs) if config.make_lfp else (
+        xml_meta.sr_lfp if xml_meta.sr_lfp is not None else config.lfp_fs
+    )
     session_struct = build_session_struct(
         source_basepath=basepath,
         local_basepath=output_dir,
@@ -641,7 +765,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         dat_path=session_dat_path,
         dat_dtype=config.dtype,
         sr=effective_sr,
-        sr_lfp=(xml_meta.sr_lfp if xml_meta.sr_lfp is not None else config.lfp_fs),
+        sr_lfp=session_sr_lfp,
         n_channels=output_n_channels,
         bad_channels_1based=bad_1,
         merge_data=merge_data,
