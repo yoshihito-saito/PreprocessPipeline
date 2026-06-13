@@ -1695,15 +1695,28 @@ INDEX_HTML = r"""<!doctype html>
 
 
 def main(argv: list[str] | None = None) -> int:
+    global DEFAULT_CONFIG_PATH
+
     parser = argparse.ArgumentParser(description="Run the PreprocessPipeline browser GUI.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Preferred port. Use 0 for an OS-assigned free port.")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Default GUI config JSON to load/save. Relative paths are resolved "
+            "from the repository config folder."
+        ),
+    )
     parser.add_argument(
         "--no-browser",
         action="store_true",
         help="Do not try to open the GUI in a browser automatically.",
     )
     args = parser.parse_args(argv)
+
+    if args.config:
+        DEFAULT_CONFIG_PATH = _resolve_config_path(args.config)
 
     server = _bind_server_with_fallback(args.host, args.port)
     actual_port = int(server.server_address[1])

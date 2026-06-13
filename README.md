@@ -112,6 +112,12 @@ Advanced direct command:
 preprocess-webgui
 ```
 
+The same config option is available for direct launch:
+
+```bash
+preprocess-webgui --config config/preprocess_gui_default_config.json
+```
+
 If the package entry point is not registered in the active environment, use:
 
 ```bash
