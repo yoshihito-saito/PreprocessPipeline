@@ -16,8 +16,13 @@ dependencies = [
     "joblib>=1.3",
     "scikit-learn>=1.3",
     "matplotlib>=3.7",
+    "PySide6>=6.6",
     "spikeinterface==0.103.2",
 ]
+
+[project.scripts]
+preprocess-gui = "src.preprocess.gui:main"
+preprocess-webgui = "src.preprocess.gui.web_app:main"
 
 [project.optional-dependencies]
 dev = [

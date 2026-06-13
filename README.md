@@ -46,6 +46,63 @@ conda activate preprocess
 python -m marimo edit Run_preprocessSession.py
 ```
 
+### PreprocessPipeline GUI
+
+The GUI provides basepath selection, preprocess/postprocess settings, `chanMap.mat` preview, preflight checks, run buttons, and pipeline logs.
+
+Recommended launcher for Windows, Linux, and macOS:
+
+```bash
+conda activate preprocess
+python launch_gui.py
+```
+
+The GUI prints a local URL such as `http://127.0.0.1:8765` and tries to open it in a browser automatically.
+
+Convenience wrappers are also available:
+
+Windows:
+
+```powershell
+.\launch_gui.bat
+```
+
+Linux/macOS:
+
+```bash
+./launch_gui.sh
+```
+
+For VS Code Remote sessions, run the same launcher in the remote terminal. If VS Code asks to forward the port, accept it and open the forwarded URL in Simple Browser or your local browser.
+
+If port `8765` is busy, the GUI automatically tries the next available port and prints the actual URL.
+
+Advanced direct command:
+
+```bash
+preprocess-webgui
+```
+
+If the package entry point is not registered in the active environment, use:
+
+```bash
+python -m src.preprocess.gui.web_app
+```
+
+The Qt desktop GUI is also available for sessions with a working display server:
+
+After updating the environment, launch it with:
+
+```bash
+preprocess-gui
+```
+
+If the package is not installed as an editable package in the active environment, use:
+
+```bash
+python -m src.preprocess.gui.app
+```
+
 ### Phy GUI
 
 Install this only if you want to inspect or curate sorting results in the Phy GUI.

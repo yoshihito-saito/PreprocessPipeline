@@ -29,6 +29,7 @@ Thumbs.db
 # --- logs & tmp ---
 *.log
 *.tmp
+implementation/
 
 # --- secrets (if any) ---
 .env
@@ -42,3 +43,4 @@ PreprocessPipeline.code-workspace
 Sorting_comparison_KS.ipynb
 .codex
 .speedtest_workdir.bin
+config/preprocess_gui_default_config_ys.json

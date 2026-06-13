@@ -288,6 +288,82 @@ def _count_noise_clusters_in_phy_dir(phy_dir: Path) -> int:
     return 0
 
 
+def _count_units_and_spikes_from_phy_files(phy_dir: Path) -> tuple[int, int]:
+    cluster_ids: set[int] = set()
+    for filename in ("cluster_group.tsv", "cluster_info.tsv"):
+        path = phy_dir / filename
+        if not path.exists():
+            continue
+        df = pd.read_csv(path, sep="\t")
+        cols_lut = {str(col).strip().lower(): col for col in df.columns}
+        cluster_col = cols_lut.get("cluster_id") or cols_lut.get("id")
+        if cluster_col is not None:
+            cluster_ids.update(
+                int(x)
+                for x in pd.to_numeric(df[cluster_col], errors="coerce").dropna().astype(int).tolist()
+            )
+            break
+
+    spike_clusters_path = phy_dir / "spike_clusters.npy"
+    total_spikes = 0
+    if spike_clusters_path.exists():
+        spike_clusters = np.load(spike_clusters_path, mmap_mode="r")
+        total_spikes = int(spike_clusters.shape[0])
+        if not cluster_ids:
+            cluster_ids.update(int(x) for x in np.unique(spike_clusters).tolist())
+    return len(cluster_ids), total_spikes
+
+
+def _run_noise_label_only(
+    *,
+    config: PostprocessConfig,
+    sorting_phy_folder: Path,
+    output_folder: Path,
+    metrics_csv_path: Path,
+    analyzer_cache_root: Path | None,
+) -> PostprocessResult:
+    if not output_folder.exists():
+        raise FileNotFoundError(
+            f"Noise labeling only requires an existing postprocess output folder: {output_folder}"
+        )
+    if not metrics_csv_path.exists():
+        raise FileNotFoundError(
+            f"Noise labeling only requires existing metrics: {metrics_csv_path}"
+        )
+    if not (output_folder / "cluster_si_unit_ids.tsv").exists():
+        raise FileNotFoundError(
+            f"Noise labeling only requires cluster_si_unit_ids.tsv in: {output_folder}"
+        )
+
+    metrics_df = pd.read_csv(metrics_csv_path, index_col=0)
+    updated = mark_noise_clusters_from_metrics(
+        phy_dir=output_folder,
+        metrics_df=metrics_df,
+        thresholds=config.noise_thresholds,
+        backup=config.noise_backup,
+        reset_to_unsorted=True,
+        update_cluster_info=True,
+    )
+    n_units_initial, total_spikes_initial = _count_units_and_spikes_from_phy_files(sorting_phy_folder)
+    n_units_final, total_spikes_final = _count_units_and_spikes_from_phy_files(output_folder)
+    return PostprocessResult(
+        sorting_phy_folder=sorting_phy_folder,
+        output_folder=output_folder,
+        preprocessed_dat_path=None,
+        metrics_csv_path=metrics_csv_path,
+        analyzer_cache_dir=(
+            analyzer_cache_root
+            if analyzer_cache_root is not None and analyzer_cache_root.exists() and not config.delete_analyzer_cache
+            else None
+        ),
+        n_units_initial=n_units_initial,
+        n_units_final=n_units_final,
+        total_spikes_initial=total_spikes_initial,
+        total_spikes_final=total_spikes_final,
+        n_noise_clusters=int((updated["group"] == "noise").sum()),
+    )
+
+
 def _load_postprocess_result_from_existing_outputs(
     *,
     config: PostprocessConfig,
@@ -608,6 +684,15 @@ def _run_postprocess_single_session(
     preprocessed_dat_path: Path | None = None
     metrics_csv_path = output_folder / config.metrics_csv_name
     analyzer_cache_root = _resolve_analyzer_cache_root(config, output_folder)
+    if config.noise_label_only:
+        _log(f"noise labeling only: sorting_phy_folder={sorting_phy_folder}")
+        return _run_noise_label_only(
+            config=config,
+            sorting_phy_folder=sorting_phy_folder,
+            output_folder=output_folder,
+            metrics_csv_path=metrics_csv_path,
+            analyzer_cache_root=analyzer_cache_root,
+        )
     if _should_skip_postprocess_target(
         config,
         output_folder=output_folder,

@@ -86,6 +86,7 @@ class PostprocessConfig:
     )
     skip_pc_metrics: bool = True
 
+    noise_label_only: bool = False
     overwrite: bool = True
     remove_if_exists: bool | None = None
     copy_binary: bool = False

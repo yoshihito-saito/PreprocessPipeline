@@ -223,14 +223,174 @@ def _load_xml_groups_for_chanmap(xml_path: Path):
     return anat_grps, spk_channels, has_spk_groups, skipped_channels, root
 
 
-def create_channel_map(
+def _normalize_chanmap_layout(layout: str | None) -> str:
+    text = str(layout or "").strip()
+    key = text.lower().replace("-", "_").replace(" ", "")
+    if key in {"neuropixel", "neuro_pixel"}:
+        return "NeuroPixel"
+    if key in {"middle_finger", "middlefinger"}:
+        return "middle_finger"
+    if key in {"poly2", "poly3", "poly5"}:
+        return key
+    if key in {"linear", "edge", "staggered", "neurogrid", "twohundred"}:
+        return key
+    if key == "doublesided":
+        return "double_sided"
+    return text or "staggered"
+
+
+def _cell_explorer_layout_coords(
+    n_channels: int,
+    layout: str,
+    group_index: int,
+    *,
+    vertical_spacing: float = 20.0,
+    shank_spacing: float = 200.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return channel coordinates matching CellExplorer generateChanCoords.m."""
+    layout = _normalize_chanmap_layout(layout)
+    x = np.full(n_channels, np.nan, dtype=float)
+    y = np.full(n_channels, np.nan, dtype=float)
+
+    if layout in {"linear", "edge"}:
+        x[:] = 0.0
+        y = -np.arange(n_channels, dtype=float) * vertical_spacing
+        x = x + group_index * shank_spacing
+        return x, y
+
+    if layout == "staggered":
+        max_offset = max(2080.0, 17.0 + 4.0 * max(n_channels, 1))
+        horz_offset = np.flip(
+            np.concatenate(
+                (
+                    np.asarray([0.0, 8.5]),
+                    np.arange(17.0, max_offset + 0.1, 4.0),
+                )
+            )
+        )
+        horz_offset[::2] = -horz_offset[::2]
+        x = horz_offset[-n_channels:].astype(float)
+        y = -np.arange(n_channels, dtype=float) * vertical_spacing
+        x = x + group_index * shank_spacing
+        return x, y
+
+    if layout in {"poly2", "poly3", "poly5"}:
+        columns = int(layout[-1])
+        extrachannels = n_channels % columns
+        polyline = np.arange(1, n_channels - extrachannels + 1) % columns
+
+        if layout == "poly2":
+            x[np.where(polyline == 1)[0] + extrachannels] = 0.0
+            x[np.where(polyline == 0)[0] + extrachannels] = 20.0
+            x[:extrachannels] = 0.0
+            for xpos, y_offset in [(0.0, 0.0), (20.0, -vertical_spacing / 2.0)]:
+                mask = x == xpos
+                y[mask] = -np.arange(np.sum(mask), dtype=float) * vertical_spacing + y_offset
+        elif layout == "poly3":
+            x[np.where(polyline == 1)[0] + extrachannels] = -18.0
+            x[np.where(polyline == 2)[0] + extrachannels] = 0.0
+            x[np.where(polyline == 0)[0] + extrachannels] = 18.0
+            x[:extrachannels] = 0.0
+            for xpos, y_offset in [
+                (18.0, 0.0),
+                (0.0, -vertical_spacing / 2.0 + extrachannels * vertical_spacing),
+                (-18.0, 0.0),
+            ]:
+                mask = x == xpos
+                y[mask] = -np.arange(np.sum(mask), dtype=float) * vertical_spacing + y_offset
+        else:
+            x[np.where(polyline == 1)[0] + extrachannels] = -36.0
+            x[np.where(polyline == 2)[0] + extrachannels] = -18.0
+            x[np.where(polyline == 3)[0] + extrachannels] = 0.0
+            x[np.where(polyline == 4)[0] + extrachannels] = 18.0
+            x[np.where(polyline == 0)[0] + extrachannels] = 36.0
+            if extrachannels > 0:
+                x[:extrachannels] = 18.0 * ((-1.0) ** np.arange(1, extrachannels + 1))
+            for xpos, y_offset in [
+                (36.0, 0.0),
+                (18.0, -vertical_spacing / 2.0),
+                (0.0, 0.0),
+                (-18.0, -vertical_spacing / 2.0),
+                (-36.0, 0.0),
+            ]:
+                mask = x == xpos
+                y[mask] = -np.arange(np.sum(mask), dtype=float) * vertical_spacing + y_offset
+
+        x = x + group_index * shank_spacing
+        return x, y
+
+    if layout == "neurogrid":
+        x = np.asarray([n_channels - (i + 1) for i in range(n_channels)], dtype=float)
+        y = -np.arange(n_channels, dtype=float) * vertical_spacing
+        x = x + group_index * vertical_spacing
+        return x, y
+
+    if layout == "twohundred":
+        x[:] = 0.0
+        y[:] = 0.0
+        y[1::2] = shank_spacing
+        x = x + group_index * shank_spacing
+        return x, y
+
+    raise ValueError(f"Unsupported probe geometry layout: {layout}")
+
+
+def _middle_finger_layout_coords(
+    n_channels: int,
+    group_index: int,
+    n_groups: int,
+    *,
+    side_n_channels: int | None = None,
+    vertical_spacing: float = 20.0,
+    shank_spacing: float = 200.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Geometry for NeuroNexus A5x12-16-Buz-Lin middle-finger probes.
+
+    Side shanks use the CellExplorer poly2 layout. The center shank is a
+    16-site linear shank extending 1200 um deeper than the side-shank tips.
+    From the tip, the lower 13 sites are spaced at 100 um and the remaining
+    upper sites are spaced at 500 um.
+    """
+    center_index = n_groups // 2
+    if group_index != center_index:
+        return _cell_explorer_layout_coords(
+            n_channels,
+            "poly2",
+            group_index,
+            vertical_spacing=vertical_spacing,
+            shank_spacing=shank_spacing,
+        )
+
+    side_count = side_n_channels if side_n_channels is not None else 12
+    side_lowest_contact_y = -float(max(side_count - 1, 0)) * vertical_spacing / 2.0
+    side_tip_y = side_lowest_contact_y - 35.0
+    center_tip_y = side_tip_y - 1200.0
+    center_lowest_contact_y = center_tip_y + 50.0
+    bottom_dense_count = min(n_channels, 13)
+    bottom_offsets = 100.0 * np.arange(bottom_dense_count, dtype=float)
+    upper_offsets = (
+        bottom_offsets[-1] + 500.0 * np.arange(1, n_channels - bottom_dense_count + 1, dtype=float)
+        if n_channels > bottom_dense_count
+        else np.asarray([], dtype=float)
+    )
+    y_from_bottom = center_lowest_contact_y + np.concatenate((bottom_offsets, upper_offsets))
+
+    x = np.full(
+        n_channels,
+        group_index * shank_spacing + 10.0,
+        dtype=float,
+    )
+    y = y_from_bottom[::-1]
+    return x, y
+
+
+def build_channel_map_data(
     basepath: Path | str,
-    outputDir: Path | str,
     basename: str | None = None,
     electrode_type: str | None = None,
     reject_channels: list[int] | None = None,
     probe_assignments: list[dict] | None = None,
-) -> Path | None:
+) -> dict[str, np.ndarray | str] | None:
     reject_channels = reject_channels or []
 
     base_path = Path(basepath)
@@ -258,10 +418,14 @@ def create_channel_map(
             val = desc_node.text.strip().lower()
             if "neuropixel" in val:
                 electrode_type = "NeuroPixel"
+            elif "middle_finger" in val or "middle finger" in val or "middlefinger" in val:
+                electrode_type = "middle_finger"
             elif "staggered" in val:
                 electrode_type = "staggered"
             elif "neurogrid" in val or "grid" in val:
                 electrode_type = "neurogrid"
+            elif "poly2" in val or "poly 2" in val:
+                electrode_type = "poly2"
             elif "poly3" in val:
                 electrode_type = "poly3"
             elif "poly5" in val:
@@ -274,12 +438,19 @@ def create_channel_map(
 
     channel_coords = []
     for probe_idx, probe in enumerate(probe_assignments):
-        p_type = probe.get("type", electrode_type)
+        p_type = _normalize_chanmap_layout(probe.get("type", electrode_type))
         p_groups = probe.get("groups", [])
         p_x_offset = probe.get("x_offset", 0)
+        center_group_index = len(p_groups) // 2
+        side_group_lengths = [
+            len(anat_grps[group_idx])
+            for local_group_idx, group_idx in enumerate(p_groups)
+            if local_group_idx != center_group_index and 0 <= group_idx < ngroups
+        ]
+        side_n_channels = side_group_lengths[0] if side_group_lengths else None
 
         for local_idx, g_idx in enumerate(p_groups):
-            if g_idx >= ngroups:
+            if g_idx < 0 or g_idx >= ngroups:
                 continue
 
             tchannels = anat_grps[g_idx]
@@ -305,53 +476,18 @@ def create_channel_map(
                 y_base = (np.arange(n_ch) // 2) + 1
                 y = y_base * -20.0
                 x = x + shank_id * 200
-            elif p_type == "staggered":
-                x[:] = 20.0
-                y = np.arange(1, n_ch + 1) * -20.0
-                x[::2] = -20.0
-                x = x + shank_id * 200
-            elif p_type == "poly3":
-                ext = n_ch % 3
-                poly = (np.arange(1, n_ch - ext + 1)) % 3
-                x[:] = 0
-                idx_p1 = np.where(poly == 1)[0] + ext
-                idx_p2 = np.where(poly == 2)[0] + ext
-                idx_p0 = np.where(poly == 0)[0] + ext
-                x[idx_p1] = -18
-                x[idx_p2] = 0
-                x[idx_p0] = 18
-                x[:ext] = 0
-                mask_18 = x == 18
-                y[mask_18] = np.arange(1, np.sum(mask_18) + 1) * -20
-                mask_0 = x == 0
-                y[mask_0] = np.arange(1, np.sum(mask_0) + 1) * -20 - 10 + ext * 20
-                mask_m18 = x == -18
-                y[mask_m18] = np.arange(1, np.sum(mask_m18) + 1) * -20
-                x = x + shank_id * 200
-            elif p_type == "poly5":
-                ext = n_ch % 5
-                poly = (np.arange(1, n_ch - ext + 1)) % 5
-                x[:] = np.nan
-                x[np.where(poly == 1)[0] + ext] = -36
-                x[np.where(poly == 2)[0] + ext] = -18
-                x[np.where(poly == 3)[0] + ext] = 0
-                x[np.where(poly == 4)[0] + ext] = 18
-                x[np.where(poly == 0)[0] + ext] = 36
-                if ext > 0:
-                    x[:ext] = 18 * ((-1.0) ** np.arange(1, ext + 1))
-                for val, y_off in [(36, 0), (18, -14), (0, 0), (-18, -14), (-36, 0)]:
-                    mask = x == val
-                    if np.any(mask):
-                        y[mask] = np.arange(1, np.sum(mask) + 1) * -28 + y_off
-                x = x + shank_id * 200
-            elif p_type == "neurogrid":
-                for i in range(n_ch):
-                    x[i] = n_ch - (i + 1)
-                    y[i] = -(i + 1) * 30
-                x = x + shank_id * 30
+            elif p_type == "middle_finger":
+                x, y = _middle_finger_layout_coords(
+                    n_ch,
+                    local_idx,
+                    len(p_groups),
+                    side_n_channels=side_n_channels,
+                )
+            else:
+                x, y = _cell_explorer_layout_coords(n_ch, p_type, local_idx)
 
             x = x + p_x_offset
-            k_val = (g_idx // 4) + 1 if p_type == "neurogrid" else g_idx + 1
+            k_val = g_idx + 1
 
             for i in range(n_ch):
                 channel_coords.append(
@@ -402,7 +538,29 @@ def create_channel_map(
         "ycoords": ycoords.reshape(-1, 1).astype(float),
         "kcoords": kcoords.reshape(-1, 1).astype(float),
         "probe_ids": pcoords.reshape(-1, 1).astype(float),
+        "probe_assignments_json": json.dumps(probe_assignments),
     }
+
+    return save_dict
+
+
+def create_channel_map(
+    basepath: Path | str,
+    outputDir: Path | str,
+    basename: str | None = None,
+    electrode_type: str | None = None,
+    reject_channels: list[int] | None = None,
+    probe_assignments: list[dict] | None = None,
+) -> Path | None:
+    save_dict = build_channel_map_data(
+        basepath=basepath,
+        basename=basename,
+        electrode_type=electrode_type,
+        reject_channels=reject_channels,
+        probe_assignments=probe_assignments,
+    )
+    if save_dict is None:
+        return None
 
     out_file = Path(outputDir) / "chanMap.mat"
     savemat(out_file, save_dict)

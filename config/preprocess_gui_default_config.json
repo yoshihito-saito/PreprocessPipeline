@@ -1,0 +1,104 @@
+{
+  "basepath": "",
+  "local_root": "/local/workdir/ys2375/PreprocessPipeline/sorting_temp",
+  "chanmap_path": "",
+  "preprocess": {
+    "analog_inputs": false,
+    "digital_inputs": true,
+    "save_raw": false,
+    "do_preprocess": true,
+    "bandpass_min_hz": 500,
+    "bandpass_max_hz": 8000,
+    "reference": "local",
+    "local_radius_um": [
+      20,
+      600
+    ],
+    "make_lfp": true,
+    "lfp_fs": 1250,
+    "state_score": true,
+    "sw_channels": [],
+    "theta_channels": [],
+    "state_ignore_manual": false,
+    "state_save_lfp_mat": true,
+    "state_sticky_trigger": false,
+    "state_winparms": [
+      2,
+      15
+    ],
+    "emg_th_alpha": 1,
+    "useEMG_NREM": true,
+    "state_min_state_length": 6,
+    "state_microarousal_sec": 100,
+    "state_block_wake_to_rem": true,
+    "remove_ttl_artifacts": false,
+    "artifact_ttl_group_mode": "all",
+    "artifact_ttl_channel": 0,
+    "artifact_ttl_include_offset": true,
+    "artifact_ttl_ms_before": 0.5,
+    "artifact_ttl_ms_after": 2,
+    "artifact_ttl_mode": "linear",
+    "remove_highamp_artifacts": true,
+    "artifact_highamp_group_mode": "shank",
+    "highamp_threshold_sigma": 10,
+    "highamp_ms_before": 2,
+    "highamp_ms_after": 2,
+    "highamp_mode": "linear",
+    "reject_channels": [],
+    "probe_assignments": [
+      {
+        "type": "staggered",
+        "groups": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "x_offset": 0
+      }
+    ],
+    "run_sorter": true,
+    "sorter": "Kilosort",
+    "sorter_path": "sorter/KiloSort1",
+    "sorter_config_path": "sorter/Kilosort1_config.yaml",
+    "matlab_path": "",
+    "preprocess_worker_count": 128,
+    "sorter_worker_count": 128,
+    "overwrite": false
+  },
+  "postprocess": {
+    "sorting_phy_folder": "",
+    "sorting_search_root": "",
+    "apply_preprocess": false,
+    "exclude_cluster_groups": [
+      "noise"
+    ],
+    "duplicate_censored_period_ms": 0.5,
+    "duplicate_threshold": 0.5,
+    "merge_min_spikes": 100,
+    "merge_corr_diff_thresh": 0.25,
+    "merge_template_diff_thresh": 0.25,
+    "split_contamination": 0.05,
+    "split_threshold_mode": "adaptive_chi2",
+    "split_wf_threshold": 0.2,
+    "split_wf_n_chans": 10,
+    "split_amp_mad_scale": 10,
+    "skip_pc_metrics": true,
+    "noise_label_only": false,
+    "noise_thresholds": {
+      "isi_violations_ratio_gt": 5,
+      "isi_violations_count_gt": 50,
+      "presence_ratio_lt": 0.1,
+      "snr_lt": 2,
+      "amplitude_median_lt": 15,
+      "amplitude_median_gt": 500,
+      "peak_to_valley_gt": 0.85,
+      "peak_trough_ratio_lt": -0.5,
+      "halfwidth_gt": 0.4,
+      "slope_lt": 15,
+      "firing_rate_lt": 0.01
+    },
+    "overwrite": false,
+    "worker_count": 128
+  }
+}

@@ -1,3 +1,8 @@
+import os
+
+os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
 from .postprocess import (
     PostprocessConfig,
     PostprocessResult,
