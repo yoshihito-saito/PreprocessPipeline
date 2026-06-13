@@ -27,6 +27,12 @@ def _set_channel_property_compat(recording: Any, channel_ids: list[int], key: st
     raise AttributeError("Recording object does not support set_channel_property/set_property.")
 
 
+def _chanmap_device_channel_indices(mat: dict[str, Any]) -> np.ndarray:
+    if "chanMap0ind" in mat:
+        return np.asarray(mat["chanMap0ind"]).flatten().astype(int)
+    return np.asarray(mat["chanMap"]).flatten().astype(int) - 1
+
+
 def _build_chanmap_group_properties(chanmap_mat_path: Path, channel_ids: list[int]) -> dict[str, list[int]]:
     mat = loadmat(chanmap_mat_path)
     required = {"kcoords", "chanMap"}
@@ -34,7 +40,7 @@ def _build_chanmap_group_properties(chanmap_mat_path: Path, channel_ids: list[in
         missing = ", ".join(sorted(required.difference(set(mat.keys()))))
         raise ValueError(f"chanMap is missing required fields: {missing}")
 
-    device_ch_inds = np.asarray(mat["chanMap"]).flatten().astype(int) - 1
+    device_ch_inds = _chanmap_device_channel_indices(mat)
     if device_ch_inds.size == 0:
         raise ValueError("chanMap has no channel entries.")
 
@@ -97,7 +103,7 @@ def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path) -> Any:
     y = np.asarray(mat["ycoords"]).flatten()
     shank_ids = np.asarray(mat["kcoords"]).flatten()
     probe_ids = np.asarray(mat.get("probe_ids", np.ones_like(x))).flatten()
-    device_ch_inds = np.asarray(mat["chanMap"]).flatten().astype(int) - 1
+    device_ch_inds = _chanmap_device_channel_indices(mat)
 
     n_contacts = min(
         x.size,
@@ -287,19 +293,67 @@ def concatenate_recordings_si(recordings: list[Any]) -> Any:
     return si.concatenate_recordings(recordings)
 
 
+def _recording_num_frames(recording: Any) -> int | None:
+    try:
+        return int(recording.get_num_frames(segment_index=0))
+    except TypeError:
+        try:
+            return int(recording.get_num_frames())
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _validate_existing_binary_size(
+    *,
+    path: Path,
+    dtype: str | np.dtype,
+    num_channels: int,
+    expected_frames: int | None = None,
+    label: str,
+) -> None:
+    dtype_np = np.dtype(dtype)
+    frame_bytes = int(dtype_np.itemsize) * int(num_channels)
+    if frame_bytes <= 0:
+        raise ValueError(f"Invalid {label} frame size: dtype={dtype_np}, num_channels={num_channels}")
+    size = int(path.stat().st_size)
+    if size % frame_bytes != 0:
+        raise ValueError(
+            f"Existing {label} is incompatible with current settings: "
+            f"{path} size={size} is not divisible by frame_bytes={frame_bytes}."
+        )
+    if expected_frames is not None:
+        actual_frames = size // frame_bytes
+        if int(actual_frames) != int(expected_frames):
+            raise ValueError(
+                f"Existing {label} has stale sample count: {actual_frames} != {expected_frames} "
+                f"({path}). Re-run with overwrite=True or remove the stale file."
+            )
+
+
 def write_concatenated_dat(
     recording: Any,
     output_dat_path: Path,
+    dtype: str,
     overwrite: bool,
     job_kwargs: dict[str, Any],
 ) -> Path:
     if output_dat_path.exists() and not overwrite:
+        _validate_existing_binary_size(
+            path=output_dat_path,
+            dtype=dtype,
+            num_channels=int(recording.get_num_channels()),
+            expected_frames=_recording_num_frames(recording),
+            label="concatenated dat",
+        )
         return output_dat_path
 
     si.write_binary_recording(
         recording,
         file_paths=str(output_dat_path),
         add_file_extension=False,
+        dtype=dtype,
         verbose=True,
         **job_kwargs,
     )
@@ -322,6 +376,14 @@ def _write_concatenated_sidecar_dat(
     if not any(p is not None and Path(p).exists() for p in dat_paths):
         return None
     if output_dat_path.exists() and not overwrite:
+        expected_frames = int(sum(int(n) for n in sample_counts)) if sample_counts is not None else None
+        _validate_existing_binary_size(
+            path=output_dat_path,
+            dtype=dtype,
+            num_channels=int(num_channels),
+            expected_frames=expected_frames,
+            label="sidecar dat",
+        )
         return output_dat_path
 
     if num_channels <= 0:
@@ -470,7 +532,11 @@ def _load_bad_channels_from_chanmap(chanmap_mat_path: Path) -> list[int]:
     connected = np.asarray(mat["connected"]).squeeze()
     if connected.dtype != bool:
         connected = connected.astype(int) != 0
-    return np.flatnonzero(~connected).astype(int).tolist()
+    device_ch_inds = _chanmap_device_channel_indices(mat)
+    n = min(connected.size, device_ch_inds.size)
+    if n == 0:
+        return []
+    return device_ch_inds[:n][~connected[:n]].astype(int).tolist()
 
 
 def attach_probe_and_remove_bad_channels(
@@ -485,6 +551,18 @@ def attach_probe_and_remove_bad_channels(
         chanmap_path = Path(chanmap_mat_path)
         bad.update(_load_bad_channels_from_chanmap(chanmap_path))
         recording_with_probe = attach_probe_from_chanmap(recording_with_probe, chanmap_path)
+
+    if hasattr(recording_with_probe, "get_num_channels"):
+        n_recording_channels = int(recording_with_probe.get_num_channels())
+        invalid_bad = sorted(ch for ch in bad if ch < 0 or ch >= n_recording_channels)
+        if invalid_bad:
+            warnings.warn(
+                "Ignoring bad/reject channels outside recording channel range "
+                f"[0, {n_recording_channels - 1}]: {invalid_bad}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            bad = {ch for ch in bad if 0 <= ch < n_recording_channels}
 
     bad_0 = sorted(bad)
     bad_1 = [b + 1 for b in bad_0]
@@ -675,15 +753,30 @@ def write_lfp(
     overwrite: bool,
     job_kwargs: dict[str, Any],
 ) -> Path:
-    if lfp_path.exists() and not overwrite:
-        return lfp_path
-
     if isinstance(lfp_fs, float):
         if not float(lfp_fs).is_integer():
             raise ValueError(f"lfp_fs must be an integer Hz for spikeinterface.resample: got {lfp_fs}")
         lfp_rate = int(lfp_fs)
     else:
         lfp_rate = int(lfp_fs)
+
+    input_fs = float(recording_raw.get_sampling_frequency())
+    if lfp_path.exists() and not overwrite:
+        n_channels = int(recording_raw.get_num_channels()) if hasattr(recording_raw, "get_num_channels") else 1
+        raw_frames = _recording_num_frames(recording_raw)
+        expected_lfp_frames = (
+            int(round(float(raw_frames) * float(lfp_rate) / input_fs))
+            if raw_frames is not None and input_fs > 0
+            else None
+        )
+        _validate_existing_binary_size(
+            path=lfp_path,
+            dtype=dtype,
+            num_channels=n_channels,
+            expected_frames=expected_lfp_frames,
+            label="lfp",
+        )
+        return lfp_path
 
     # MATLAB neurocode parity: apply explicit 450 Hz low-pass before downsampling.
     lowpass_hz = 450.0
@@ -699,7 +792,6 @@ def write_lfp(
         )
         lowpass_hz = adjusted
 
-    input_fs = float(recording_raw.get_sampling_frequency())
     nyquist_in = input_fs / 2.0
     if lowpass_hz >= nyquist_in:
         adjusted = max(nyquist_in - 1.0, 1.0)

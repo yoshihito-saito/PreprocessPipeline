@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 from typing import Any
+import warnings
 
 import numpy as np
 from scipy.io import savemat
@@ -53,8 +54,31 @@ def _as_1based_group_arrays(groups_0based: list[list[int]], n_channels: int) -> 
     cell = np.empty((1, len(groups_0based)), dtype=object)
     chan_dtype = _channel_dtype(n_channels)
     for i, group in enumerate(groups_0based):
-        cell[0, i] = (np.asarray(group, dtype=np.int64) + 1).astype(chan_dtype, copy=False).reshape(1, -1)
+        vals = np.asarray(group, dtype=np.int64).reshape(-1)
+        invalid = vals[(vals < 0) | (vals >= int(n_channels))]
+        if invalid.size:
+            warnings.warn(
+                "Ignoring XML group channels outside recording channel range "
+                f"[0, {int(n_channels) - 1}]: {sorted(set(int(v) for v in invalid.tolist()))}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            vals = vals[(vals >= 0) & (vals < int(n_channels))]
+        cell[0, i] = (vals + 1).astype(chan_dtype, copy=False).reshape(1, -1)
     return cell
+
+
+def _filter_bad_channels_1based(channels_1based: list[int], n_channels: int) -> list[int]:
+    vals = [int(ch) for ch in channels_1based]
+    invalid = sorted(set(ch for ch in vals if ch < 1 or ch > int(n_channels)))
+    if invalid:
+        warnings.warn(
+            "Ignoring bad channels outside session channel range "
+            f"[1, {int(n_channels)}]: {invalid}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return sorted(set(ch for ch in vals if 1 <= ch <= int(n_channels)))
 
 
 def _normalized_scalar(value: float | int | None) -> float | int | np.ndarray:
@@ -276,7 +300,7 @@ def build_session_struct(
 
     chan_dtype = _channel_dtype(n_channels)
     bad_channels = np.asarray(
-        sorted(set(int(ch) for ch in bad_channels_1based)),
+        _filter_bad_channels_1based(bad_channels_1based, n_channels),
         dtype=chan_dtype,
     ).reshape(1, -1)
 

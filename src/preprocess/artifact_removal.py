@@ -389,7 +389,7 @@ def remove_artifacts(
     # Determine deterministic group order as they appear along channels
     ordered_gids = sorted(group_to_inds.keys(), key=lambda g: (group_to_inds[g][0] if group_to_inds[g].size else 1e18))
 
-    cleaned_subs = []
+    cleaned_by_channel: dict[int, si.BaseRecording] = {}
     details = {}
 
     for gid in ordered_gids:
@@ -437,12 +437,20 @@ def remove_artifacts(
                 "channel_ids": gr_ch_ids.tolist(),
             }
 
-        cleaned_subs.append(sub_clean)
+        for ch_id in gr_ch_ids:
+            cleaned_by_channel[int(ch_id)] = sub_clean
 
-    # Aggregate channels back (keeps original order by our group ordering + in-group order)
-    recording_clean = si.aggregate_channels(cleaned_subs)
     original_ids = recording_in.get_channel_ids()
-    recording_clean = recording_clean.select_channels(original_ids)
+    # Aggregate channels back in the exact original order. Avoid aggregating by
+    # group and then selecting interleaved channel ids: SpikeInterface 0.103.x
+    # concatenates aggregated parent recordings by parent id, not by the
+    # requested interleaved channel order, which can mix corrected/raw channels
+    # for non-contiguous shank groups.
+    ordered_channel_recordings = [
+        cleaned_by_channel[int(ch)].select_channels(channel_ids=[ch])
+        for ch in original_ids
+    ]
+    recording_clean = si.aggregate_channels(ordered_channel_recordings)
     # Re-apply original group property on the aggregated recording
     try:
         agg_ch_ids = recording_clean.get_channel_ids()

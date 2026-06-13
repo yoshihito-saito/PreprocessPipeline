@@ -17,10 +17,18 @@ def compute_mergepoints(
     foldernames: list[str],
 ) -> MergePointsData:
     itemsize = np.dtype(dtype).itemsize
+    frame_bytes = int(n_channels) * int(itemsize)
+    if frame_bytes <= 0:
+        raise ValueError(f"Invalid frame size for mergepoints: n_channels={n_channels}, dtype={dtype}")
     n_samp = []
     for p in dat_paths:
-        bytes_ = p.stat().st_size
-        n_samp.append(int(bytes_ // (n_channels * itemsize)))
+        bytes_ = int(p.stat().st_size)
+        if bytes_ % frame_bytes != 0:
+            raise ValueError(
+                f"Dat size is not divisible by frame size for mergepoints: "
+                f"{p} size={bytes_}, frame_bytes={frame_bytes}"
+            )
+        n_samp.append(int(bytes_ // frame_bytes))
 
     n_samp_arr = np.asarray(n_samp, dtype=np.int64)
     cumsum = np.cumsum(n_samp_arr)

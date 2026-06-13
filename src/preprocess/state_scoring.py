@@ -1638,6 +1638,102 @@ def _assign_state_on_intervals(
             states[i0:i1] = np.uint8(state_value)
 
 
+def _fill_unassigned_states(states: np.ndarray) -> np.ndarray:
+    arr = np.asarray(states, dtype=np.uint8).reshape(-1).copy()
+    if arr.size == 0 or not np.any(arr == 0):
+        return arr
+
+    i = 0
+    while i < arr.size:
+        if arr[i] != 0:
+            i += 1
+            continue
+        start = i
+        while i < arr.size and arr[i] == 0:
+            i += 1
+        stop = i
+        left = int(arr[start - 1]) if start > 0 else 0
+        right = int(arr[stop]) if stop < arr.size else 0
+        fill = left if left != 0 else right
+        if left != 0 and right != 0 and left != right:
+            for j in range(start, stop):
+                fill_j = left if (j - start) <= (stop - 1 - j) else right
+                arr[j] = np.uint8(fill_j)
+            continue
+        if fill != 0:
+            arr[start:stop] = np.uint8(fill)
+    return arr
+
+
+def _apply_minimum_state_durations(
+    states: np.ndarray,
+    idx_timestamps: np.ndarray,
+    statename_list: list[str],
+    min_len: float,
+) -> np.ndarray:
+    arr = np.asarray(states, dtype=np.uint8).reshape(-1).copy()
+    min_len = float(max(0.0, min_len))
+    if arr.size == 0 or min_len <= 0:
+        return _fill_unassigned_states(arr)
+
+    arr = _fill_unassigned_states(arr)
+    ints = _idx_to_int(states=arr, timestamps=idx_timestamps, statenames=statename_list)
+
+    min_sws = min_len
+    min_w_next_rem = min_len
+    min_rem_in_w = min_len
+    min_rem = min_len
+    min_wake = min_len
+
+    wake_int = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
+    nrem_int = np.asarray(ints.get("NREMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
+    rem_int = np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
+
+    short_nrem = (nrem_int[:, 1] - nrem_int[:, 0]) <= min_sws if nrem_int.size else np.asarray([], dtype=bool)
+    if short_nrem.size and np.any(short_nrem):
+        _assign_state_on_intervals(arr, idx_timestamps, nrem_int[short_nrem], 1)
+
+    ints = _idx_to_int(states=arr, timestamps=idx_timestamps, statenames=statename_list)
+    wake_int = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
+    rem_int = np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
+
+    short_w = (wake_int[:, 1] - wake_int[:, 0]) <= min_w_next_rem if wake_int.size else np.asarray([], dtype=bool)
+    wr, rw = _find_next_to_ints(wake_int, rem_int)
+    if short_w.size and np.any(short_w & (wr | rw)):
+        _assign_state_on_intervals(arr, idx_timestamps, wake_int[short_w & (wr | rw)], 5)
+
+    ints = _idx_to_int(states=arr, timestamps=idx_timestamps, statenames=statename_list)
+    rem_int = np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
+    wake_int = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
+
+    short_r = (rem_int[:, 1] - rem_int[:, 0]) <= min_rem_in_w if rem_int.size else np.asarray([], dtype=bool)
+    rr, rl = _find_next_to_ints(rem_int, wake_int)
+    if short_r.size and np.any(short_r & (rr & rl)):
+        _assign_state_on_intervals(arr, idx_timestamps, rem_int[short_r & (rr & rl)], 1)
+
+    ints = _idx_to_int(states=arr, timestamps=idx_timestamps, statenames=statename_list)
+    rem_int = np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
+    short_r2 = (rem_int[:, 1] - rem_int[:, 0]) <= min_rem if rem_int.size else np.asarray([], dtype=bool)
+    if short_r2.size and np.any(short_r2):
+        _assign_state_on_intervals(arr, idx_timestamps, rem_int[short_r2], 1)
+
+    ints = _idx_to_int(states=arr, timestamps=idx_timestamps, statenames=statename_list)
+    wake_int = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
+    nrem_int = np.asarray(ints.get("NREMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
+    short_w2 = (wake_int[:, 1] - wake_int[:, 0]) <= min_wake if wake_int.size else np.asarray([], dtype=bool)
+    wn, nw = _find_next_to_ints(wake_int, nrem_int)
+    if short_w2.size and np.any(short_w2 & (wn | nw)):
+        _assign_state_on_intervals(arr, idx_timestamps, wake_int[short_w2 & (wn | nw)], 3)
+
+    ints = _idx_to_int(states=arr, timestamps=idx_timestamps, statenames=statename_list)
+    nrem_int = np.asarray(ints.get("NREMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
+    short_nrem2 = (nrem_int[:, 1] - nrem_int[:, 0]) <= min_sws if nrem_int.size else np.asarray([], dtype=bool)
+    if short_nrem2.size and np.any(short_nrem2):
+        _assign_state_on_intervals(arr, idx_timestamps, nrem_int[short_nrem2], 1)
+
+    return _fill_unassigned_states(arr)
+
+
 def _suppress_wake_to_rem_transitions(
     states: np.ndarray,
     timestamps: np.ndarray,
@@ -1658,11 +1754,11 @@ def _suppress_wake_to_rem_transitions(
             w_start = i - 1
             while w_start - 1 >= 0 and arr[w_start - 1] == 1:
                 w_start -= 1
-            if bool(preserve_rem_interruption) and w_start > 0 and arr[w_start - 1] == 5:
-                i += 1
-                continue
             wake_dur = float(ts[i - 1] - ts[w_start]) if i - 1 >= w_start else 0.0
             if wake_dur <= min_wake:
+                i += 1
+                continue
+            if bool(preserve_rem_interruption) and w_start > 0 and arr[w_start - 1] == 5:
                 i += 1
                 continue
             j = i + 1
@@ -1912,74 +2008,35 @@ def _compute_sleep_state(
 
     min_len = float(max(0.0, min_state_length))
     microarousal_len = float(max(0.0, microarousal_sec))
-    ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
-
-    # Minimum interruption passes (approximation of ClusterStates_DetermineStates)
-    min_sws = min_len
-    min_w_next_rem = min_len
-    min_rem_in_w = min_len
-    min_rem = min_len
-    min_wake = min_len
-
-    wake_int = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
-    nrem_int = np.asarray(ints.get("NREMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
-    rem_int = np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
-
-    # short nrem -> wake
-    short_nrem = (nrem_int[:, 1] - nrem_int[:, 0]) <= min_sws if nrem_int.size else np.asarray([], dtype=bool)
-    if short_nrem.size and np.any(short_nrem):
-        _assign_state_on_intervals(states, idx_timestamps, nrem_int[short_nrem], 1)
-
-    ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
-    wake_int = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
-    rem_int = np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
-
-    # short wake next to rem -> rem
-    short_w = (wake_int[:, 1] - wake_int[:, 0]) <= min_w_next_rem if wake_int.size else np.asarray([], dtype=bool)
-    wr, rw = _find_next_to_ints(wake_int, rem_int)
-    if short_w.size and np.any(short_w & (wr | rw)):
-        _assign_state_on_intervals(states, idx_timestamps, wake_int[short_w & (wr | rw)], 5)
-
-    ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
-    rem_int = np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
-    wake_int = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
-
-    # short rem in wake -> wake
-    short_r = (rem_int[:, 1] - rem_int[:, 0]) <= min_rem_in_w if rem_int.size else np.asarray([], dtype=bool)
-    rr, rl = _find_next_to_ints(rem_int, wake_int)
-    if short_r.size and np.any(short_r & (rr & rl)):
-        _assign_state_on_intervals(states, idx_timestamps, rem_int[short_r & (rr & rl)], 1)
-
-    ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
-    rem_int = np.asarray(ints.get("REMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
-    short_r2 = (rem_int[:, 1] - rem_int[:, 0]) <= min_rem if rem_int.size else np.asarray([], dtype=bool)
-    if short_r2.size and np.any(short_r2):
-        _assign_state_on_intervals(states, idx_timestamps, rem_int[short_r2], 1)
-
-    ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
-    wake_int = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
-    nrem_int = np.asarray(ints.get("NREMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
-    short_w2 = (wake_int[:, 1] - wake_int[:, 0]) <= min_wake if wake_int.size else np.asarray([], dtype=bool)
-    wn, nw = _find_next_to_ints(wake_int, nrem_int)
-    if short_w2.size and np.any(short_w2 & (wn | nw)):
-        _assign_state_on_intervals(states, idx_timestamps, wake_int[short_w2 & (wn | nw)], 3)
-
-    ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
-    nrem_int = np.asarray(ints.get("NREMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
-    short_nrem2 = (nrem_int[:, 1] - nrem_int[:, 0]) <= min_sws if nrem_int.size else np.asarray([], dtype=bool)
-    if short_nrem2.size and np.any(short_nrem2):
-        _assign_state_on_intervals(states, idx_timestamps, nrem_int[short_nrem2], 1)
+    states = _apply_minimum_state_durations(states, idx_timestamps, statename_list, min_len)
 
     if block_wake_to_rem:
         states = _suppress_wake_to_rem_transitions(
             states,
             idx_timestamps,
             min_wake_before_rem_secs=microarousal_len,
-            preserve_rem_interruption=True,
+            preserve_rem_interruption=False,
         )
 
     if emg_forced_wake_int.size:
         _assign_state_on_intervals(states, idx_timestamps, emg_forced_wake_int, 1)
+        states = _apply_minimum_state_durations(states, idx_timestamps, statename_list, min_len)
+        if block_wake_to_rem:
+            states = _suppress_wake_to_rem_transitions(
+                states,
+                idx_timestamps,
+                min_wake_before_rem_secs=microarousal_len,
+                preserve_rem_interruption=False,
+            )
+
+    states = _fill_unassigned_states(states)
+    if block_wake_to_rem:
+        states = _suppress_wake_to_rem_transitions(
+            states,
+            idx_timestamps,
+            min_wake_before_rem_secs=microarousal_len,
+            preserve_rem_interruption=False,
+        )
 
     ints = _idx_to_int(states=states, timestamps=idx_timestamps, statenames=statename_list)
 

@@ -392,7 +392,7 @@ def create_channel_map(
             if ch_id not in spk_set:
                 connected[i] = False
 
-    chanMap = np.arange(1, n_channels + 1).reshape(1, -1)
+    chanMap = (real_channels + 1).reshape(1, -1)
     chanMap0ind = real_channels.reshape(1, -1)
     save_dict = {
         "chanMap": chanMap.astype(float),
@@ -430,7 +430,9 @@ def prepare_chanmap(
 
     chan = loadmat(chanmap_path)
     connected = np.asarray(chan["connected"]).flatten().astype(int)
-    bad_ch_ids = np.where(connected == 0)[0].tolist()
+    device_ch_inds = np.asarray(chan.get("chanMap0ind", np.asarray(chan["chanMap"]).flatten() - 1)).flatten().astype(int)
+    n = min(connected.size, device_ch_inds.size)
+    bad_ch_ids = device_ch_inds[:n][connected[:n] == 0].astype(int).tolist()
     return Path(chanmap_path), bad_ch_ids
 
 
@@ -456,9 +458,12 @@ def show_chanmap(
     y = np.asarray(chanmap["ycoords"]).flatten()
     shank_ids = np.asarray(chanmap["kcoords"]).flatten()
     probe_ids = np.asarray(chanmap.get("probe_ids", np.ones_like(x))).flatten()
-    device_ch_inds = np.asarray(chanmap["chanMap"]).flatten().astype(int) - 1
+    device_ch_inds = np.asarray(
+        chanmap.get("chanMap0ind", np.asarray(chanmap["chanMap"]).flatten() - 1)
+    ).flatten().astype(int)
     connected = np.asarray(chanmap["connected"]).flatten().astype(int)
-    bad_ch_ids = np.where(connected == 0)[0].tolist()
+    n = min(connected.size, device_ch_inds.size)
+    bad_ch_ids = device_ch_inds[:n][connected[:n] == 0].astype(int).tolist()
 
     probegroup = ProbeGroup()
     unique_probes = [p for p in np.unique(probe_ids) if p > 0]
@@ -804,7 +809,28 @@ def _subsession_sort_key(
 def _infer_channels_from_file(path: Path, sample_count: int, bytes_per_sample: int = 2) -> int:
     if sample_count <= 0 or not path.exists():
         return 0
-    return int(path.stat().st_size // (sample_count * bytes_per_sample))
+    denom = int(sample_count) * int(bytes_per_sample)
+    size = int(path.stat().st_size)
+    if denom <= 0 or size % denom != 0:
+        raise ValueError(
+            f"Cannot infer sidecar channel count for {path}: size={size}, "
+            f"sample_count={sample_count}, bytes_per_sample={bytes_per_sample}"
+        )
+    return int(size // denom)
+
+
+def _infer_sample_count_from_binary(path: Path, *, n_channels: int, dtype: str) -> int:
+    itemsize = np.dtype(dtype).itemsize
+    frame_bytes = int(n_channels) * int(itemsize)
+    if frame_bytes <= 0:
+        raise ValueError(f"Invalid binary frame size for {path}: n_channels={n_channels}, dtype={dtype}")
+    size = int(path.stat().st_size)
+    if size % frame_bytes != 0:
+        raise ValueError(
+            f"Binary file size is not divisible by frame size: {path} "
+            f"size={size}, frame_bytes={frame_bytes}"
+        )
+    return int(size // frame_bytes)
 
 
 def build_acquisition_catalog(
@@ -814,7 +840,6 @@ def build_acquisition_catalog(
     intan_header: IntanRhdHeader | None = None,
 ) -> AcquisitionCatalog:
     if amplifier_paths and amplifier_paths[0].is_dir() and (amplifier_paths[0] / "structure.oebin").exists():
-        itemsize = np.dtype(dtype).itemsize
         recording_paths = [Path(p) for p in amplifier_paths]
         continuous_paths: list[Path] = []
         recording_stream_names: list[str | None] = []
@@ -843,7 +868,13 @@ def build_acquisition_catalog(
             continuous_paths.append(continuous_path)
             recording_stream_names.append(stream_name)
             ttl_event_paths.append(ttl_path)
-            sample_counts.append(int(continuous_path.stat().st_size // (n_channels * itemsize)))
+            sample_counts.append(
+                _infer_sample_count_from_binary(
+                    continuous_path,
+                    n_channels=n_channels,
+                    dtype=dtype,
+                )
+            )
 
         has_ttl = any(path.exists() for path in ttl_event_paths)
         dig_ch = 16 if has_ttl else 0
@@ -876,8 +907,14 @@ def build_acquisition_catalog(
             board_digital_input_native_orders=dig_native_orders,
         )
 
-    itemsize = np.dtype(dtype).itemsize
-    sample_counts = [int(p.stat().st_size // (n_amplifier_channels * itemsize)) for p in amplifier_paths]
+    sample_counts = [
+        _infer_sample_count_from_binary(
+            p,
+            n_channels=n_amplifier_channels,
+            dtype=dtype,
+        )
+        for p in amplifier_paths
+    ]
 
     analogin_paths: list[Path] = []
     digitalin_paths: list[Path] = []
@@ -1258,12 +1295,20 @@ def rezToPhy(rez: dict, save_path: str | Path) -> None:
     amplitudes = st3[:, 2]
 
     ops = rez["ops"]
-    chan_map = np.atleast_1d(ops["chanMap"]).flatten()
-    chan_map_0ind = (chan_map - 1).astype(np.int32)
+    if "chanMap0ind" in ops:
+        chan_map_0ind = np.atleast_1d(ops["chanMap0ind"]).flatten().astype(np.int32)
+    else:
+        chan_map = np.atleast_1d(ops["chanMap"]).flatten()
+        chan_map_0ind = (chan_map - 1).astype(np.int32)
 
     connected = np.atleast_1d(rez["connected"]).flatten().astype(bool)
     xcoords = np.atleast_1d(rez["xcoords"]).flatten()
     ycoords = np.atleast_1d(rez["ycoords"]).flatten()
+    n_chan_meta = min(chan_map_0ind.size, connected.size, xcoords.size, ycoords.size)
+    chan_map_0ind = chan_map_0ind[:n_chan_meta]
+    connected = connected[:n_chan_meta]
+    xcoords = xcoords[:n_chan_meta]
+    ycoords = ycoords[:n_chan_meta]
 
     U = np.asarray(rez["U"])
     W = np.asarray(rez["W"])
