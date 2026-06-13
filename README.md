@@ -8,6 +8,29 @@ PreprocessPipeline is a preprocessing and postprocessing pipeline for spike sort
 
 Run the command for your OS, then activate the environment.
 
+### Locked Environment
+
+For the current working server environment, use the lock files in `env_locks/`.
+This is the safest option when NumPy/SciPy dependency changes cause errors.
+
+Files:
+
+- `env_locks/environment-linux-64.lock.yml`: full conda export including pip packages.
+- `env_locks/conda-linux-64.explicit.txt`: exact conda package URLs for linux-64.
+- `env_locks/pip-freeze.txt`: raw `pip freeze` output for auditing.
+
+Linux exact recreate:
+
+```bash
+conda env create -n preprocess-locked -f env_locks/environment-linux-64.lock.yml
+conda activate preprocess-locked
+python -m pip install -e .
+```
+
+Known working core versions are Python `3.11.14`, NumPy `1.26.4`, SciPy
+`1.16.3`, Numba `0.62.1`, llvmlite `0.45.1`, SpikeInterface `0.103.2`, and
+PySide6 `6.9.2`.
+
 ### Windows
 
 ```powershell
@@ -44,6 +67,63 @@ conda activate preprocess
 
 ```bash
 python -m marimo edit Run_preprocessSession.py
+```
+
+### PreprocessPipeline GUI
+
+The GUI provides basepath selection, preprocess/postprocess settings, `chanMap.mat` preview, preflight checks, run buttons, and pipeline logs.
+
+Recommended launcher for Windows, Linux, and macOS:
+
+```bash
+conda activate preprocess
+python launch_gui.py
+```
+
+The GUI prints a local URL such as `http://127.0.0.1:8765` and tries to open it in a browser automatically.
+
+Convenience wrappers are also available:
+
+Windows:
+
+```powershell
+.\launch_gui.bat
+```
+
+Linux/macOS:
+
+```bash
+./launch_gui.sh
+```
+
+For VS Code Remote sessions, run the same launcher in the remote terminal. If VS Code asks to forward the port, accept it and open the forwarded URL in Simple Browser or your local browser.
+
+If port `8765` is busy, the GUI automatically tries the next available port and prints the actual URL.
+
+Advanced direct command:
+
+```bash
+preprocess-webgui
+```
+
+If the package entry point is not registered in the active environment, use:
+
+```bash
+python -m src.preprocess.gui.web_app
+```
+
+The Qt desktop GUI is also available for sessions with a working display server:
+
+After updating the environment, launch it with:
+
+```bash
+preprocess-gui
+```
+
+If the package is not installed as an editable package in the active environment, use:
+
+```bash
+python -m src.preprocess.gui.app
 ```
 
 ### Phy GUI

@@ -601,14 +601,33 @@ def apply_preprocessing(
         freq_max=bandpass_max_hz,
     )
 
-    if reference == "local":
+    reference_normalized = str(reference).strip().lower()
+    if reference_normalized in {"none", "no", "off"}:
+        return rec_f
+
+    if reference_normalized == "local":
         has_locations = True
         try:
-            _ = rec_f.get_channel_locations()
+            locations = rec_f.get_channel_locations()
         except Exception:
             has_locations = False
 
         if has_locations:
+            isolated_channels = _local_reference_channels_without_neighbors(
+                channel_ids=[int(ch) for ch in rec_f.get_channel_ids()],
+                locations=locations,
+                local_radius_um=local_radius_um,
+            )
+            if isolated_channels:
+                shown = ", ".join(str(ch) for ch in isolated_channels[:20])
+                suffix = ", ..." if len(isolated_channels) > 20 else ""
+                raise ValueError(
+                    "Local CMR cannot be applied because some channels have no "
+                    "reference channels inside the local annulus "
+                    f"{tuple(local_radius_um)} um. Channels: {shown}{suffix}. "
+                    "Increase CMR radius max, or set common median reference to "
+                    "global/none."
+                )
             rec_ref = spre.common_reference(
                 rec_f,
                 reference="local",
@@ -618,10 +637,35 @@ def apply_preprocessing(
         else:
             print("Channel locations are unavailable. Falling back to global median reference.")
             rec_ref = spre.common_reference(rec_f, reference="global", operator="median")
-    else:
+    elif reference_normalized == "global":
         rec_ref = spre.common_reference(rec_f, reference="global", operator="median")
+    else:
+        raise ValueError("reference must be one of: none, local, global")
 
     return rec_ref
+
+
+def _local_reference_channels_without_neighbors(
+    *,
+    channel_ids: list[int],
+    locations: Any,
+    local_radius_um: tuple[float, float],
+) -> list[int]:
+    loc = np.asarray(locations, dtype=np.float64)
+    if loc.ndim != 2 or loc.shape[0] == 0:
+        return []
+    n = min(len(channel_ids), loc.shape[0])
+    if n <= 1:
+        return [int(ch) for ch in channel_ids[:n]]
+
+    loc = loc[:n]
+    ids = [int(ch) for ch in channel_ids[:n]]
+    r_min, r_max = sorted(float(v) for v in local_radius_um)
+    diffs = loc[:, None, :] - loc[None, :, :]
+    dist = np.sqrt(np.sum(diffs * diffs, axis=2))
+    neighbor_mask = (dist >= r_min) & (dist <= r_max)
+    np.fill_diagonal(neighbor_mask, False)
+    return [ch for ch, has_neighbor in zip(ids, np.any(neighbor_mask, axis=1)) if not has_neighbor]
 
 
 def preprocess_selected_channels_preserve_shape(
