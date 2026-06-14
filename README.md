@@ -29,7 +29,8 @@ python -m pip install -e .
 
 Known working core versions are Python `3.11.14`, NumPy `1.26.4`, SciPy
 `1.16.3`, Numba `0.62.1`, llvmlite `0.45.1`, SpikeInterface `0.103.2`, and
-PySide6 `6.9.2`.
+PySide6 `6.9.2`. PyTorch installs are pinned to Torch `2.9.1` and
+TorchVision `0.24.1`.
 
 ### Windows
 
@@ -59,17 +60,7 @@ python scripts/setup_env.py --force-recreate
 conda activate preprocess
 ```
 
-## Optional Tools
-
-### marimo
-
-`marimo` is included in the `preprocess` environment, and `Run_preprocessSession.py` can be opened in marimo:
-
-```bash
-python -m marimo edit Run_preprocessSession.py
-```
-
-### PreprocessPipeline GUI
+## PreprocessPipeline GUI
 
 The GUI provides basepath selection, preprocess/postprocess settings, `chanMap.mat` preview, preflight checks, run buttons, and pipeline logs.
 
@@ -80,7 +71,7 @@ conda activate preprocess
 python launch_gui.py
 ```
 
-The GUI prints a local URL such as `http://127.0.0.1:8765` and tries to open it in a browser automatically.
+The launcher opens the GUI in a browser automatically. If the browser does not open, use the address printed in the terminal.
 
 Convenience wrappers are also available:
 
@@ -96,9 +87,7 @@ Linux/macOS:
 ./launch_gui.sh
 ```
 
-For VS Code Remote sessions, run the same launcher in the remote terminal. If VS Code asks to forward the port, accept it and open the forwarded URL in Simple Browser or your local browser.
-
-If port `8765` is busy, the GUI automatically tries the next available port and prints the actual URL.
+For VS Code Remote sessions, run the same launcher in the remote terminal. If VS Code asks to forward the port, accept it and open the forwarded address in Simple Browser or your local browser.
 
 To use a specific GUI default parameter file:
 

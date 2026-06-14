@@ -16,6 +16,8 @@ TORCH_CHANNELS: tuple[tuple[str, tuple[int, int]], ...] = (
     ("cu124", (12, 4)),
     ("cu118", (11, 8)),
 )
+TORCH_VERSION = "2.9.1"
+TORCHVISION_VERSION = "0.24.1"
 
 
 def _format_cmd(cmd: list[str]) -> str:
@@ -78,7 +80,15 @@ def resolve_compute_platform(requested: str) -> tuple[str, str]:
 
 
 def build_install_command(channel: str) -> list[str]:
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "torch", "torchvision", "torchaudio"]
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        f"torch=={TORCH_VERSION}",
+        f"torchvision=={TORCHVISION_VERSION}",
+    ]
     if platform.system() == "Darwin" and channel == "cpu":
         return cmd
     return [*cmd, "--index-url", f"https://download.pytorch.org/whl/{channel}"]

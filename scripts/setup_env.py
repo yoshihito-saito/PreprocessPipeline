@@ -123,7 +123,7 @@ def main() -> None:
     if strategy == "windows":
         _conda_run(conda, env_name, ["python", "-m", "pip", "install", "--upgrade", "pip"])
         _conda_run(conda, env_name, ["python", "scripts/install_torch.py", "--compute-platform", args.torch_channel])
-        _conda_run(conda, env_name, ["python", "-m", "pip", "install", "-e", ".[dev,notebook]"])
+        _conda_run(conda, env_name, ["python", "-m", "pip", "install", "-e", ".", "--no-deps"])
         _verify_windows_stack(conda, env_name)
         return
 
