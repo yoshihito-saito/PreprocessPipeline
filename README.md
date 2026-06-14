@@ -22,8 +22,8 @@ Files:
 Linux exact recreate:
 
 ```bash
-conda env create -n preprocess-locked -f env_locks/environment-linux-64.lock.yml
-conda activate preprocess-locked
+conda env create -f env_locks/environment-linux-64.lock.yml
+conda activate preprocess
 python -m pip install -e .
 ```
 

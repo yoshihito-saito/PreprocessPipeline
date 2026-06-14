@@ -1,4 +1,4 @@
-name: phy2
+name: preprocess
 channels:
   - conda-forge
 dependencies:
