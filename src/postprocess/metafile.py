@@ -101,10 +101,6 @@ class PostprocessConfig:
             "snr_lt": 0.5,
             "amplitude_median_lt": 5.0,
             "amplitude_median_gt": 2000.0,
-            "peak_to_valley_gt": 0.85,
-            "peak_trough_ratio_lt": -0.5,
-            "halfwidth_gt": 0.45,
-            "slope_lt": 100.0,
             "firing_rate_lt": 0.01,
         }
     )

@@ -263,16 +263,18 @@ Noise thresholds:
   - Exclude units whose absolute median spike amplitude is too small.
 - `amplitude_median_gt = 2000.0`
   - Exclude likely artifacts whose absolute median spike amplitude is too large.
-- `peak_to_valley_gt = 0.85`
-  - Exclude units with excessively long peak-to-valley duration.
-- `peak_trough_ratio_lt = -0.5`
-  - Exclude units whose peak/trough ratio is below threshold and suggests an implausible waveform shape.
-- `halfwidth_gt = 0.4`
-  - Exclude units with overly broad spike half-width.
-- `slope_lt = 100.0`
-  - Exclude units with repolarization/recovery-derived slope that is too shallow.
 - `firing_rate_lt = 0.01`
   - Exclude units with firing rate that is too low.
+
+Waveform-shape thresholds are computed and exported for review, but are not
+enabled as default hard noise criteria because they are sensitive to waveform
+polarity and triphasic templates. The GUI does not expose these thresholds.
+Add these keys explicitly to `noise_thresholds` in code or notebooks to opt in:
+
+- `peak_to_valley_gt`
+- `peak_trough_ratio_lt`
+- `halfwidth_gt`
+- `slope_lt`
 
 ## Python Implementation Status
 

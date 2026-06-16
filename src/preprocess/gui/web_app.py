@@ -1145,7 +1145,7 @@ INDEX_HTML = r"""<!doctype html>
           <label>workers</label><input id="post_worker_count" type="number" min="1">
           <label class="check"><input id="post_overwrite" type="checkbox"> overwrite curation/metrics outputs</label><span></span>
           <div class="wide section">Noise labeling thresholds</div>
-          <div class="wide hint">Clusters are marked noise when any enabled metric crosses its threshold. Waveform thresholds use template metrics computed after curation.</div>
+          <div class="wide hint">Clusters are marked noise when any enabled metric crosses its threshold. Blank fields are disabled.</div>
           <label title="Mark noise when firing rate is less than or equal to this Hz value.">firing rate <= Hz</label><input id="noise_firing_rate_lt" type="number" step="0.001">
           <label title="Mark noise when ISI violations ratio exceeds this value.">ISI violation ratio ></label><input id="noise_isi_violations_ratio_gt" type="number" step="0.1">
           <label title="Mark noise when ISI violation count exceeds this value.">ISI violation count ></label><input id="noise_isi_violations_count_gt" type="number" step="1">
@@ -1153,10 +1153,6 @@ INDEX_HTML = r"""<!doctype html>
           <label title="Mark noise when SNR is below this value.">SNR <</label><input id="noise_snr_lt" type="number" step="0.1">
           <label title="Mark noise when absolute median amplitude is below this microvolt value.">amplitude median abs < uV</label><input id="noise_amplitude_median_lt" type="number" step="1">
           <label title="Mark noise when absolute median amplitude is above this microvolt value.">amplitude median abs > uV</label><input id="noise_amplitude_median_gt" type="number" step="1">
-          <label title="Mark noise when peak-to-valley waveform duration exceeds this milliseconds value.">peak-to-valley > ms</label><input id="noise_peak_to_valley_gt" type="number" step="0.01">
-          <label title="Mark noise when peak/trough ratio is below this value.">peak/trough ratio <</label><input id="noise_peak_trough_ratio_lt" type="number" step="0.01">
-          <label title="Mark noise when waveform half-width exceeds this milliseconds value.">half-width > ms</label><input id="noise_halfwidth_gt" type="number" step="0.01">
-          <label title="Mark noise when repolarization slope is below this value.">repolarization slope <</label><input id="noise_slope_lt" type="number" step="1">
           <div class="wide"><button onclick="startRun('noise_label')" title="Only update noise labels from existing quality_metrics.csv. Requires full postprocess output to already exist.">Run noise labeling only</button></div>
         </div>
       </div>
@@ -1270,10 +1266,6 @@ INDEX_HTML = r"""<!doctype html>
       'snr_lt',
       'amplitude_median_lt',
       'amplitude_median_gt',
-      'peak_to_valley_gt',
-      'peak_trough_ratio_lt',
-      'halfwidth_gt',
-      'slope_lt',
       'firing_rate_lt'
     ];
 

@@ -19,10 +19,6 @@ NOTEBOOK_NOISE_THRESHOLDS = {
     "snr_lt": 2.0,
     "amplitude_median_lt": 15.0,
     "amplitude_median_gt": 500.0,
-    "peak_to_valley_gt": 0.85,
-    "peak_trough_ratio_lt": -0.5,
-    "halfwidth_gt": 0.4,
-    "slope_lt": 15.0,
     "firing_rate_lt": 0.01,
 }
 
