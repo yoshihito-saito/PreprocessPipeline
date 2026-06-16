@@ -22,7 +22,6 @@ dependencies = [
 
 [project.scripts]
 preprocess-gui = "src.preprocess.gui:main"
-preprocess-webgui = "src.preprocess.gui.web_app:main"
 
 [project.optional-dependencies]
 dev = [

@@ -792,6 +792,33 @@ def ensure_xml(basepath: Path, local_output_dir: Path, basename: str) -> Path:
     )
 
 
+def find_rhd_source(basepath: Path, basename: str, *, use_first_child_match: bool = False) -> Path | None:
+    preferred = [basepath / f"{basename}.rhd", basepath / "info.rhd"]
+
+    for src in preferred:
+        if src is not None and src.exists():
+            return src
+
+    child_matches = _direct_child_file_candidates(basepath, "info.rhd", f"{basename}.rhd")
+    if len(child_matches) == 1:
+        return child_matches[0]
+    if len(child_matches) > 1:
+        ordered_matches = sorted(
+            child_matches,
+            key=lambda path: _subsession_sort_key(path.parent / "amplifier.dat"),
+        )
+        return ordered_matches[0]
+
+    local_rhd = sorted(basepath.glob("*.rhd"))
+    if len(local_rhd) == 1:
+        return local_rhd[0]
+    if len(local_rhd) > 1:
+        local_rhd = sorted(local_rhd, key=lambda path: _fallback_session_name_sort_key(path.stem))
+        return local_rhd[0]
+
+    return None
+
+
 def ensure_rhd(
     basepath: Path,
     local_output_dir: Path,
@@ -800,34 +827,9 @@ def ensure_rhd(
     use_first_child_match: bool = False,
 ) -> Path | None:
     target = local_output_dir / f"{basename}.rhd"
-    preferred = [basepath / f"{basename}.rhd", basepath / "info.rhd"]
-
-    for src in preferred:
-        if src is not None and src.exists():
-            copy2(src, target)
-            return target
-
-    child_matches = _direct_child_file_candidates(basepath, "info.rhd", f"{basename}.rhd")
-    if len(child_matches) == 1:
-        copy2(child_matches[0], target)
-        return target
-    if len(child_matches) > 1:
-        ordered_matches = sorted(
-            child_matches,
-            key=lambda path: _subsession_sort_key(path.parent / "amplifier.dat"),
-        )
-        first_match = ordered_matches[0]
-        copy2(first_match, target)
-        return target
-
-    local_rhd = sorted(basepath.glob("*.rhd"))
-    if len(local_rhd) == 1:
-        copy2(local_rhd[0], target)
-        return target
-    if len(local_rhd) > 1:
-        local_rhd = sorted(local_rhd, key=lambda path: _fallback_session_name_sort_key(path.stem))
-        first_match = local_rhd[0]
-        copy2(first_match, target)
+    src = find_rhd_source(basepath, basename, use_first_child_match=use_first_child_match)
+    if src is not None:
+        copy2(src, target)
         return target
 
     if target.exists():
