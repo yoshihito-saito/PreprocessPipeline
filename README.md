@@ -64,16 +64,25 @@ conda activate preprocess
 
 The GUI provides basepath selection, preprocess/postprocess settings, `chanMap.mat` preview, preflight checks, run buttons, and pipeline logs.
 
-Recommended launcher for Windows, Linux, and macOS:
+Recommended command after installing the package in the active environment:
 
 ```bash
 conda activate preprocess
+preprocess-gui
+```
+
+The command starts the standalone Qt desktop GUI. It requires a working display
+server, for example a local desktop session, X forwarding, or a VS Code remote
+display setup.
+
+If the package entry point is not registered in the active environment, use the
+repository launcher:
+
+```bash
 python launch_gui.py
 ```
 
-The launcher opens the GUI in a browser automatically. If the browser does not open, use the address printed in the terminal.
-
-Convenience wrappers are also available:
+Convenience wrappers call the same Qt launcher:
 
 Windows:
 
@@ -87,41 +96,22 @@ Linux/macOS:
 ./launch_gui.sh
 ```
 
-For VS Code Remote sessions, run the same launcher in the remote terminal. If VS Code asks to forward the port, accept it and open the forwarded address in Simple Browser or your local browser.
-
 To use a specific GUI default parameter file:
 
 ```bash
 python launch_gui.py --config config/preprocess_gui_default_config.json
 ```
 
-Advanced direct command:
+For private machine-specific defaults, create
+`config/preprocess_gui_default_config.local.json`. The GUI loads this untracked
+file automatically when `PREPROCESS_GUI_DEFAULT_CONFIG` is not set, while the
+tracked public default config stays free of personal paths. In the desktop GUI,
+use `Load config` and `Save config` to browse arbitrary GUI config JSON files.
+When `local_root` is blank, the GUI automatically uses
+`<PreprocessPipeline root>/preprocess_tmp` as the local working directory and
+creates it if needed.
 
-```bash
-preprocess-webgui
-```
-
-The same config option is available for direct launch:
-
-```bash
-preprocess-webgui --config config/preprocess_gui_default_config.json
-```
-
-If the package entry point is not registered in the active environment, use:
-
-```bash
-python -m src.preprocess.gui.web_app
-```
-
-The Qt desktop GUI is also available for sessions with a working display server:
-
-After updating the environment, launch it with:
-
-```bash
-preprocess-gui
-```
-
-If the package is not installed as an editable package in the active environment, use:
+Advanced direct module launch:
 
 ```bash
 python -m src.preprocess.gui.app
@@ -209,7 +199,7 @@ mexGPUall
 - TTL artifact removal: `remove_artifact_TTL=True`
 - TTL channel selection: `artifact_TTL_channel` (0-based `[0..15]`)
 - TTL edge behavior:
-  - default: rising edges (`digitalIn.timestampsOn`)
+  - default: rising edges only (`digitalIn.timestampsOn`; `artifact_TTL_include_offset=False`)
   - include falling edges: `artifact_TTL_include_offset=True` (`timestampsOn + timestampsOff`)
 - TTL cleaning params: `artifact_TTL_ms_before`, `artifact_TTL_ms_after`, `artifact_TTL_mode`, `artifact_TTL_by_group`
 - High-amplitude artifact removal: `remove_highamp_artifact=True`

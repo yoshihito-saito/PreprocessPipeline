@@ -2,6 +2,7 @@
 data/*
 sorting_tmp/*
 sorting_temp/*
+preprocess_tmp/*
 # --- Python ---
 __pycache__/
 *.pyo
@@ -44,6 +45,7 @@ Sorting_comparison_KS.ipynb
 .codex
 .speedtest_workdir.bin
 config/preprocess_gui_default_config_ys.json
+config/preprocess_gui_default_config.local.json
 config/preprocess_gui_default_config.json
 AGENTS.md
 implementation_plan/

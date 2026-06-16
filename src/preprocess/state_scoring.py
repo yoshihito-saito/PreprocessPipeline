@@ -114,6 +114,12 @@ def _safe_uint_dtype(max_value: int) -> np.dtype:
     return np.dtype(np.uint32)
 
 
+def _new_saved_figure(*, figsize: tuple[float, float]):
+    from matplotlib.figure import Figure
+
+    return Figure(figsize=figsize)
+
+
 def _resolve_parallel_jobs(job_kwargs: dict[str, Any] | None) -> int:
     if not isinstance(job_kwargs, dict):
         return 1
@@ -1284,12 +1290,11 @@ def _save_swth_figure(
     fig_dir.mkdir(parents=True, exist_ok=True)
     out_path = fig_dir / f"{basename}_SWTHChannels.jpg"
     try:
-        import matplotlib.pyplot as plt
+        fig = _new_saved_figure(figsize=(12, 10))
     except Exception:
         out_path.touch()
         return out_path
 
-    fig = plt.figure(figsize=(12, 10))
     gs = fig.add_gridspec(
         nrows=5,
         ncols=2,
@@ -1407,7 +1412,7 @@ def _save_swth_figure(
     ax_th_spec.set_xlabel("t (s)")
 
     fig.savefig(out_path, dpi=120)
-    plt.close(fig)
+    fig.clear()
     return out_path
 
 
@@ -2204,14 +2209,13 @@ def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, An
     th_thr = float(hists.get("THthresh", 0.5))
 
     try:
-        import matplotlib.pyplot as plt
+        fig = _new_saved_figure(figsize=(12, 11))
     except Exception:
         for p in (p_results, p_2d, p_3d):
             p.touch()
         return [p_results, p_2d, p_3d]
 
     # Figure 1: SSResults (spectrograms + state bars + metrics)
-    fig = plt.figure(figsize=(12, 11))
     gs = fig.add_gridspec(8, 1, hspace=0.18)
     ax_sw_spec = fig.add_subplot(gs[0:2, 0])
     ax_th_spec = fig.add_subplot(gs[2, 0], sharex=ax_sw_spec)
@@ -2299,10 +2303,10 @@ def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, An
     ax_emg.set_xlabel("t (s)")
 
     fig.savefig(p_results, dpi=120)
-    plt.close(fig)
+    fig.clear()
 
     # Figure 2: SSCluster2D
-    fig = plt.figure(figsize=(10, 10.5))
+    fig = _new_saved_figure(figsize=(10, 10.5))
     # 6-row grid lets the right column use two equal-height panels (3 rows each).
     gs = fig.add_gridspec(6, 2, wspace=0.35, hspace=0.9)
     ax11 = fig.add_subplot(gs[0:2, 0])
@@ -2358,10 +2362,10 @@ def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, An
     ax22.set_ylabel("EMG")
 
     fig.savefig(p_2d, dpi=120)
-    plt.close(fig)
+    fig.clear()
 
     # Figure 3: SSCluster3D
-    fig = plt.figure(figsize=(11, 8))
+    fig = _new_saved_figure(figsize=(11, 8))
     gs = fig.add_gridspec(3, 3, wspace=0.4, hspace=0.45)
     ax_sw_hist = fig.add_subplot(gs[0, 0])
     ax_emg_hist = fig.add_subplot(gs[1, 0])
@@ -2391,7 +2395,7 @@ def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, An
     ax3d.set_zlabel("EMG")
 
     fig.savefig(p_3d, dpi=120)
-    plt.close(fig)
+    fig.clear()
 
     return [p_results, p_2d, p_3d]
 

@@ -28,11 +28,20 @@ SORTING_OUTPUT_PATTERNS = (
     "Kilosort2.5_*",
     "Kilosort4_*",
 )
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_LOCAL_WORKING_DIR = REPO_ROOT / "preprocess_tmp"
 
 
 def default_worker_count() -> int:
     cpu_count = os.cpu_count() or 1
     return 128 if cpu_count >= 128 else max(1, cpu_count - 8)
+
+
+def default_local_working_dir(*, create: bool = True) -> Path:
+    path = DEFAULT_LOCAL_WORKING_DIR
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def parse_int_list(text: str) -> list[int]:
@@ -109,7 +118,7 @@ class PreprocessGuiSettings:
     remove_ttl_artifacts: bool = False
     artifact_ttl_group_mode: str = "none"
     artifact_ttl_channel: int = 0
-    artifact_ttl_include_offset: bool = True
+    artifact_ttl_include_offset: bool = False
     artifact_ttl_ms_before: float = 0.5
     artifact_ttl_ms_after: float = 2.0
     artifact_ttl_mode: str = "linear"
@@ -133,7 +142,7 @@ class PreprocessGuiSettings:
     sorter: str | None = "Kilosort"
     sorter_path: str = str(Path("sorter") / "KiloSort1")
     sorter_config_path: str = str(Path("sorter") / "Kilosort1_config.yaml")
-    matlab_path: str = "/local/workdir/ys2375/MATLAB/R2024b/bin/matlab"
+    matlab_path: str = ""
     preprocess_worker_count: int = field(default_factory=default_worker_count)
     sorter_worker_count: int = field(default_factory=default_worker_count)
     overwrite: bool = False
@@ -167,7 +176,7 @@ class PostprocessGuiSettings:
 @dataclass
 class PipelineGuiSettings:
     basepath: str = ""
-    local_root: str = str(Path.cwd() / "sorting_temp")
+    local_root: str = ""
     chanmap_path: str = ""
     preprocess: PreprocessGuiSettings = field(default_factory=PreprocessGuiSettings)
     postprocess: PostprocessGuiSettings = field(default_factory=PostprocessGuiSettings)
@@ -178,7 +187,7 @@ class PipelineGuiSettings:
 
     @property
     def local_root_path(self) -> Path:
-        return _path_or_none(self.local_root) or (Path.cwd() / "sorting_temp")
+        return _path_or_none(self.local_root) or default_local_working_dir()
 
     @property
     def basename(self) -> str:

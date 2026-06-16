@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from scipy.io import loadmat
 
-from src.preprocess.io import build_channel_map_data
+from src.preprocess.io import build_channel_map_data, find_rhd_source
 from src.preprocess.recording import _local_reference_channels_without_neighbors
 
 from .config_model import (
@@ -128,7 +128,11 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
 
     if basepath is not None:
         xml = basepath / f"{basepath.name}.xml"
-        rhd = basepath / "info.rhd"
+        rhd = find_rhd_source(basepath, basepath.name)
+        if rhd is None and output_dir is not None:
+            local_rhd = output_dir / f"{basepath.name}.rhd"
+            if local_rhd.exists():
+                rhd = local_rhd
         checks.append(
             CheckResult(
                 "Session XML",
@@ -139,8 +143,8 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
         checks.append(
             CheckResult(
                 "Intan info.rhd",
-                "ok" if rhd.exists() else "warn",
-                str(rhd) if rhd.exists() else f"not found at expected path: {rhd}",
+                "ok" if rhd is not None and rhd.exists() else "warn",
+                str(rhd) if rhd is not None and rhd.exists() else "not found in basepath or direct child folders",
             )
         )
 
@@ -221,7 +225,7 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
                     CheckResult(
                         "basename.dat",
                         "error",
-                        f"not found: {dat_path}. Run preprocess only with run sorter off to regenerate it, then run postprocess again.",
+                        f"not found: {dat_path}. Set spike sorting to skip/disabled, run preprocess only to create basename.dat, then run postprocess again.",
                     )
                 )
         else:

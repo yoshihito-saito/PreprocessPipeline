@@ -11,9 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Launch the PreprocessPipeline web GUI.")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser = argparse.ArgumentParser(description="Launch the PreprocessPipeline Qt GUI.")
     parser.add_argument(
         "--config",
         default=None,
@@ -22,7 +20,6 @@ def main(argv: list[str] | None = None) -> int:
             "from the repository root."
         ),
     )
-    parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args(argv)
 
     os.chdir(REPO_ROOT)
@@ -37,12 +34,11 @@ def main(argv: list[str] | None = None) -> int:
             config_path = REPO_ROOT / config_path
         os.environ["PREPROCESS_GUI_DEFAULT_CONFIG"] = str(config_path.resolve())
 
-    from src.preprocess.gui.web_app import main as web_main
+    sys.argv = [sys.argv[0]]
 
-    web_args = ["--host", args.host, "--port", str(args.port)]
-    if args.no_browser:
-        web_args.append("--no-browser")
-    return web_main(web_args)
+    from src.preprocess.gui.app import main as qt_main
+
+    return qt_main()
 
 
 if __name__ == "__main__":
