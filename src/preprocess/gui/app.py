@@ -1878,17 +1878,30 @@ class MainWindow(QMainWindow):
         if self._thread is None or not self._thread.isRunning():
             self._append_log("\n=== Force stop requested, but no pipeline job is running ===\n")
             return
-        QMessageBox.warning(
-            self,
-            "Force stop",
-            "The GUI will stay open.\n\n"
-            "The current QThread runner cannot be safely force-killed without risking a GUI crash. "
-            "Wait for the current step to finish, or close the terminal process if an emergency kill is required.",
-        )
-        self._append_log(
-            "\n=== Force stop requested; GUI remains open. "
-            "Safe in-GUI force kill requires subprocess-based execution. ===\n"
-        )
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Force stop")
+        dialog.setText("Stop the current run?")
+        stop_button = dialog.addButton("Stop", QMessageBox.ButtonRole.DestructiveRole)
+        dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(stop_button)
+        dialog.exec()
+        if dialog.clickedButton() is not stop_button:
+            return
+        thread = self._thread
+        self._append_log("\n=== Force stop requested ===\n")
+        thread.requestInterruption()
+        thread.quit()
+        thread.terminate()
+        stopped = thread.wait(5000)
+        if stopped:
+            self._append_log("=== Force stop complete ===\n")
+            self._thread_finished()
+            self._set_running(False)
+        else:
+            self._append_log(
+                "=== Force stop requested, but the current step is still shutting down ===\n"
+            )
 
     def _start_run(self, mode: RunMode) -> None:
         if self._thread is not None:

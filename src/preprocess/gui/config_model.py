@@ -35,7 +35,8 @@ DEFAULT_LOCAL_WORKING_DIR = REPO_ROOT / "preprocess_tmp"
 
 def default_worker_count() -> int:
     cpu_count = os.cpu_count() or 1
-    return 128 if cpu_count >= 128 else max(1, cpu_count - 8)
+    usable_count = min(cpu_count, 61) if os.name == "nt" else cpu_count
+    return 128 if usable_count >= 128 else max(1, usable_count - 8)
 
 
 def default_local_working_dir(*, create: bool = True) -> Path:
