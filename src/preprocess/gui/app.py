@@ -297,8 +297,8 @@ class ChanMapCanvas(QWidget):
         self._drag_start = None
         self._selection_patch = None
         ax.set_facecolor("#252525")
-        group_keys = [(int(p), int(k)) for p, k in zip(probe_ids.tolist(), kcoords.tolist())]
-        unique_groups = sorted(set(group_keys))
+        probe_keys = [int(p) for p in probe_ids.tolist()]
+        unique_probes = sorted(set(probe_keys))
         palette = [
             "#80deea",
             "#b39ddb",
@@ -321,10 +321,10 @@ class ChanMapCanvas(QWidget):
             "#b2dfdb",
             "#d1c4e9",
         ]
-        color_by_group = {
-            group: palette[idx % len(palette)] for idx, group in enumerate(unique_groups)
+        color_by_probe = {
+            probe: palette[idx % len(palette)] for idx, probe in enumerate(unique_probes)
         }
-        point_colors = np.array([color_by_group[group] for group in group_keys], dtype=object)
+        point_colors = np.array([color_by_probe[probe] for probe in probe_keys], dtype=object)
         ax.scatter(
             x[connected],
             y[connected],
@@ -497,6 +497,7 @@ class MainWindow(QMainWindow):
         self.noise_threshold_fields: dict[str, QLineEdit] = {}
         self._refresh_suspended = False
         self._last_chanmap_preview_key: tuple[Any, ...] | None = None
+        self._chanmap_controls_dirty = False
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(150)
@@ -828,6 +829,7 @@ class MainWindow(QMainWindow):
         session_form = self._form_layout(session)
         self.reject_channels = QLineEdit()
         self.reject_channels.setPlaceholderText("0, 3, 17")
+        self.reject_channels.textChanged.connect(self._mark_chanmap_controls_dirty)
         self.chanmap_path = QLineEdit()
         self.chanmap_path.setPlaceholderText("optional explicit chanMap.mat path")
         load_chanmap = QPushButton("Load chanMap")
@@ -1311,6 +1313,9 @@ class MainWindow(QMainWindow):
         self._probe_rows.append(row)
         for widget in [geometry, groups, x_offset]:
             self._connect_refresh(widget)
+        geometry.currentTextChanged.connect(self._mark_chanmap_controls_dirty)
+        groups.textChanged.connect(self._mark_chanmap_controls_dirty)
+        x_offset.valueChanged.connect(self._mark_chanmap_controls_dirty)
         self._schedule_refresh()
 
     def _remove_probe_assignment_row(self, row_panel: QWidget) -> None:
@@ -1319,6 +1324,7 @@ class MainWindow(QMainWindow):
         self._probe_rows = [row for row in self._probe_rows if row["panel"] is not row_panel]
         row_panel.setParent(None)
         row_panel.deleteLater()
+        self._mark_chanmap_controls_dirty()
         self._schedule_refresh()
 
     def _render_probe_assignments(self, assignments: list[dict[str, Any]]) -> None:
@@ -1362,6 +1368,11 @@ class MainWindow(QMainWindow):
             return None
         return parsed
 
+    def _mark_chanmap_controls_dirty(self, *_args: Any) -> None:
+        if self._refresh_suspended:
+            return
+        self._chanmap_controls_dirty = True
+
     @staticmethod
     def _bad_channels_from_chanmap_data(data: dict[str, Any]) -> list[int]:
         connected = np.asarray(data.get("connected", []), dtype=bool).reshape(-1)
@@ -1398,6 +1409,75 @@ class MainWindow(QMainWindow):
             return
         self.chanmap_canvas.load_chanmap(path)
         self._last_chanmap_preview_key = key
+
+    def _candidate_existing_chanmaps(self, *, include_explicit: bool = True) -> list[Path]:
+        settings = self._collect_settings()
+        candidates: list[Path] = []
+
+        explicit = Path(settings.chanmap_path).expanduser() if settings.chanmap_path.strip() else None
+        if include_explicit and explicit is not None:
+            candidates.append(explicit)
+
+        output_dir = settings.local_output_dir
+        if output_dir is not None:
+            candidates.append(output_dir / "chanMap.mat")
+            sorter_candidates: list[Path] = []
+            for pattern in ("Kilosort_*", "Kilosort2_5_*", "Kilosort2.5_*", "Kilosort4_*"):
+                for run_dir in output_dir.glob(pattern):
+                    if not run_dir.is_dir() or run_dir.name.endswith("_spi"):
+                        continue
+                    sorter_candidates.extend(
+                        [run_dir / "chanMap.mat", run_dir / "sorter_output" / "chanMap.mat"]
+                    )
+            sorter_candidates = [p for p in sorter_candidates if p.exists()]
+            sorter_candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            candidates.extend(sorter_candidates)
+
+        basepath = settings.basepath_path
+        if basepath is not None:
+            candidates.append(basepath / "chanMap.mat")
+
+        local_root_text = self.local_root.text().strip()
+        if local_root_text:
+            candidates.append(Path(local_root_text).expanduser() / "chanMap.mat")
+
+        seen: set[Path] = set()
+        unique: list[Path] = []
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                resolved = candidate
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            unique.append(candidate)
+        return unique
+
+    def _apply_chanmap_file_to_controls(self, path: Path) -> bool:
+        if not path.exists():
+            return False
+        data = loadmat(path)
+        assignments = self._assignments_from_chanmap_data(data)
+        self._refresh_suspended = True
+        try:
+            self.chanmap_path.setText(str(path))
+            self.reject_channels.setText(", ".join(str(v) for v in self._bad_channels_from_chanmap_data(data)))
+            if assignments:
+                self._render_probe_assignments(assignments)
+            self._chanmap_controls_dirty = False
+        finally:
+            self._refresh_suspended = False
+        self._last_chanmap_preview_key = None
+        self.chanmap_canvas.render_chanmap(data, source=path)
+        self._append_log(f"Loaded chanMap: {path}\n")
+        return True
+
+    def _auto_load_existing_chanmap(self) -> bool:
+        for candidate in self._candidate_existing_chanmaps(include_explicit=False):
+            if candidate.exists():
+                return self._apply_chanmap_file_to_controls(candidate)
+        return False
 
     def _load_settings_chanmap_preview(self, settings: PipelineGuiSettings) -> bool:
         basepath = settings.basepath_path
@@ -1457,11 +1537,15 @@ class MainWindow(QMainWindow):
         path = self._select_directory("Select basepath", self.basepath.text() or str(Path.cwd()))
         if path:
             self.basepath.setText(path)
+            self._auto_load_existing_chanmap()
+            self._schedule_refresh()
 
     def _browse_local_root(self) -> None:
         path = self._select_directory("Select local output root", self.local_root.text() or str(Path.cwd()))
         if path:
             self.local_root.setText(path)
+            self._auto_load_existing_chanmap()
+            self._schedule_refresh()
 
     def _browse_chanmap(self) -> None:
         path = self._select_open_file(
@@ -1470,19 +1554,7 @@ class MainWindow(QMainWindow):
             "MAT files (*.mat);;All files (*)",
         )
         if path:
-            chanmap_path = Path(path)
-            data = loadmat(chanmap_path)
-            self._refresh_suspended = True
-            try:
-                self.chanmap_path.setText(path)
-                self.reject_channels.setText(", ".join(str(v) for v in self._bad_channels_from_chanmap_data(data)))
-                assignments = self._assignments_from_chanmap_data(data)
-                if assignments:
-                    self._render_probe_assignments(assignments)
-            finally:
-                self._refresh_suspended = False
-            self._last_chanmap_preview_key = None
-            self.chanmap_canvas.render_chanmap(data, source=chanmap_path)
+            self._apply_chanmap_file_to_controls(Path(path))
             self._schedule_refresh()
 
     def _browse_sorting_folder(self) -> None:
@@ -1728,6 +1800,7 @@ class MainWindow(QMainWindow):
             self.highamp_mode.setCurrentText(p.highamp_mode)
             self.reject_channels.setText(", ".join(str(v) for v in p.reject_channels))
             self._render_probe_assignments(p.probe_assignments)
+            self._chanmap_controls_dirty = False
             self.run_sorter.setChecked(p.run_sorter and (p.sorter or "disabled") != "disabled")
             self.sorter.setCurrentText(p.sorter or "disabled")
             default_sorter_path, default_sorter_config = self._current_sorter_defaults()
@@ -1794,7 +1867,14 @@ class MainWindow(QMainWindow):
             lines.extend(self._format_checks(checks))
             self.run_preview.setPlainText("\n".join(lines))
             chanmap = settings.resolved_chanmap_path()
-            if not self._load_settings_chanmap_preview(settings) and chanmap is not None and chanmap.exists():
+            explicit_chanmap = Path(settings.chanmap_path).expanduser() if settings.chanmap_path.strip() else None
+            if (
+                explicit_chanmap is not None
+                and explicit_chanmap.exists()
+                and not self._chanmap_controls_dirty
+            ):
+                self._load_chanmap_preview(explicit_chanmap)
+            elif not self._load_settings_chanmap_preview(settings) and chanmap is not None and chanmap.exists():
                 self._load_chanmap_preview(chanmap)
         except Exception as exc:
             self.run_preview.setPlainText(f"Config error:\n{exc}")
