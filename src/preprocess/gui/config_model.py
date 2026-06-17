@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from src.postprocess import PostprocessConfig
 from src.preprocess import PreprocessConfig
+from src.preprocess.io import load_xml_metadata
 from src.preprocess.paths import find_project_root, resolve_project_path
 from src.worker_defaults import default_worker_count, normalize_worker_count
 
@@ -91,9 +92,32 @@ def latest_sorting_folder(root: Path | None) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
 
 
+def latest_sorting_folder_from_roots(roots: list[Path | None]) -> Path | None:
+    for root in roots:
+        candidate = latest_sorting_folder(root)
+        if candidate is not None:
+            return candidate
+    return None
+
+
 def postprocess_output_folder_for_sorting(sorting_folder: Path) -> Path:
     run_root = sorting_folder.parent if sorting_folder.name == "sorter_output" else sorting_folder
     return (run_root.parent / f"{run_root.name}_spi").resolve()
+
+
+def _session_xml_path(basepath: Path | None, basename: str) -> Path | None:
+    if basepath is None or not basename:
+        return None
+    xml_path = basepath / f"{basename}.xml"
+    return xml_path if xml_path.exists() else None
+
+
+def _postprocess_xml_metadata(basepath: Path | None, basename: str) -> tuple[float | None, int | None]:
+    xml_path = _session_xml_path(basepath, basename)
+    if xml_path is None:
+        return None, None
+    meta = load_xml_metadata(xml_path)
+    return float(meta.sr), int(meta.n_channels)
 
 
 @dataclass
@@ -205,6 +229,28 @@ class PipelineGuiSettings:
             return None
         return (self.local_root_path / self.basename).resolve()
 
+    def postprocess_dat_path(self) -> Path | None:
+        basename = self.basename
+        if not basename:
+            return None
+        candidates: list[Path] = []
+        output_dir = self.local_output_dir
+        if output_dir is not None:
+            candidates.append(output_dir / f"{basename}.dat")
+        basepath = self.basepath_path
+        if basepath is not None:
+            candidates.append(basepath / f"{basename}.dat")
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+        return candidates[0] if candidates else None
+
+    def postprocess_sorting_folder(self) -> Path | None:
+        explicit = _path_or_none(self.postprocess.sorting_phy_folder)
+        if explicit is not None:
+            return explicit
+        return latest_sorting_folder_from_roots([self.local_output_dir, self.basepath_path])
+
     def resolved_chanmap_path(self) -> Path | None:
         explicit = _path_or_none(self.chanmap_path)
         if explicit is not None:
@@ -295,19 +341,19 @@ class PipelineGuiSettings:
 
     def to_postprocess_config(self) -> PostprocessConfig:
         pp = self.postprocess
-        output_dir = self.local_output_dir
         basename = self.basename
-        dat_path = output_dir / f"{basename}.dat" if output_dir is not None and basename else None
+        basepath = self.basepath_path
+        dat_path = self.postprocess_dat_path()
         chanmap_path = self.resolved_chanmap_path()
-
-        sorting_phy_folder = _path_or_none(pp.sorting_phy_folder)
-        if sorting_phy_folder is None:
-            sorting_phy_folder = latest_sorting_folder(output_dir)
+        sampling_frequency, num_channels = _postprocess_xml_metadata(basepath, basename)
+        sorting_phy_folder = self.postprocess_sorting_folder()
 
         return PostprocessConfig(
             sorting_phy_folder=sorting_phy_folder,
             sorting_search_root=_path_or_none(pp.sorting_search_root),
             dat_path=dat_path if dat_path is not None and dat_path.exists() else None,
+            sampling_frequency=sampling_frequency,
+            num_channels=num_channels,
             chanmap_mat_path=chanmap_path if chanmap_path is not None and chanmap_path.exists() else None,
             reject_channels=list(self.preprocess.reject_channels),
             apply_preprocess=pp.apply_preprocess,

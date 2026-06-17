@@ -14,7 +14,6 @@ from .config_model import (
     PipelineGuiSettings,
     REPO_ROOT,
     RunMode,
-    latest_sorting_folder,
     postprocess_output_folder_for_sorting,
 )
 
@@ -38,6 +37,34 @@ def _check_path(label: str, path: Path | None, *, must_be_dir: bool = False) -> 
     if must_be_dir and not path.is_dir():
         return CheckResult(label, "error", f"not a directory: {path}")
     return CheckResult(label, "ok", str(path))
+
+
+def _bad_channels_from_chanmap(path: Path) -> list[int]:
+    data = loadmat(path)
+    connected = np.asarray(data.get("connected", []), dtype=bool).reshape(-1)
+    if connected.size == 0:
+        raise ValueError("connected field is missing or empty")
+    device_ch = np.asarray(
+        data.get("chanMap0ind", np.asarray(data["chanMap"]).reshape(-1) - 1)
+    ).reshape(-1)
+    n = min(len(connected), len(device_ch))
+    return sorted(device_ch[:n][~connected[:n]].astype(int).tolist())
+
+
+def _chanmap_bad_channel_check(settings: PipelineGuiSettings, chanmap_path: Path) -> CheckResult:
+    try:
+        chanmap_bad = _bad_channels_from_chanmap(chanmap_path)
+    except Exception as exc:
+        return CheckResult("chanMap bad channels", "error", f"could not inspect chanMap bad channels: {exc}")
+    gui_bad = sorted(set(int(ch) for ch in settings.preprocess.reject_channels))
+    if gui_bad != chanmap_bad:
+        return CheckResult(
+            "chanMap bad channels",
+            "error",
+            "GUI bad channels do not match chanMap disconnected channels: "
+            f"GUI={gui_bad}, chanMap={chanmap_bad}. Load the chanMap or update bad channels before postprocess.",
+        )
+    return CheckResult("chanMap bad channels", "ok", f"matches GUI bad channels: {gui_bad}")
 
 
 def _repo_relative_path(text: str) -> Path | None:
@@ -131,6 +158,7 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
     basepath = settings.basepath_path
     output_dir = settings.local_output_dir
     chanmap_path = settings.resolved_chanmap_path()
+    full_postprocess = mode == "postprocess" and not settings.postprocess.noise_label_only
 
     checks.append(_check_path("Basepath", basepath, must_be_dir=True))
     if output_dir is None:
@@ -148,7 +176,7 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
         checks.append(
             CheckResult(
                 "Session XML",
-                "ok" if xml.exists() else "warn",
+                "ok" if xml.exists() else ("error" if full_postprocess else "warn"),
                 str(xml) if xml.exists() else f"not found at expected path: {xml}",
             )
         )
@@ -189,7 +217,7 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
 
     if mode in ("postprocess", "noise_label"):
         phy = settings.postprocess.sorting_phy_folder.strip()
-        sorting_folder = Path(phy) if phy else latest_sorting_folder(output_dir)
+        sorting_folder = Path(phy) if phy else settings.postprocess_sorting_folder()
         if phy:
             checks.append(_check_path("Postprocess sorting folder", Path(phy), must_be_dir=True))
         elif sorting_folder is not None:
@@ -227,8 +255,20 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
                     )
             else:
                 checks.append(CheckResult("Noise labeling metrics", "error", "sorting folder is required first"))
-        elif output_dir is not None and settings.basename:
-            dat_path = output_dir / f"{settings.basename}.dat"
+        elif settings.basename:
+            if chanmap_path is None or not chanmap_path.exists():
+                checks.append(
+                    CheckResult(
+                        "chanMap",
+                        "error",
+                        f"not found: {chanmap_path or 'not set'}. Load or generate chanMap before postprocess.",
+                    )
+                )
+            else:
+                checks.append(CheckResult("chanMap", "ok", str(chanmap_path)))
+                checks.append(_chanmap_bad_channel_check(settings, chanmap_path))
+
+            dat_path = settings.postprocess_dat_path()
             if dat_path.exists():
                 detail = str(dat_path)
                 if settings.postprocess.apply_preprocess:
@@ -244,6 +284,26 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
                         f"not found: {dat_path}. Set spike sorting to skip/disabled, run preprocess only to create basename.dat, then run postprocess again.",
                     )
                 )
+
+            if sorting_folder is not None:
+                post_output = postprocess_output_folder_for_sorting(sorting_folder)
+                if post_output.exists() and not settings.postprocess.overwrite:
+                    checks.append(
+                        CheckResult(
+                            "Postprocess output",
+                            "warn",
+                            f"existing output may be reused/skipped because overwrite is off: {post_output}",
+                        )
+                    )
+                analyzer_cache = post_output / "analyzer_cache"
+                if analyzer_cache.exists():
+                    checks.append(
+                        CheckResult(
+                            "Analyzer cache",
+                            "warn",
+                            f"existing analyzer cache found: {analyzer_cache}",
+                        )
+                    )
         else:
             checks.append(CheckResult("basename.dat", "error", "basepath is required to resolve local_root/<basename>/<basename>.dat"))
     elif mode == "all":
