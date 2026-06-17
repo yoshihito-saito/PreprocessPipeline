@@ -46,7 +46,7 @@ from matplotlib.patches import Rectangle
 from src.preprocess import prepare_chanmap, select_paths_with_gui
 from src.preprocess.io import build_channel_map_data, set_tree_world_rw
 from src.preprocess.paths import find_project_root, resolve_project_path
-from src.worker_defaults import normalize_worker_count
+from src.worker_defaults import default_worker_count, normalize_worker_count
 
 from .config_model import (
     PipelineGuiSettings,
@@ -843,7 +843,7 @@ class MainWindow(QMainWindow):
         signal = QGroupBox("Signal processing")
         sig = self._form_layout(signal)
         self.do_preprocess = QCheckBox("do preprocess")
-        self.preprocess_worker_count = self._spin(1, 4096, 1)
+        self.preprocess_worker_count = self._worker_spin()
         self.bandpass_min = self._double_spin(0.1, 100000.0, 500.0)
         self.bandpass_max = self._double_spin(0.1, 100000.0, 8000.0)
         self.reference = NoWheelComboBox()
@@ -946,7 +946,7 @@ class MainWindow(QMainWindow):
         sorter_config_layout.setSpacing(6)
         sorter_config_layout.addWidget(self.sorter_config_path, 1)
         sorter_config_layout.addWidget(self.open_sorter_config)
-        self.sorter_worker_count = self._spin(1, 4096, 1)
+        self.sorter_worker_count = self._worker_spin()
         sf.addRow(self.run_sorter)
         sf.addRow("Sorter", self.sorter)
         sf.addRow("Sorter path", self.sorter_path)
@@ -1067,7 +1067,7 @@ class MainWindow(QMainWindow):
         self.skip_pc_metrics = QCheckBox("Skip PC metrics")
         self.noise_label_only = QCheckBox("Noise label only")
         self.noise_label_only.setVisible(False)
-        self.post_worker_count = self._spin(1, 4096, 1)
+        self.post_worker_count = self._worker_spin()
 
         form.addRow("Exclude groups", self.exclude_groups)
         form.addRow("Duplicate censor ms", self.duplicate_censored)
@@ -1225,6 +1225,10 @@ class MainWindow(QMainWindow):
         box.setRange(minimum, maximum)
         box.setValue(value)
         return box
+
+    def _worker_spin(self) -> QSpinBox:
+        worker_count = default_worker_count()
+        return self._spin(1, worker_count, worker_count)
 
     def _field_with_button(self, field: QLineEdit, button: QPushButton) -> QWidget:
         panel = QWidget()
@@ -1582,6 +1586,7 @@ class MainWindow(QMainWindow):
             widget.setEnabled(enabled)
 
     def _collect_settings(self) -> PipelineGuiSettings:
+        self._normalize_worker_fields()
         noise_thresholds: dict[str, float] = {}
         for key, field in self.noise_threshold_fields.items():
             text = field.text().strip()
@@ -1748,7 +1753,15 @@ class MainWindow(QMainWindow):
             if not self._load_settings_chanmap_preview(settings) and chanmap is not None and chanmap.exists():
                 self._load_chanmap_preview(chanmap)
         finally:
+            self._normalize_worker_fields()
             self._refresh_suspended = False
+
+    def _normalize_worker_fields(self) -> None:
+        for field in (self.preprocess_worker_count, self.sorter_worker_count, self.post_worker_count):
+            field.setMaximum(default_worker_count())
+            normalized = normalize_worker_count(field.value())
+            if field.value() != normalized:
+                field.setValue(normalized)
 
     def _refresh_preview(self) -> None:
         try:
