@@ -6,56 +6,45 @@ PreprocessPipeline is a preprocessing and postprocessing pipeline for spike sort
 
 ## Installation
 
-Clone the repository and move into the repository directory first:
+### Windows Installation
+
+Open Anaconda Prompt or a PowerShell session where `conda` is available.
 
 ```bash
 git clone https://github.com/yoshihito-saito/PreprocessPipeline.git
 cd PreprocessPipeline
-```
-
-Then run the setup command and activate the environment. On Windows, run this
-from Anaconda Prompt or a PowerShell session where `conda` is available.
-
-```bash
 python scripts/setup_env.py
 conda activate preprocess
 ```
 
-Start the GUI:
-
-```bash
-preprocess-gui
-```
-
-Rebuild the environment from scratch:
+To rebuild the environment from scratch:
 
 ```bash
 python scripts/setup_env.py --force-recreate
 conda activate preprocess
 ```
 
-On Linux, the setup script uses `env_locks/environment-linux-64.lock.yml` as
-the default environment file. On Windows, it uses `environment.windows.yml` for
-now; a Windows default environment export should be generated on Windows after
-that environment is tested.
-
-To bypass the Linux default environment export and use the shorter environment
-spec instead:
+### Linux Installation
 
 ```bash
-python scripts/setup_env.py --use-spec
+git clone https://github.com/yoshihito-saito/PreprocessPipeline.git
+cd PreprocessPipeline
+python scripts/setup_env.py
+conda activate preprocess
 ```
 
-Known working core versions are Python `3.11.14`, NumPy `1.26.4`, SciPy
-`1.16.3`, Numba `0.62.1`, llvmlite `0.45.1`, SpikeInterface `0.103.2`, and
-PySide6 `6.9.2`. PyTorch installs are pinned to Torch `2.9.1` and
-TorchVision `0.24.1`.
+To rebuild the environment from scratch:
 
-## PreprocessPipeline GUI
+```bash
+python scripts/setup_env.py --force-recreate
+conda activate preprocess
+```
+
+## Run GUI
 
 The GUI provides basepath selection, preprocess/postprocess settings, `chanMap.mat` preview, preflight checks, run buttons, and pipeline logs.
 
-Recommended command after installing the package in the active environment:
+Recommended command:
 
 ```bash
 conda activate preprocess
@@ -247,15 +236,8 @@ Noise thresholds:
 - `firing_rate_lt = 0.01`
   - Exclude units with firing rate that is too low.
 
-Waveform-shape thresholds are computed and exported for review, but are not
-enabled as default hard noise criteria because they are sensitive to waveform
-polarity and triphasic templates. The GUI does not expose these thresholds.
-Add these keys explicitly to `noise_thresholds` in code or notebooks to opt in:
-
-- `peak_to_valley_gt`
-- `peak_trough_ratio_lt`
-- `halfwidth_gt`
-- `slope_lt`
+Waveform-shape thresholds are computed for review, but they are not used for
+the default noise decision.
 
 ## Python Implementation Status
 
