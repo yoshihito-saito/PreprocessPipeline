@@ -6,31 +6,14 @@ PreprocessPipeline is a preprocessing and postprocessing pipeline for spike sort
 
 ## Installation
 
-Run the command for your OS, then activate the environment.
-
-### Locked Environment
-
-For the current working server environment, use the lock files in `env_locks/`.
-This is the safest option when NumPy/SciPy dependency changes cause errors.
-
-Files:
-
-- `env_locks/environment-linux-64.lock.yml`: full conda export including pip packages.
-- `env_locks/conda-linux-64.explicit.txt`: exact conda package URLs for linux-64.
-- `env_locks/pip-freeze.txt`: raw `pip freeze` output for auditing.
-
-Linux exact recreate:
+Clone the repository and move into the repository directory first:
 
 ```bash
-conda env create -f env_locks/environment-linux-64.lock.yml
-conda activate preprocess
-python -m pip install -e .
+git clone https://github.com/yoshihito-saito/PreprocessPipeline.git
+cd PreprocessPipeline
 ```
 
-Known working core versions are Python `3.11.14`, NumPy `1.26.4`, SciPy
-`1.16.3`, Numba `0.62.1`, llvmlite `0.45.1`, SpikeInterface `0.103.2`, and
-PySide6 `6.9.2`. PyTorch installs are pinned to Torch `2.9.1` and
-TorchVision `0.24.1`.
+Then run the setup command for your OS and activate the environment.
 
 ### Windows
 
@@ -39,7 +22,13 @@ TorchVision `0.24.1`.
 conda activate preprocess
 ```
 
-Rebuild from scratch:
+Start the GUI:
+
+```powershell
+preprocess-gui
+```
+
+Rebuild the Windows environment from scratch:
 
 ```powershell
 .\setup_env_windows.bat --force-recreate
@@ -53,12 +42,44 @@ python scripts/setup_env.py
 conda activate preprocess
 ```
 
-Rebuild from scratch:
+Start the GUI:
+
+```bash
+preprocess-gui
+```
+
+Rebuild the Linux/macOS environment from scratch:
 
 ```bash
 python scripts/setup_env.py --force-recreate
 conda activate preprocess
 ```
+
+### Advanced: Linux Locked Environment
+
+Most users should use the OS-specific setup commands above. The files in
+`env_locks/` are for exactly recreating the known working Linux server
+environment when dependency changes cause NumPy/SciPy/PyTorch compatibility
+issues.
+
+Available lock/audit files:
+
+- `env_locks/environment-linux-64.lock.yml`: full conda export including pip packages.
+- `env_locks/conda-linux-64.explicit.txt`: exact conda package URLs for linux-64.
+- `env_locks/pip-freeze.txt`: raw `pip freeze` output for auditing.
+
+Exact Linux recreate:
+
+```bash
+conda env create -f env_locks/environment-linux-64.lock.yml
+conda activate preprocess
+python -m pip install -e .
+```
+
+Known working core versions are Python `3.11.14`, NumPy `1.26.4`, SciPy
+`1.16.3`, Numba `0.62.1`, llvmlite `0.45.1`, SpikeInterface `0.103.2`, and
+PySide6 `6.9.2`. PyTorch installs are pinned to Torch `2.9.1` and
+TorchVision `0.24.1`.
 
 ## PreprocessPipeline GUI
 
