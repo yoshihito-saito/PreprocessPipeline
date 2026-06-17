@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
+from importlib import metadata
 import os
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 
 PROJECT_ROOT_ENV = "PREPROCESS_PIPELINE_ROOT"
+DIST_NAMES = ("preprocess-pipeline", "preprocess_pipeline")
 
 
 def _candidate_ancestors(path: Path) -> Iterable[Path]:
@@ -28,6 +33,29 @@ def is_project_root(path: Path) -> bool:
     )
 
 
+def _direct_url_roots() -> Iterable[Path]:
+    for dist_name in DIST_NAMES:
+        try:
+            dist = metadata.distribution(dist_name)
+        except metadata.PackageNotFoundError:
+            continue
+        direct_url = dist.read_text("direct_url.json")
+        if not direct_url:
+            continue
+        try:
+            data = json.loads(direct_url)
+        except json.JSONDecodeError:
+            continue
+        url = str(data.get("url", "")).strip()
+        parsed = urlparse(url)
+        if parsed.scheme != "file":
+            continue
+        path = Path(url2pathname(parsed.path)).expanduser()
+        if parsed.netloc and os.name == "nt":
+            path = Path(f"//{parsed.netloc}{url2pathname(parsed.path)}")
+        yield path
+
+
 def find_project_root(start: Path | None = None) -> Path:
     override = os.environ.get(PROJECT_ROOT_ENV, "").strip()
     if override:
@@ -41,6 +69,7 @@ def find_project_root(start: Path | None = None) -> Path:
     starts = [Path.cwd()]
     if start is not None:
         starts.append(start)
+    starts.extend(_direct_url_roots())
     starts.append(Path(__file__).resolve())
 
     seen: set[Path] = set()
