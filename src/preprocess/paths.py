@@ -11,6 +11,11 @@ from urllib.request import url2pathname
 
 PROJECT_ROOT_ENV = "PREPROCESS_PIPELINE_ROOT"
 DIST_NAMES = ("preprocess-pipeline", "preprocess_pipeline")
+PROJECT_ROOT_ERROR = (
+    "Could not find the PreprocessPipeline repository root with a sorter/ folder. "
+    f"Set {PROJECT_ROOT_ENV} to the PreprocessPipeline checkout, or reinstall from the checkout "
+    "with `python -m pip install . --no-deps --force-reinstall`."
+)
 
 
 def _candidate_ancestors(path: Path) -> Iterable[Path]:
@@ -26,10 +31,13 @@ def _candidate_ancestors(path: Path) -> Iterable[Path]:
 
 
 def is_project_root(path: Path) -> bool:
-    return (path / "sorter").is_dir() and (
+    sorter_dir = path / "sorter"
+    return sorter_dir.is_dir() and (
         (path / "config").is_dir()
         or (path / "pyproject.toml").is_file()
         or (path / "src" / "preprocess").is_dir()
+        or (sorter_dir / "KiloSort1").exists()
+        or (sorter_dir / "Kilosort1_config.yaml").is_file()
     )
 
 
@@ -66,10 +74,10 @@ def find_project_root(start: Path | None = None) -> Path:
             )
         return root
 
-    starts = [Path.cwd()]
+    starts = list(_direct_url_roots())
     if start is not None:
         starts.append(start)
-    starts.extend(_direct_url_roots())
+    starts.append(Path.cwd())
     starts.append(Path(__file__).resolve())
 
     seen: set[Path] = set()
@@ -81,7 +89,7 @@ def find_project_root(start: Path | None = None) -> Path:
             if is_project_root(root):
                 return root
 
-    return Path(__file__).resolve().parents[2]
+    raise FileNotFoundError(PROJECT_ROOT_ERROR)
 
 
 def resolve_project_path(value: str | Path, *, root: Path | None = None) -> Path:

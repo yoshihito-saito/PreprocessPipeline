@@ -39,7 +39,7 @@ def default_worker_count() -> int:
 
 
 def default_local_working_dir(*, create: bool = True) -> Path:
-    path = DEFAULT_LOCAL_WORKING_DIR
+    path = DEFAULT_LOCAL_WORKING_DIR.resolve()
     if create:
         path.mkdir(parents=True, exist_ok=True)
     return path
