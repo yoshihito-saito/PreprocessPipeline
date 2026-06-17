@@ -53,51 +53,10 @@ The command starts the standalone Qt desktop GUI. It requires a working display
 server, for example a local desktop session, X forwarding, or a VS Code remote
 display setup.
 
-If the package entry point is not registered in the active environment, use the
-repository launcher:
 
-```bash
-python launch_gui.py
-```
+## Phy2
 
-Convenience wrappers call the same Qt launcher:
-
-Windows:
-
-```powershell
-.\launch_gui.bat
-```
-
-Linux/macOS:
-
-```bash
-./launch_gui.sh
-```
-
-To use a specific GUI default parameter file:
-
-```bash
-python launch_gui.py --config config/preprocess_gui_default_config.json
-```
-
-For private machine-specific defaults, create
-`config/preprocess_gui_default_config.local.json`. The GUI loads this untracked
-file automatically when `PREPROCESS_GUI_DEFAULT_CONFIG` is not set, while the
-tracked public default config stays free of personal paths. In the desktop GUI,
-use `Load config` and `Save config` to browse arbitrary GUI config JSON files.
-When `local_root` is blank, the GUI automatically uses
-`<PreprocessPipeline root>/preprocess_tmp` as the local working directory and
-creates it if needed.
-
-Advanced direct module launch:
-
-```bash
-python -m src.preprocess.gui.app
-```
-
-### Phy GUI
-
-Install this only if you want to inspect or curate sorting results in the Phy GUI.
+Install this for curate sorting results in the Phy GUI.
 
 ```bash
 pip install git+https://github.com/cortex-lab/phy.git
@@ -105,7 +64,7 @@ pip install git+https://github.com/cortex-lab/phy.git
 
 ### Phy2 Plugins
 
-Install this only if you use the Phy plugin workflow.
+Install this to use the Phy plugin workflow.
 
 1. Download the plugins from `https://github.com/petersenpeter/phy2-plugins`.
 2. Copy the `plugins` folder to your Phy config directory.
@@ -117,11 +76,9 @@ Install this only if you use the Phy plugin workflow.
 
 ### MATLAB
 
-Install MATLAB separately only if you use MATLAB-dependent steps.
+Install MATLAB separately.
 
 ## Kilosort1 MATLAB/CUDA Compilation
-
-Only needed if you want to compile the bundled Kilosort1 copy in `sorter/KiloSort1/CUDA`.
 
 ### Windows
 
@@ -254,5 +211,4 @@ the default noise decision.
 - [ ] Tracking/DLC (`getPos`, `path_to_dlc_bat_file`, `general_behavior_file`)
 - [ ] Session summary (`runSummary` / `sessionSummary`)
 - [ ] Concatenation option (`fillMissingDatFiles`)
-- [ ] Regression tests for MATLAB vs Python output
-- [ ] End-to-end comparison notebook updates and documentation cleanup
+
