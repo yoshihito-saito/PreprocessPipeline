@@ -3,7 +3,6 @@ data/*
 sorting_tmp/*
 sorting_temp/*
 preprocess_tmp/*
-env_locks/*.txt
 # --- Python ---
 __pycache__/
 *.pyo

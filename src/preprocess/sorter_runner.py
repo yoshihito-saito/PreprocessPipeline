@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 import time
 from typing import Any
 import ast
@@ -134,6 +135,21 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _runtime_root() -> Path:
+    override = os.environ.get("PREPROCESS_RUNTIME_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path(tempfile.gettempdir()) / "preprocess_pipeline"
+
+
+def _matlab_shim_dir() -> Path:
+    return _runtime_root() / "matlab_shim"
+
+
+def _matlab_log_path() -> Path:
+    return _matlab_shim_dir() / "matlab_run.log"
+
+
 def _default_sorter_config_path(sorter: str) -> Path:
     s = sorter.lower()
     if s == "kilosort":
@@ -202,7 +218,7 @@ def _inject_matlab_shim(
     *,
     matlab_max_workers: int | None = None,
 ) -> Path:
-    shim_dir = _repo_root() / ".matlab_shim"
+    shim_dir = _matlab_shim_dir()
     shim_dir.mkdir(parents=True, exist_ok=True)
     requested_workers = None if matlab_max_workers is None else int(matlab_max_workers)
     if requested_workers is not None and requested_workers < 1:
@@ -1060,7 +1076,7 @@ def _find_sorter_runtime_root_pids(output_folder: Path) -> list[int]:
         if (
             "run_kilosort.sh" in cmd
             or "kilosort_master(" in cmd
-            or ".matlab_shim/matlab" in cmd
+            or "matlab_shim/matlab" in cmd
         ):
             roots.append(int(proc["pid"]))
     return sorted(set(roots))
@@ -1427,7 +1443,7 @@ def execute_sorting_job(
             _ensure_matlab_shell_env()
         print(f"Prepended MATLAB bin to PATH for this run: {matlab_bin}")
 
-        matlab_log = _repo_root() / ".matlab_shim" / "matlab_run.log"
+        matlab_log = _matlab_log_path()
         shim_path = _inject_matlab_shim(
             matlab_cmd,
             matlab_log,
@@ -1597,7 +1613,7 @@ def execute_sorting_job(
                 f"Sorting failed for sorter={sorter_name}. Original error: {err}"
             ) from err
         # Surface MATLAB-side failure reasons (GPU, license/service, etc).
-        matlab_log = _repo_root() / ".matlab_shim" / "matlab_run.log"
+        matlab_log = _matlab_log_path()
         hint = ""
         cause = "MATLAB runtime error"
         if matlab_log.exists():

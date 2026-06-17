@@ -10,9 +10,8 @@ import subprocess
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ENV_FILE = REPO_ROOT / "environment.yml"
+LINUX_ENV_FILE = REPO_ROOT / "environment.linux.yml"
 WINDOWS_ENV_FILE = REPO_ROOT / "environment.windows.yml"
-LINUX_LOCK_FILE = REPO_ROOT / "env_locks" / "environment-linux-64.lock.yml"
 
 
 def _format_cmd(cmd: list[str]) -> str:
@@ -57,25 +56,12 @@ def _create_or_update_env(conda: str, env_file: Path, env_name: str) -> None:
     _run([conda, "env", "create", "--name", env_name, "--file", str(env_file)], cwd=REPO_ROOT)
 
 
-def _unlocked_env_file(strategy: str) -> Path:
-    return WINDOWS_ENV_FILE if strategy == "windows" else DEFAULT_ENV_FILE
-
-
-def _lock_file(strategy: str, system: str) -> Path | None:
-    if strategy == "unix" and system == "Linux":
-        return LINUX_LOCK_FILE
-    return None
-
-
-def _resolve_env_file(strategy: str, system: str, *, use_spec: bool) -> tuple[Path, bool]:
-    if not use_spec:
-        lock_file = _lock_file(strategy, system)
-        if lock_file is not None and lock_file.exists():
-            return lock_file, True
-        if lock_file is not None:
-            print(f"Default Linux environment file not found: {lock_file}. Falling back to platform spec.")
-
-    return _unlocked_env_file(strategy), False
+def _resolve_env_file(strategy: str) -> Path:
+    if strategy == "windows":
+        return WINDOWS_ENV_FILE
+    if strategy == "linux":
+        return LINUX_ENV_FILE
+    raise SystemExit(f"Unsupported setup platform: {strategy}")
 
 
 def _remove_env(conda: str, env_name: str) -> None:
@@ -88,7 +74,7 @@ def _conda_run(conda: str, env_name: str, cmd: list[str]) -> None:
     _run([conda, "run", "--no-capture-output", "-n", env_name, *cmd], cwd=REPO_ROOT)
 
 
-def _verify_unix_stack(conda: str, env_name: str) -> None:
+def _verify_linux_stack(conda: str, env_name: str) -> None:
     code = (
         "import torch; import numpy; import scipy; import spikeinterface; "
         "print('stack_ok', torch.__version__, torch.cuda.is_available())"
@@ -110,24 +96,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-name", help="Override the conda environment name from the yaml file.")
     parser.add_argument(
         "--platform",
-        choices=("auto", "windows", "unix"),
+        choices=("auto", "windows", "linux"),
         default="auto",
         help="Force the setup strategy. Auto uses the current OS.",
     )
     parser.add_argument(
         "--torch-channel",
         default="auto",
-        help="auto, cpu, or an explicit wheel channel such as cu124 or cu130. Used only with platform specs.",
+        help="auto, cpu, or an explicit wheel channel such as cu124 or cu130. Used by Windows setup.",
     )
     parser.add_argument(
         "--force-recreate",
         action="store_true",
         help="Delete the target conda environment first, then create it from scratch.",
-    )
-    parser.add_argument(
-        "--use-spec",
-        action="store_true",
-        help="Use environment.yml or environment.windows.yml instead of the default Linux environment export.",
     )
     return parser.parse_args()
 
@@ -137,30 +118,33 @@ def main() -> None:
     system = platform.system()
     strategy = args.platform
     if strategy == "auto":
-        strategy = "windows" if system == "Windows" else "unix"
+        if system == "Windows":
+            strategy = "windows"
+        elif system == "Linux":
+            strategy = "linux"
+        else:
+            raise SystemExit(f"Unsupported OS for setup: {system}")
 
     conda = _conda_exe()
-    env_file, using_export = _resolve_env_file(strategy, system, use_spec=args.use_spec)
+    env_file = _resolve_env_file(strategy)
     env_name = args.env_name or _parse_env_name(env_file)
-    source = "default" if using_export else "platform spec"
-    print(f"Using {source} environment file: {env_file.relative_to(REPO_ROOT)}")
+    print(f"Using environment file: {env_file.relative_to(REPO_ROOT)}")
 
     if args.force_recreate:
         _remove_env(conda, env_name)
     _create_or_update_env(conda, env_file, env_name)
 
-    if not using_export:
-        if strategy == "windows":
-            _conda_run(conda, env_name, ["python", "-m", "pip", "install", "--upgrade", "pip"])
+    if strategy == "windows":
+        _conda_run(conda, env_name, ["python", "-m", "pip", "install", "--upgrade", "pip"])
         _conda_run(conda, env_name, ["python", "scripts/install_torch.py", "--compute-platform", args.torch_channel])
 
-    _conda_run(conda, env_name, ["python", "-m", "pip", "install", "-e", ".", "--no-deps"])
+    _conda_run(conda, env_name, ["python", "-m", "pip", "install", ".", "--no-deps"])
 
     if strategy == "windows":
         _verify_windows_stack(conda, env_name)
         return
 
-    _verify_unix_stack(conda, env_name)
+    _verify_linux_stack(conda, env_name)
 
 
 if __name__ == "__main__":

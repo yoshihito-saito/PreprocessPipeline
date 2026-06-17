@@ -8,8 +8,6 @@ PreprocessPipeline is a preprocessing and postprocessing pipeline for spike sort
 
 ### Windows Installation
 
-Open Anaconda Prompt or a PowerShell session where `conda` is available.
-
 ```bash
 git clone https://github.com/yoshihito-saito/PreprocessPipeline.git
 cd PreprocessPipeline
