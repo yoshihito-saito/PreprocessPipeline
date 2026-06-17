@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+import json
 import os
 from pathlib import Path
 import shutil
@@ -44,7 +45,7 @@ from matplotlib.patches import Rectangle
 
 from src.postprocess import PostprocessConfig, run_postprocess_session
 from src.preprocess import prepare_chanmap, run_preprocess_session, select_paths_with_gui
-from src.preprocess.io import set_tree_world_rw
+from src.preprocess.io import build_channel_map_data, set_tree_world_rw
 
 from .config_model import (
     PipelineGuiSettings,
@@ -240,7 +241,7 @@ class ChanMapCanvas(QWidget):
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.figure = Figure(figsize=(5.5, 4.0), tight_layout=True, facecolor="#2f2f2f")
+        self.figure = Figure(figsize=(5.5, 4.0), facecolor="#2f2f2f")
         self.canvas = FigureCanvas(self.figure)
         self.summary = QLabel("No chanMap loaded")
         self.summary.setWordWrap(True)
@@ -260,6 +261,7 @@ class ChanMapCanvas(QWidget):
     def show_empty(self) -> None:
         self.figure.clear()
         ax = self.figure.add_subplot(111)
+        self.figure.subplots_adjust(left=0.11, right=0.98, bottom=0.14, top=0.90)
         self._ax = ax
         self._full_xlim = None
         self._full_ylim = None
@@ -283,7 +285,9 @@ class ChanMapCanvas(QWidget):
             self.show_empty()
             self.summary.setText(f"chanMap not found: {path}")
             return
-        data = loadmat(path)
+        self.render_chanmap(loadmat(path), source=path)
+
+    def render_chanmap(self, data: dict[str, Any], *, source: Path | str) -> None:
         x = np.asarray(data["xcoords"]).reshape(-1)
         y = np.asarray(data["ycoords"]).reshape(-1)
         kcoords = np.asarray(data.get("kcoords", np.ones_like(x))).reshape(-1)
@@ -303,35 +307,85 @@ class ChanMapCanvas(QWidget):
 
         self.figure.clear()
         ax = self.figure.add_subplot(111)
+        self.figure.subplots_adjust(left=0.11, right=0.98, bottom=0.14, top=0.90)
         self._ax = ax
         self._drag_start = None
         self._selection_patch = None
         ax.set_facecolor("#252525")
-        colors = probe_ids * 1000 + kcoords
+        group_keys = [(int(p), int(k)) for p, k in zip(probe_ids.tolist(), kcoords.tolist())]
+        unique_groups = sorted(set(group_keys))
+        palette = [
+            "#80deea",
+            "#b39ddb",
+            "#a5d6a7",
+            "#ffcc80",
+            "#90caf9",
+            "#ce93d8",
+            "#c5e1a5",
+            "#f48fb1",
+            "#bcaaa4",
+            "#fff59d",
+            "#9fa8da",
+            "#ffab91",
+            "#b0bec5",
+            "#81c784",
+            "#64b5f6",
+            "#e6ee9c",
+            "#f8bbd0",
+            "#d7ccc8",
+            "#b2dfdb",
+            "#d1c4e9",
+        ]
+        color_by_group = {
+            group: palette[idx % len(palette)] for idx, group in enumerate(unique_groups)
+        }
+        point_colors = np.array([color_by_group[group] for group in group_keys], dtype=object)
         ax.scatter(
             x[connected],
             y[connected],
-            c=colors[connected],
-            cmap="tab20",
+            c=point_colors[connected],
             s=42,
             edgecolor="#252525",
             linewidth=0.3,
+            clip_on=True,
+            zorder=2,
         )
         if np.any(~connected):
-            ax.scatter(x[~connected], y[~connected], c="none", edgecolor="red", marker="x", s=70, linewidth=1.8)
+            ax.scatter(
+                x[~connected],
+                y[~connected],
+                c="red",
+                marker="x",
+                s=70,
+                linewidth=1.8,
+                clip_on=True,
+                zorder=3,
+            )
 
         if n <= 256:
             for xi, yi, ch, is_connected in zip(x, y, device_ch, connected):
                 color = "#e5e7eb" if is_connected else "#f87171"
-                ax.text(float(xi), float(yi), str(int(ch)), fontsize=7, ha="center", va="bottom", color=color)
+                ax.text(
+                    float(xi),
+                    float(yi),
+                    str(int(ch)),
+                    fontsize=7,
+                    ha="center",
+                    va="bottom",
+                    color=color,
+                    clip_on=True,
+                    zorder=4,
+                )
 
-        ax.set_title(path.name, color="#f5f5f5")
+        source_text = str(source)
+        title = Path(source_text).name if source_text and source_text != "current settings" else source_text
+        ax.set_title(title, color="#f5f5f5")
         ax.set_xlabel("x (um)", color="#d4d4d4")
         ax.set_ylabel("y (um)", color="#d4d4d4")
         ax.tick_params(colors="#a3a3a3")
         for spine in ax.spines.values():
             spine.set_color("#404040")
-        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_aspect("equal", adjustable="box", anchor="C")
         ax.grid(True, alpha=0.25, color="#737373")
         self._full_xlim = tuple(float(v) for v in ax.get_xlim())
         self._full_ylim = tuple(float(v) for v in ax.get_ylim())
@@ -341,7 +395,7 @@ class ChanMapCanvas(QWidget):
         probes = sorted(set(int(v) for v in probe_ids.tolist()))
         shanks = sorted(set(int(v) for v in kcoords.tolist()))
         self.summary.setText(
-            f"{path}\n"
+            f"{source_text}\n"
             f"channels={n}, connected={int(np.sum(connected))}, bad={len(bad)}, "
             f"probes={len(probes)}, groups/shanks={len(shanks)}\n"
             f"bad channels: {bad[:40]}{' ...' if len(bad) > 40 else ''}"
@@ -351,7 +405,9 @@ class ChanMapCanvas(QWidget):
         ax = self._ax
         if ax is None or event.inaxes is not ax or event.xdata is None or event.ydata is None:
             return
-        scale = 0.8 if event.button == "up" else 1.25
+        step = float(getattr(event, "step", 0.0) or 0.0)
+        zoom_in = event.button == "up" or step > 0
+        scale = 0.8 if zoom_in else 1.25
         xlim = ax.get_xlim()
         ylim = ax.get_ylim()
         x_center = float(event.xdata)
@@ -360,6 +416,8 @@ class ChanMapCanvas(QWidget):
         new_height = (ylim[1] - ylim[0]) * scale
         x_rel = (x_center - xlim[0]) / (xlim[1] - xlim[0])
         y_rel = (y_center - ylim[0]) / (ylim[1] - ylim[0])
+        if new_width <= 1e-12 or new_height <= 1e-12:
+            return
         ax.set_xlim(x_center - new_width * x_rel, x_center + new_width * (1.0 - x_rel))
         ax.set_ylim(y_center - new_height * y_rel, y_center + new_height * (1.0 - y_rel))
         self.canvas.draw_idle()
@@ -445,7 +503,7 @@ class MainWindow(QMainWindow):
         self._probe_rows: list[dict[str, QWidget]] = []
         self.noise_threshold_fields: dict[str, QLineEdit] = {}
         self._refresh_suspended = False
-        self._last_chanmap_preview_key: tuple[Path, int, int] | None = None
+        self._last_chanmap_preview_key: tuple[Any, ...] | None = None
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(150)
@@ -1271,6 +1329,41 @@ class MainWindow(QMainWindow):
             assignments.append({"type": geometry, "groups": groups, "x_offset": int(x_offset)})
         return assignments
 
+    @staticmethod
+    def _mat_text(value: Any) -> str:
+        arr = np.asarray(value)
+        if arr.size == 0:
+            return ""
+        if arr.dtype.kind in {"U", "S"} and arr.ndim > 1:
+            return "".join(str(v) for v in arr.reshape(-1)).strip()
+        item = arr.reshape(-1)[0]
+        if isinstance(item, bytes):
+            return item.decode("utf-8", errors="replace")
+        return str(item)
+
+    def _assignments_from_chanmap_data(self, data: dict[str, Any]) -> list[dict[str, Any]] | None:
+        raw = data.get("probe_assignments_json")
+        if raw is None:
+            return None
+        text = self._mat_text(raw).strip()
+        if not text:
+            return None
+        parsed = json.loads(text)
+        if not isinstance(parsed, list):
+            return None
+        return parsed
+
+    @staticmethod
+    def _bad_channels_from_chanmap_data(data: dict[str, Any]) -> list[int]:
+        connected = np.asarray(data.get("connected", []), dtype=bool).reshape(-1)
+        if connected.size == 0:
+            return []
+        device_ch = np.asarray(
+            data.get("chanMap0ind", np.asarray(data["chanMap"]).reshape(-1) - 1)
+        ).reshape(-1).astype(int)
+        n = min(len(connected), len(device_ch))
+        return device_ch[:n][~connected[:n]].astype(int).tolist()
+
     def _connect_refresh(self, widget: QWidget) -> None:
         if isinstance(widget, QLineEdit):
             widget.textChanged.connect(self._schedule_refresh)
@@ -1291,11 +1384,45 @@ class MainWindow(QMainWindow):
             key = (path, -1, -1)
         else:
             stat = path.stat()
-            key = (path.resolve(), int(stat.st_mtime_ns), int(stat.st_size))
+            key = ("file", path.resolve(), int(stat.st_mtime_ns), int(stat.st_size))
         if key == self._last_chanmap_preview_key:
             return
         self.chanmap_canvas.load_chanmap(path)
         self._last_chanmap_preview_key = key
+
+    def _load_settings_chanmap_preview(self, settings: PipelineGuiSettings) -> bool:
+        basepath = settings.basepath_path
+        if basepath is None:
+            return False
+        xml_path = basepath / f"{settings.basename}.xml"
+        if not xml_path.exists():
+            return False
+        try:
+            assignments_json = json.dumps(settings.preprocess.probe_assignments, sort_keys=True)
+            stat = xml_path.stat()
+            key = (
+                "settings",
+                xml_path.resolve(),
+                int(stat.st_mtime_ns),
+                int(stat.st_size),
+                tuple(settings.preprocess.reject_channels),
+                assignments_json,
+            )
+            if key == self._last_chanmap_preview_key:
+                return True
+            data = build_channel_map_data(
+                basepath=basepath,
+                basename=settings.basename,
+                reject_channels=settings.preprocess.reject_channels,
+                probe_assignments=settings.preprocess.probe_assignments,
+            )
+            if data is None:
+                return False
+            self.chanmap_canvas.render_chanmap(data, source="current GUI settings")
+            self._last_chanmap_preview_key = key
+            return True
+        except Exception:
+            return False
 
     def _select_directory(self, title: str, start: str) -> str:
         dialog = QFileDialog(self, title, start or str(Path.cwd()))
@@ -1334,8 +1461,20 @@ class MainWindow(QMainWindow):
             "MAT files (*.mat);;All files (*)",
         )
         if path:
-            self.chanmap_path.setText(path)
-            self._load_chanmap_preview(Path(path))
+            chanmap_path = Path(path)
+            data = loadmat(chanmap_path)
+            self._refresh_suspended = True
+            try:
+                self.chanmap_path.setText(path)
+                self.reject_channels.setText(", ".join(str(v) for v in self._bad_channels_from_chanmap_data(data)))
+                assignments = self._assignments_from_chanmap_data(data)
+                if assignments:
+                    self._render_probe_assignments(assignments)
+            finally:
+                self._refresh_suspended = False
+            self._last_chanmap_preview_key = None
+            self.chanmap_canvas.render_chanmap(data, source=chanmap_path)
+            self._schedule_refresh()
 
     def _browse_sorting_folder(self) -> None:
         path = self._select_directory(
@@ -1583,7 +1722,7 @@ class MainWindow(QMainWindow):
             self.post_overwrite.setChecked(pp.overwrite)
             self.post_worker_count.setValue(pp.worker_count)
             chanmap = settings.resolved_chanmap_path()
-            if chanmap is not None and chanmap.exists():
+            if not self._load_settings_chanmap_preview(settings) and chanmap is not None and chanmap.exists():
                 self._load_chanmap_preview(chanmap)
         finally:
             self._refresh_suspended = False
@@ -1592,7 +1731,10 @@ class MainWindow(QMainWindow):
         try:
             settings = self._collect_settings()
             mode: RunMode = "postprocess" if self.tabs.currentIndex() == 1 else "all"
-            checks = run_preflight(settings, mode)
+            try:
+                checks = run_preflight(settings, mode)
+            except Exception as exc:
+                checks = [CheckResult("Preflight", "warn", str(exc))]
             lines = [
                 f"Basepath: {settings.basepath or '-'}",
                 f"Basename: {settings.basename or '-'}",
@@ -1605,7 +1747,7 @@ class MainWindow(QMainWindow):
             lines.extend(self._format_checks(checks))
             self.run_preview.setPlainText("\n".join(lines))
             chanmap = settings.resolved_chanmap_path()
-            if chanmap is not None and chanmap.exists():
+            if not self._load_settings_chanmap_preview(settings) and chanmap is not None and chanmap.exists():
                 self._load_chanmap_preview(chanmap)
         except Exception as exc:
             self.run_preview.setPlainText(f"Config error:\n{exc}")
