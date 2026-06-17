@@ -578,7 +578,7 @@ def prepare_chanmap(
     reject_channels: list[int] | None = None,
 ) -> tuple[Path, list[int]]:
     chanmap_path = create_channel_map(
-        basepath=local_output_dir,
+        basepath=basepath,
         basename=basename,
         outputDir=local_output_dir,
         probe_assignments=probe_assignments,
