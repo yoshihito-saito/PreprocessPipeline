@@ -13,29 +13,8 @@ git clone https://github.com/yoshihito-saito/PreprocessPipeline.git
 cd PreprocessPipeline
 ```
 
-Then run the setup command for your OS and activate the environment.
-
-### Windows
-
-```powershell
-.\setup_env_windows.bat
-conda activate preprocess
-```
-
-Start the GUI:
-
-```powershell
-preprocess-gui
-```
-
-Rebuild the Windows environment from scratch:
-
-```powershell
-.\setup_env_windows.bat --force-recreate
-conda activate preprocess
-```
-
-### Linux/macOS
+Then run the setup command and activate the environment. On Windows, run this
+from Anaconda Prompt or a PowerShell session where `conda` is available.
 
 ```bash
 python scripts/setup_env.py
@@ -48,32 +27,23 @@ Start the GUI:
 preprocess-gui
 ```
 
-Rebuild the Linux/macOS environment from scratch:
+Rebuild the environment from scratch:
 
 ```bash
 python scripts/setup_env.py --force-recreate
 conda activate preprocess
 ```
 
-### Advanced: Linux Locked Environment
+On Linux, the setup script uses `env_locks/environment-linux-64.lock.yml` as
+the default environment file. On Windows, it uses `environment.windows.yml` for
+now; a Windows default environment export should be generated on Windows after
+that environment is tested.
 
-Most users should use the OS-specific setup commands above. The files in
-`env_locks/` are for exactly recreating the known working Linux server
-environment when dependency changes cause NumPy/SciPy/PyTorch compatibility
-issues.
-
-Available lock/audit files:
-
-- `env_locks/environment-linux-64.lock.yml`: full conda export including pip packages.
-- `env_locks/conda-linux-64.explicit.txt`: exact conda package URLs for linux-64.
-- `env_locks/pip-freeze.txt`: raw `pip freeze` output for auditing.
-
-Exact Linux recreate:
+To bypass the Linux default environment export and use the shorter environment
+spec instead:
 
 ```bash
-conda env create -f env_locks/environment-linux-64.lock.yml
-conda activate preprocess
-python -m pip install -e .
+python scripts/setup_env.py --use-spec
 ```
 
 Known working core versions are Python `3.11.14`, NumPy `1.26.4`, SciPy

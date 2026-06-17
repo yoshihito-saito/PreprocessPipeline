@@ -12,6 +12,7 @@ import subprocess
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ENV_FILE = REPO_ROOT / "environment.yml"
 WINDOWS_ENV_FILE = REPO_ROOT / "environment.windows.yml"
+LINUX_LOCK_FILE = REPO_ROOT / "env_locks" / "environment-linux-64.lock.yml"
 
 
 def _format_cmd(cmd: list[str]) -> str:
@@ -56,6 +57,27 @@ def _create_or_update_env(conda: str, env_file: Path, env_name: str) -> None:
     _run([conda, "env", "create", "--name", env_name, "--file", str(env_file)], cwd=REPO_ROOT)
 
 
+def _unlocked_env_file(strategy: str) -> Path:
+    return WINDOWS_ENV_FILE if strategy == "windows" else DEFAULT_ENV_FILE
+
+
+def _lock_file(strategy: str, system: str) -> Path | None:
+    if strategy == "unix" and system == "Linux":
+        return LINUX_LOCK_FILE
+    return None
+
+
+def _resolve_env_file(strategy: str, system: str, *, use_spec: bool) -> tuple[Path, bool]:
+    if not use_spec:
+        lock_file = _lock_file(strategy, system)
+        if lock_file is not None and lock_file.exists():
+            return lock_file, True
+        if lock_file is not None:
+            print(f"Default Linux environment file not found: {lock_file}. Falling back to platform spec.")
+
+    return _unlocked_env_file(strategy), False
+
+
 def _remove_env(conda: str, env_name: str) -> None:
     if not _conda_env_exists(conda, env_name):
         return
@@ -84,7 +106,7 @@ def _verify_windows_stack(conda: str, env_name: str) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create the preprocess environment and install PyTorch.")
+    parser = argparse.ArgumentParser(description="Create or update the preprocess conda environment.")
     parser.add_argument("--env-name", help="Override the conda environment name from the yaml file.")
     parser.add_argument(
         "--platform",
@@ -95,12 +117,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--torch-channel",
         default="auto",
-        help="auto, cpu, or an explicit wheel channel such as cu124 or cu130",
+        help="auto, cpu, or an explicit wheel channel such as cu124 or cu130. Used only with platform specs.",
     )
     parser.add_argument(
         "--force-recreate",
         action="store_true",
         help="Delete the target conda environment first, then create it from scratch.",
+    )
+    parser.add_argument(
+        "--use-spec",
+        action="store_true",
+        help="Use environment.yml or environment.windows.yml instead of the default Linux environment export.",
     )
     return parser.parse_args()
 
@@ -113,21 +140,26 @@ def main() -> None:
         strategy = "windows" if system == "Windows" else "unix"
 
     conda = _conda_exe()
-    env_file = WINDOWS_ENV_FILE if strategy == "windows" else DEFAULT_ENV_FILE
+    env_file, using_export = _resolve_env_file(strategy, system, use_spec=args.use_spec)
     env_name = args.env_name or _parse_env_name(env_file)
+    source = "default" if using_export else "platform spec"
+    print(f"Using {source} environment file: {env_file.relative_to(REPO_ROOT)}")
 
     if args.force_recreate:
         _remove_env(conda, env_name)
     _create_or_update_env(conda, env_file, env_name)
 
-    if strategy == "windows":
-        _conda_run(conda, env_name, ["python", "-m", "pip", "install", "--upgrade", "pip"])
+    if not using_export:
+        if strategy == "windows":
+            _conda_run(conda, env_name, ["python", "-m", "pip", "install", "--upgrade", "pip"])
         _conda_run(conda, env_name, ["python", "scripts/install_torch.py", "--compute-platform", args.torch_channel])
-        _conda_run(conda, env_name, ["python", "-m", "pip", "install", "-e", ".", "--no-deps"])
+
+    _conda_run(conda, env_name, ["python", "-m", "pip", "install", "-e", ".", "--no-deps"])
+
+    if strategy == "windows":
         _verify_windows_stack(conda, env_name)
         return
 
-    _conda_run(conda, env_name, ["python", "scripts/install_torch.py", "--compute-platform", args.torch_channel])
     _verify_unix_stack(conda, env_name)
 
 
