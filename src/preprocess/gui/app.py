@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
 import json
 import os
 from pathlib import Path
 import shutil
 import sys
-import traceback
-from typing import Any, Callable
+import tempfile
+from typing import Any
 
 import numpy as np
 from scipy.io import loadmat
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QProcess, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -43,8 +42,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
-from src.postprocess import PostprocessConfig, run_postprocess_session
-from src.preprocess import prepare_chanmap, run_preprocess_session, select_paths_with_gui
+from src.preprocess import prepare_chanmap, select_paths_with_gui
 from src.preprocess.io import build_channel_map_data, set_tree_world_rw
 from src.preprocess.paths import find_project_root, resolve_project_path
 from src.worker_defaults import normalize_worker_count
@@ -196,38 +194,6 @@ def _move_local_output_to_basepath(
         "overwrite": overwrite,
         "move_dat": move_dat,
     }
-
-
-class SignalWriter:
-    def __init__(self, emit: Callable[[str], None]) -> None:
-        self._emit = emit
-
-    def write(self, text: str) -> int:
-        if text:
-            self._emit(text)
-        return len(text)
-
-    def flush(self) -> None:
-        return None
-
-
-class PipelineWorker(QObject):
-    log = Signal(str)
-    finished = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, fn: Callable[[], Any]) -> None:
-        super().__init__()
-        self._fn = fn
-
-    def run(self) -> None:
-        writer = SignalWriter(self.log.emit)
-        try:
-            with redirect_stdout(writer), redirect_stderr(writer):
-                result = self._fn()
-            self.finished.emit(result)
-        except Exception:
-            self.failed.emit(traceback.format_exc())
 
 
 class NoWheelComboBox(QComboBox):
@@ -506,9 +472,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("PreprocessPipeline GUI")
         self.resize(1320, 860)
-        self._thread: QThread | None = None
-        self._worker: PipelineWorker | None = None
-        self._last_preprocess_result: Any | None = None
+        self._process: QProcess | None = None
+        self._process_config_path: Path | None = None
+        self._process_result: dict[str, Any] | None = None
+        self._process_tail = ""
+        self._force_stop_requested = False
         self._probe_rows: list[dict[str, QWidget]] = []
         self.noise_threshold_fields: dict[str, QLineEdit] = {}
         self._refresh_suspended = False
@@ -1828,7 +1796,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Generate chanMap failed", str(exc))
 
     def _move_outputs_to_basepath(self) -> None:
-        if self._thread is not None:
+        if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
             QMessageBox.warning(self, "Run active", "Cannot move outputs while a pipeline job is running.")
             return
         try:
@@ -1876,7 +1844,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Move outputs failed", str(exc))
 
     def _force_stop_process(self) -> None:
-        if self._thread is None or not self._thread.isRunning():
+        if self._process is None or self._process.state() == QProcess.ProcessState.NotRunning:
             self._append_log("\n=== Force stop requested, but no pipeline job is running ===\n")
             return
         dialog = QMessageBox(self)
@@ -1889,23 +1857,12 @@ class MainWindow(QMainWindow):
         dialog.exec()
         if dialog.clickedButton() is not stop_button:
             return
-        thread = self._thread
+        self._force_stop_requested = True
         self._append_log("\n=== Force stop requested ===\n")
-        thread.requestInterruption()
-        thread.quit()
-        thread.terminate()
-        stopped = thread.wait(5000)
-        if stopped:
-            self._append_log("=== Force stop complete ===\n")
-            self._thread_finished()
-            self._set_running(False)
-        else:
-            self._append_log(
-                "=== Force stop requested, but the current step is still shutting down ===\n"
-            )
+        self._kill_process_tree()
 
     def _start_run(self, mode: RunMode) -> None:
-        if self._thread is not None:
+        if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
             QMessageBox.warning(self, "Run already active", "A pipeline job is already running.")
             return
         try:
@@ -1929,98 +1886,101 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
+        self._force_stop_requested = False
         self._set_running(True)
         self._append_log(f"\n=== Running {mode} ===\n")
-        worker = PipelineWorker(lambda: self._run_pipeline(settings, mode))
-        thread = QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.log.connect(self._append_log, Qt.ConnectionType.QueuedConnection)
-        worker.finished.connect(self._run_finished, Qt.ConnectionType.QueuedConnection)
-        worker.failed.connect(self._run_failed, Qt.ConnectionType.QueuedConnection)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._thread_finished, Qt.ConnectionType.QueuedConnection)
-        self._thread = thread
-        self._worker = worker
-        thread.start()
+        fd, config_name = tempfile.mkstemp(prefix="preprocess_gui_", suffix=".json")
+        os.close(fd)
+        config_path = Path(config_name)
+        settings.save(config_path)
+        process = QProcess(self)
+        process.setProgram(sys.executable)
+        process.setArguments([
+            "-m",
+            "src.preprocess.gui.run_pipeline",
+            "--config",
+            str(config_path),
+            "--mode",
+            mode,
+        ])
+        process.setWorkingDirectory(str(REPO_ROOT))
+        process.readyReadStandardOutput.connect(self._read_process_stdout)
+        process.readyReadStandardError.connect(self._read_process_stderr)
+        process.finished.connect(self._process_finished)
+        self._process = process
+        self._process_config_path = config_path
+        self._process_result = None
+        self._process_tail = ""
+        process.start()
 
-    def _run_pipeline(self, settings: PipelineGuiSettings, mode: RunMode) -> dict[str, Any]:
-        payload: dict[str, Any] = {"mode": mode}
-        pre_result = None
-        if mode in ("all", "preprocess"):
-            if settings.basepath_path is None:
-                raise ValueError("basepath is required.")
-            if settings.resolved_chanmap_path() is None or not settings.resolved_chanmap_path().exists():
-                print("chanMap is missing; generating before preprocess.")
-                basepath, basename, local_output_dir, _xml_path = select_paths_with_gui(
-                    use_gui=False,
-                    manual_basepath=settings.basepath_path,
-                    local_root=settings.local_root_path,
-                )
-                chanmap_path, bad_channels = prepare_chanmap(
-                    basepath=basepath,
-                    basename=basename,
-                    local_output_dir=local_output_dir,
-                    probe_assignments=settings.preprocess.probe_assignments,
-                    reject_channels=settings.preprocess.reject_channels,
-                )
-                print(f"Generated chanMap: {chanmap_path}")
-                print(f"Bad channels: {bad_channels}")
-                settings.chanmap_path = str(chanmap_path)
-            pre_config = settings.to_preprocess_config()
-            pre_result = run_preprocess_session(pre_config)
-            payload["preprocess_result"] = pre_result
+    def _read_process_stdout(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardOutput()).decode(errors="replace")
+        self._handle_process_output(text)
 
-        if mode in ("all", "postprocess", "noise_label"):
-            if mode == "all" and pre_result is not None:
-                post_config = self._postprocess_config_from_preprocess_result(settings, pre_result)
+    def _read_process_stderr(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardError()).decode(errors="replace")
+        self._append_log(text)
+
+    def _handle_process_output(self, text: str) -> None:
+        combined = self._process_tail + text
+        lines = combined.splitlines(keepends=True)
+        self._process_tail = ""
+        for line in lines:
+            if not line.endswith(("\n", "\r")):
+                self._process_tail = line
+                continue
+            stripped = line.strip()
+            if stripped.startswith("__PREPROCESS_GUI_RESULT__"):
+                try:
+                    self._process_result = json.loads(stripped.removeprefix("__PREPROCESS_GUI_RESULT__"))
+                except json.JSONDecodeError:
+                    self._append_log(line)
             else:
-                post_config = settings.to_postprocess_config()
-            if mode == "noise_label":
-                post_config.noise_label_only = True
-            payload["postprocess_results"] = run_postprocess_session(post_config)
+                self._append_log(line)
 
-        return payload
-
-    def _postprocess_config_from_preprocess_result(self, settings: PipelineGuiSettings, pre_result: Any) -> PostprocessConfig:
-        post_config = settings.to_postprocess_config()
-        post_config.sorting_phy_folder = pre_result.sorter_output_dir or post_config.sorting_phy_folder
-        post_config.sorting_search_root = pre_result.local_output_dir
-        post_config.dat_path = pre_result.dat_path
-        post_config.sampling_frequency = pre_result.sr
-        post_config.num_channels = pre_result.n_channels
-        post_config.chanmap_mat_path = settings.resolved_chanmap_path()
-        post_config.reject_channels = list(pre_result.bad_channels_0based)
-        return post_config
-
-    def _run_finished(self, result: object) -> None:
+    def _process_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        if self._process_tail:
+            self._handle_process_output("\n")
+        stopped = self._force_stop_requested
+        self._force_stop_requested = False
         self._set_running(False)
-        if isinstance(result, dict):
-            pre_result = result.get("preprocess_result")
-            if pre_result is not None:
-                self._last_preprocess_result = pre_result
-                if getattr(pre_result, "sorter_output_dir", None):
-                    self.sorting_phy_folder.setText(str(pre_result.sorter_output_dir))
+        if self._process_config_path is not None:
+            self._process_config_path.unlink(missing_ok=True)
+            self._process_config_path = None
+        self._process = None
+        if stopped:
+            self._append_log("=== Force stop complete ===\n")
+            return
+        if exit_code == 0:
             self._append_log("\n=== Run finished ===\n")
-            self._append_result_summary(result)
+            if self._process_result:
+                pre_result = self._process_result.get("preprocess_result") or {}
+                sorter_output = pre_result.get("sorter_output_dir")
+                if sorter_output:
+                    self.sorting_phy_folder.setText(sorter_output)
+        else:
+            self._append_log("\n=== Run failed ===\n")
+            QMessageBox.critical(self, "Run failed", f"Pipeline process exited with code {exit_code}.")
         self._refresh_preview()
 
-    def _run_failed(self, text: str) -> None:
-        self._set_running(False)
-        self._append_log("\n=== Run failed ===\n")
-        self._append_log(text)
-        QMessageBox.critical(self, "Run failed", text.splitlines()[-1] if text.splitlines() else text)
-
-    def _thread_finished(self) -> None:
-        self._thread = None
-        self._worker = None
+    def _kill_process_tree(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        pid = int(process.processId())
+        if os.name == "nt" and pid > 0:
+            QProcess.startDetached("taskkill", ["/PID", str(pid), "/T", "/F"])
+        else:
+            process.kill()
 
     def closeEvent(self, event: Any) -> None:
-        if self._thread is not None and self._thread.isRunning():
+        if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
             QMessageBox.warning(
                 self,
                 "Run active",
@@ -2039,19 +1999,6 @@ class MainWindow(QMainWindow):
         self.log.moveCursor(QTextCursor.MoveOperation.End)
         self.log.insertPlainText(text)
         self.log.moveCursor(QTextCursor.MoveOperation.End)
-
-    def _append_result_summary(self, result: dict[str, Any]) -> None:
-        pre = result.get("preprocess_result")
-        if pre is not None:
-            self._append_log(f"local_output_dir: {pre.local_output_dir}\n")
-            self._append_log(f"dat_path: {pre.dat_path}\n")
-            self._append_log(f"lfp_path: {pre.lfp_path}\n")
-            self._append_log(f"sorter_output_dir: {pre.sorter_output_dir}\n")
-        post_results = result.get("postprocess_results") or []
-        for idx, post in enumerate(post_results, start=1):
-            self._append_log(f"postprocess[{idx}] output_folder: {post.output_folder}\n")
-            self._append_log(f"postprocess[{idx}] metrics_csv_path: {post.metrics_csv_path}\n")
-
 
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
