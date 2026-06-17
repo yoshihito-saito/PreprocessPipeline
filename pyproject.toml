@@ -36,3 +36,6 @@ notebook = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src", "src.*"]
+
+[tool.setuptools.package-data]
+"src.preprocess.gui" = ["assets/*.svg"]
