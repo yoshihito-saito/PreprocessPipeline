@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
-import os
 from pathlib import Path
 from typing import Any, Literal
 
 from src.postprocess import PostprocessConfig
 from src.preprocess import PreprocessConfig
 from src.preprocess.paths import find_project_root, resolve_project_path
+from src.worker_defaults import default_worker_count, normalize_worker_count
 
 
 RunMode = Literal["all", "preprocess", "postprocess", "noise_label"]
@@ -31,12 +31,6 @@ SORTING_OUTPUT_PATTERNS = (
 )
 REPO_ROOT = find_project_root()
 DEFAULT_LOCAL_WORKING_DIR = REPO_ROOT / "preprocess_tmp"
-
-
-def default_worker_count() -> int:
-    cpu_count = os.cpu_count() or 1
-    usable_count = min(cpu_count, 61) if os.name == "nt" else cpu_count
-    return 128 if usable_count >= 128 else max(1, usable_count - 8)
 
 
 def default_local_working_dir(*, create: bool = True) -> Path:
@@ -267,7 +261,7 @@ class PipelineGuiSettings:
             highamp_ms_before=p.highamp_ms_before,
             highamp_ms_after=p.highamp_ms_after,
             highamp_mode=p.highamp_mode,
-            highamp_n_jobs=p.preprocess_worker_count,
+            highamp_n_jobs=normalize_worker_count(p.preprocess_worker_count),
             make_lfp=p.make_lfp,
             lfp_fs=p.lfp_fs,
             state_score=p.state_score,
@@ -285,14 +279,14 @@ class PipelineGuiSettings:
             chanmap_mat_path=self.resolved_chanmap_path(),
             reject_channels=list(p.reject_channels),
             matlab_path=_path_or_none(p.matlab_path),
-            matlab_max_workers=p.sorter_worker_count,
+            matlab_max_workers=normalize_worker_count(p.sorter_worker_count),
             sorter=sorter,
             sorter_path=_repo_path_or_none(p.sorter_path) if sorter else None,
             sorter_config_path=_repo_path_or_none(p.sorter_config_path) if sorter else None,
             overwrite=p.overwrite,
             job_kwargs={
                 "pool_engine": "process",
-                "n_jobs": p.preprocess_worker_count,
+                "n_jobs": normalize_worker_count(p.preprocess_worker_count),
                 "chunk_duration": "1s",
                 "progress_bar": True,
                 "max_threads_per_worker": 1,
@@ -336,7 +330,7 @@ class PipelineGuiSettings:
             noise_label_only=pp.noise_label_only,
             noise_thresholds=dict(pp.noise_thresholds),
             overwrite=pp.overwrite,
-            job_kwargs={"n_jobs": pp.worker_count, "progress_bar": True},
+            job_kwargs={"n_jobs": normalize_worker_count(pp.worker_count), "progress_bar": True},
         )
 
     def to_json(self) -> str:
@@ -351,7 +345,10 @@ class PipelineGuiSettings:
             preprocess_data.setdefault("preprocess_worker_count", legacy_worker_count)
             preprocess_data.setdefault("sorter_worker_count", legacy_worker_count)
         preprocess = PreprocessGuiSettings(**preprocess_data)
+        preprocess.preprocess_worker_count = normalize_worker_count(preprocess.preprocess_worker_count)
+        preprocess.sorter_worker_count = normalize_worker_count(preprocess.sorter_worker_count)
         postprocess = PostprocessGuiSettings(**data.pop("postprocess", {}))
+        postprocess.worker_count = normalize_worker_count(postprocess.worker_count)
         return cls(**data, preprocess=preprocess, postprocess=postprocess)
 
     def save(self, path: Path) -> None:

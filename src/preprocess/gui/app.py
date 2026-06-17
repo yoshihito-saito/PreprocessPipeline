@@ -47,6 +47,7 @@ from src.postprocess import PostprocessConfig, run_postprocess_session
 from src.preprocess import prepare_chanmap, run_preprocess_session, select_paths_with_gui
 from src.preprocess.io import build_channel_map_data, set_tree_world_rw
 from src.preprocess.paths import find_project_root, resolve_project_path
+from src.worker_defaults import normalize_worker_count
 
 from .config_model import (
     PipelineGuiSettings,
@@ -1653,8 +1654,8 @@ class MainWindow(QMainWindow):
             run_sorter=self.run_sorter.isChecked(),
             sorter=self.sorter.currentText(),
             matlab_path=self.matlab_path.text().strip(),
-            preprocess_worker_count=self.preprocess_worker_count.value(),
-            sorter_worker_count=self.sorter_worker_count.value(),
+            preprocess_worker_count=normalize_worker_count(self.preprocess_worker_count.value()),
+            sorter_worker_count=normalize_worker_count(self.sorter_worker_count.value()),
             overwrite=self.pre_overwrite.isChecked(),
         )
         postprocess = PostprocessGuiSettings(
@@ -1676,7 +1677,7 @@ class MainWindow(QMainWindow):
             noise_label_only=self.noise_label_only.isChecked(),
             noise_thresholds=noise_thresholds,
             overwrite=self.post_overwrite.isChecked(),
-            worker_count=self.post_worker_count.value(),
+            worker_count=normalize_worker_count(self.post_worker_count.value()),
         )
         return PipelineGuiSettings(
             basepath=self.basepath.text().strip(),
@@ -1741,8 +1742,8 @@ class MainWindow(QMainWindow):
             self.sorter_path.setText(p.sorter_path or default_sorter_path)
             self.sorter_config_path.setText(p.sorter_config_path or default_sorter_config)
             self.matlab_path.setText(p.matlab_path)
-            self.preprocess_worker_count.setValue(p.preprocess_worker_count)
-            self.sorter_worker_count.setValue(p.sorter_worker_count)
+            self.preprocess_worker_count.setValue(normalize_worker_count(p.preprocess_worker_count))
+            self.sorter_worker_count.setValue(normalize_worker_count(p.sorter_worker_count))
             self.pre_overwrite.setChecked(p.overwrite)
             self._update_sorter_enabled()
             pp = settings.postprocess
@@ -1766,7 +1767,7 @@ class MainWindow(QMainWindow):
                 value = pp.noise_thresholds.get(key)
                 field.setText("" if value is None else str(value))
             self.post_overwrite.setChecked(pp.overwrite)
-            self.post_worker_count.setValue(pp.worker_count)
+            self.post_worker_count.setValue(normalize_worker_count(pp.worker_count))
             chanmap = settings.resolved_chanmap_path()
             if not self._load_settings_chanmap_preview(settings) and chanmap is not None and chanmap.exists():
                 self._load_chanmap_preview(chanmap)

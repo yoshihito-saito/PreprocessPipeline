@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import os
 from pathlib import Path
 from typing import Any
 
+from src.worker_defaults import default_worker_count
+
 
 def _default_parallel_n_jobs() -> int:
-    cpu_count = os.cpu_count() or 1
-    fallback_workers = max(1, int(cpu_count) - 8)
-    requested_n_jobs = 128
-    return requested_n_jobs if cpu_count >= requested_n_jobs else fallback_workers
+    return default_worker_count()
 
 
 @dataclass

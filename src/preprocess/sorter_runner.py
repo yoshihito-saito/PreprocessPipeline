@@ -24,13 +24,11 @@ from spikeinterface.core.job_tools import job_keys as _SI_JOB_KEYS
 from .io import load_xml_metadata
 from .paths import find_project_root
 from .recording import apply_preprocessing, attach_probe_from_chanmap, select_recording_channels
+from src.worker_defaults import default_worker_count
 
 
 def _default_parallel_n_jobs() -> int:
-    cpu_count = os.cpu_count() or 1
-    fallback_workers = max(1, int(cpu_count) - 8)
-    requested_n_jobs = 128
-    return requested_n_jobs if cpu_count >= requested_n_jobs else fallback_workers
+    return default_worker_count()
 
 
 _SORTER_ALIASES = {
