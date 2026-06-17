@@ -74,6 +74,15 @@ def _path_or_none(value: str | Path | None) -> Path | None:
     return Path(text).expanduser() if text else None
 
 
+def _repo_path_or_none(value: str | Path | None) -> Path | None:
+    path = _path_or_none(value)
+    if path is None:
+        return None
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path
+
+
 def latest_sorting_folder(root: Path | None) -> Path | None:
     if root is None or not root.exists() or not root.is_dir():
         return None
@@ -276,8 +285,8 @@ class PipelineGuiSettings:
             matlab_path=_path_or_none(p.matlab_path),
             matlab_max_workers=p.sorter_worker_count,
             sorter=sorter,
-            sorter_path=_path_or_none(p.sorter_path) if sorter else None,
-            sorter_config_path=_path_or_none(p.sorter_config_path) if sorter else None,
+            sorter_path=_repo_path_or_none(p.sorter_path) if sorter else None,
+            sorter_config_path=_repo_path_or_none(p.sorter_config_path) if sorter else None,
             overwrite=p.overwrite,
             job_kwargs={
                 "pool_engine": "process",

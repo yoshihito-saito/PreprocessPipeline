@@ -12,8 +12,8 @@ from typing import Any, Callable
 import numpy as np
 from scipy.io import loadmat
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QTextCursor
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -85,6 +85,13 @@ PROBE_TYPES = (
     "double_sided",
     "NeuroPixel",
 )
+
+SORTER_DEFAULTS: dict[str, tuple[str, str]] = {
+    "Kilosort": ("sorter/KiloSort1", "sorter/Kilosort1_config.yaml"),
+    "Kilosort2_5": ("sorter/Kilosort2.5", "sorter/Kilosort2.5_config.yaml"),
+    "kilosort4": ("sorter/Kilosort4", "sorter/Kilosort4_config.yaml"),
+    "disabled": ("", ""),
+}
 
 NOISE_THRESHOLD_FIELDS = (
     ("firing_rate_lt", "firing rate <= Hz"),
@@ -952,11 +959,20 @@ class MainWindow(QMainWindow):
         self.sorter_path = QLineEdit()
         self.sorter_config_path = QLineEdit()
         self.matlab_path = QLineEdit()
+        self.matlab_path.setPlaceholderText("auto-detect from PATH")
+        self.open_sorter_config = QPushButton("Open config")
+        self.open_sorter_config.clicked.connect(self._open_sorter_config)
+        sorter_config_row = QWidget()
+        sorter_config_layout = QHBoxLayout(sorter_config_row)
+        sorter_config_layout.setContentsMargins(0, 0, 0, 0)
+        sorter_config_layout.setSpacing(6)
+        sorter_config_layout.addWidget(self.sorter_config_path, 1)
+        sorter_config_layout.addWidget(self.open_sorter_config)
         self.sorter_worker_count = self._spin(1, 4096, 1)
         sf.addRow(self.run_sorter)
         sf.addRow("Sorter", self.sorter)
         sf.addRow("Sorter path", self.sorter_path)
-        sf.addRow("Sorter config", self.sorter_config_path)
+        sf.addRow("Sorter config", sorter_config_row)
         sf.addRow("MATLAB path", self.matlab_path)
         sf.addRow("Workers for sorter", self.sorter_worker_count)
 
@@ -1538,13 +1554,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save default config failed", str(exc))
 
     def _sorter_changed(self, sorter: str) -> None:
-        defaults = {
-            "Kilosort": ("sorter/KiloSort1", "sorter/Kilosort1_config.yaml"),
-            "Kilosort2_5": ("sorter/Kilosort2.5", "sorter/Kilosort2.5_config.yaml"),
-            "kilosort4": ("sorter/Kilosort4", "sorter/Kilosort4_config.yaml"),
-            "disabled": ("", ""),
-        }
-        path, config = defaults.get(sorter, ("", ""))
+        path, config = SORTER_DEFAULTS.get(sorter, ("", ""))
         self.sorter_path.setText(path)
         self.sorter_config_path.setText(config)
         if sorter == "disabled":
@@ -1554,9 +1564,43 @@ class MainWindow(QMainWindow):
         self._update_sorter_enabled()
         self._schedule_refresh()
 
+    @staticmethod
+    def _resolve_repo_path(text: str) -> Path:
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+        return path.resolve()
+
+    def _current_sorter_config_path(self) -> Path | None:
+        text = self.sorter_config_path.text().strip()
+        if not text:
+            _path, config = SORTER_DEFAULTS.get(self.sorter.currentText(), ("", ""))
+            text = config
+        return self._resolve_repo_path(text) if text else None
+
+    def _current_sorter_defaults(self) -> tuple[str, str]:
+        return SORTER_DEFAULTS.get(self.sorter.currentText(), ("", ""))
+
+    def _open_sorter_config(self) -> None:
+        path = self._current_sorter_config_path()
+        if path is None:
+            QMessageBox.information(self, "Open config", "No sorter config is selected.")
+            return
+        if not path.exists():
+            QMessageBox.warning(self, "Open config", f"Sorter config not found:\n{path}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            QMessageBox.information(self, "Open config", f"Open this file manually:\n{path}")
+
     def _update_sorter_enabled(self) -> None:
         enabled = self.run_sorter.isChecked()
-        for widget in [self.sorter, self.sorter_path, self.sorter_config_path, self.matlab_path]:
+        for widget in [
+            self.sorter,
+            self.sorter_path,
+            self.sorter_config_path,
+            self.open_sorter_config,
+            self.matlab_path,
+        ]:
             widget.setEnabled(enabled)
 
     def _collect_settings(self) -> PipelineGuiSettings:
@@ -1566,6 +1610,8 @@ class MainWindow(QMainWindow):
             if text:
                 noise_thresholds[key] = float(text)
         preprocess = PreprocessGuiSettings(
+            sorter_path=self.sorter_path.text().strip() or self._current_sorter_defaults()[0],
+            sorter_config_path=self.sorter_config_path.text().strip() or self._current_sorter_defaults()[1],
             analog_inputs=self.analog_inputs.isChecked(),
             digital_inputs=self.digital_inputs.isChecked(),
             save_raw=self.save_raw.isChecked(),
@@ -1605,8 +1651,6 @@ class MainWindow(QMainWindow):
             probe_assignments=self._probe_rows_to_assignments(),
             run_sorter=self.run_sorter.isChecked(),
             sorter=self.sorter.currentText(),
-            sorter_path=self.sorter_path.text().strip(),
-            sorter_config_path=self.sorter_config_path.text().strip(),
             matlab_path=self.matlab_path.text().strip(),
             preprocess_worker_count=self.preprocess_worker_count.value(),
             sorter_worker_count=self.sorter_worker_count.value(),
@@ -1692,8 +1736,9 @@ class MainWindow(QMainWindow):
             self._render_probe_assignments(p.probe_assignments)
             self.run_sorter.setChecked(p.run_sorter and (p.sorter or "disabled") != "disabled")
             self.sorter.setCurrentText(p.sorter or "disabled")
-            self.sorter_path.setText(p.sorter_path)
-            self.sorter_config_path.setText(p.sorter_config_path)
+            default_sorter_path, default_sorter_config = self._current_sorter_defaults()
+            self.sorter_path.setText(p.sorter_path or default_sorter_path)
+            self.sorter_config_path.setText(p.sorter_config_path or default_sorter_config)
             self.matlab_path.setText(p.matlab_path)
             self.preprocess_worker_count.setValue(p.preprocess_worker_count)
             self.sorter_worker_count.setValue(p.sorter_worker_count)

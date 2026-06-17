@@ -384,6 +384,46 @@ def _load_params(path: Path) -> dict[str, Any]:
     return params
 
 
+def _yaml_safe_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _yaml_safe_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_yaml_safe_value(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
+
+
+def _save_sorter_config_snapshot(
+    *,
+    output_folder: Path,
+    source_config_path: Path,
+    resolved_params: dict[str, Any],
+) -> None:
+    output_folder.mkdir(parents=True, exist_ok=True)
+    source_suffix = source_config_path.suffix.lower() or ".yaml"
+    source_copy = output_folder / f"sorter_config_source{source_suffix}"
+    resolved_copy = output_folder / "sorter_config_resolved.yaml"
+    try:
+        if source_config_path.exists():
+            shutil.copy2(source_config_path, source_copy)
+        with open(resolved_copy, "w", encoding="utf-8") as f:
+            yaml.safe_dump(
+                _yaml_safe_value(resolved_params),
+                f,
+                sort_keys=True,
+                allow_unicode=False,
+            )
+        print(f"Saved sorter config snapshot: {source_copy}")
+        print(f"Saved resolved sorter params: {resolved_copy}")
+    except Exception as exc:
+        print(f"Warning: failed to save sorter config snapshot: {exc}")
+
+
 def _validate_no_inf_strings(obj: Any, cfg_path: Path, parent_key: str = "") -> None:
     inf_tokens = {"inf", "+inf", "infinity", "+infinity", ".inf", "-inf", "-infinity", "-.inf"}
     if isinstance(obj, dict):
@@ -1431,8 +1471,8 @@ def execute_sorting_job(
         if matlab_cmd is None:
             raise RuntimeError(
                 "MATLAB executable was not found. "
-                "Set PreprocessConfig(matlab_path=Path('/local/workdir/ys2375/MATLAB/R2024b/bin/matlab')) "
-                "or PreprocessConfig(matlab_path=Path('C:/.../MATLAB/.../bin/matlab.exe'))."
+                "Add MATLAB to PATH or set PreprocessConfig(matlab_path=Path('/path/to/matlab')). "
+                "On Windows, matlab_path can point to matlab.exe."
             )
 
         matlab_bin = str(Path(matlab_cmd).parent)
@@ -1667,6 +1707,11 @@ def execute_sorting_job(
                 output_folder=output_folder,
                 sorter_name=sorter_name,
             )
+    _save_sorter_config_snapshot(
+        output_folder=output_folder,
+        source_config_path=cfg_path,
+        resolved_params=params,
+    )
     _flatten_sorter_output_folder(output_folder)
     _patch_phy_outputs_for_raw_dat(
         output_folder=output_folder,

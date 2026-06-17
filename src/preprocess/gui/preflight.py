@@ -11,6 +11,7 @@ from src.preprocess.recording import _local_reference_channels_without_neighbors
 
 from .config_model import (
     PipelineGuiSettings,
+    REPO_ROOT,
     RunMode,
     latest_sorting_folder,
     postprocess_output_folder_for_sorting,
@@ -36,6 +37,16 @@ def _check_path(label: str, path: Path | None, *, must_be_dir: bool = False) -> 
     if must_be_dir and not path.is_dir():
         return CheckResult(label, "error", f"not a directory: {path}")
     return CheckResult(label, "ok", str(path))
+
+
+def _repo_relative_path(text: str) -> Path | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    path = Path(stripped).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path
 
 
 def _local_cmr_check(settings: PipelineGuiSettings) -> CheckResult | None:
@@ -164,12 +175,16 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
             checks.append(local_cmr)
         sorter = settings.preprocess.sorter if settings.preprocess.run_sorter else None
         if sorter and sorter.lower() != "disabled":
-            sorter_path = Path(settings.preprocess.sorter_path)
-            sorter_config = Path(settings.preprocess.sorter_config_path)
+            sorter_path = _repo_relative_path(settings.preprocess.sorter_path)
+            sorter_config = _repo_relative_path(settings.preprocess.sorter_config_path)
             checks.append(_check_path("Sorter path", sorter_path, must_be_dir=True))
             checks.append(_check_path("Sorter config", sorter_config))
             if "kilosort" in sorter.lower() and sorter.lower() != "kilosort4":
-                checks.append(_check_path("MATLAB path", Path(settings.preprocess.matlab_path)))
+                matlab_text = settings.preprocess.matlab_path.strip()
+                if matlab_text:
+                    checks.append(_check_path("MATLAB path", Path(matlab_text).expanduser()))
+                else:
+                    checks.append(CheckResult("MATLAB path", "ok", "auto-detect from PATH"))
 
     if mode in ("postprocess", "noise_label"):
         phy = settings.postprocess.sorting_phy_folder.strip()
