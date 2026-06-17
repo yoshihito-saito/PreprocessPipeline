@@ -23,6 +23,7 @@ from .metafile import (
     SessionXmlMeta,
     XmlMeta,
 )
+from .paths import find_project_root
 
 
 _OPENEPHYS_DATETIME_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})")
@@ -662,8 +663,7 @@ def resolve_local_output_dir(basepath: Path, basename: str, config: PreprocessCo
     elif config.output_dir is not None:
         root = Path(config.output_dir)
     else:
-        repo_root = Path(__file__).resolve().parents[2]
-        root = repo_root / "sorting_temp"
+        root = find_project_root() / "sorting_temp"
     out = root / basename
     out.mkdir(parents=True, exist_ok=True)
     return out.resolve()

@@ -22,6 +22,7 @@ from scipy.io import loadmat, savemat
 from spikeinterface.core.job_tools import job_keys as _SI_JOB_KEYS
 
 from .io import load_xml_metadata
+from .paths import find_project_root
 from .recording import apply_preprocessing, attach_probe_from_chanmap, select_recording_channels
 
 
@@ -132,7 +133,7 @@ def _ensure_matlab_shell_env() -> None:
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return find_project_root()
 
 
 def _runtime_root() -> Path:

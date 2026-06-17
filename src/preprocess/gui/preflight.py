@@ -7,6 +7,7 @@ import numpy as np
 from scipy.io import loadmat
 
 from src.preprocess.io import build_channel_map_data, find_rhd_source
+from src.preprocess.paths import resolve_project_path
 from src.preprocess.recording import _local_reference_channels_without_neighbors
 
 from .config_model import (
@@ -45,8 +46,8 @@ def _repo_relative_path(text: str) -> Path | None:
         return None
     path = Path(stripped).expanduser()
     if not path.is_absolute():
-        path = REPO_ROOT / path
-    return path
+        path = resolve_project_path(path, root=REPO_ROOT)
+    return path.resolve()
 
 
 def _local_cmr_check(settings: PipelineGuiSettings) -> CheckResult | None:

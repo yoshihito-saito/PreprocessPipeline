@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from src.postprocess import PostprocessConfig
 from src.preprocess import PreprocessConfig
+from src.preprocess.paths import find_project_root, resolve_project_path
 
 
 RunMode = Literal["all", "preprocess", "postprocess", "noise_label"]
@@ -28,7 +29,7 @@ SORTING_OUTPUT_PATTERNS = (
     "Kilosort2.5_*",
     "Kilosort4_*",
 )
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = find_project_root()
 DEFAULT_LOCAL_WORKING_DIR = REPO_ROOT / "preprocess_tmp"
 
 
@@ -79,8 +80,8 @@ def _repo_path_or_none(value: str | Path | None) -> Path | None:
     if path is None:
         return None
     if not path.is_absolute():
-        path = REPO_ROOT / path
-    return path
+        path = resolve_project_path(path, root=REPO_ROOT)
+    return path.resolve()
 
 
 def latest_sorting_folder(root: Path | None) -> Path | None:

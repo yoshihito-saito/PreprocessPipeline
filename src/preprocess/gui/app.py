@@ -46,6 +46,7 @@ from matplotlib.patches import Rectangle
 from src.postprocess import PostprocessConfig, run_postprocess_session
 from src.preprocess import prepare_chanmap, run_preprocess_session, select_paths_with_gui
 from src.preprocess.io import build_channel_map_data, set_tree_world_rw
+from src.preprocess.paths import find_project_root, resolve_project_path
 
 from .config_model import (
     PipelineGuiSettings,
@@ -58,7 +59,7 @@ from .config_model import (
 from .preflight import CheckResult, run_preflight
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = find_project_root()
 PUBLIC_DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "preprocess_gui_default_config.json"
 LOCAL_DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "preprocess_gui_default_config.local.json"
 
@@ -1568,7 +1569,7 @@ class MainWindow(QMainWindow):
     def _resolve_repo_path(text: str) -> Path:
         path = Path(text).expanduser()
         if not path.is_absolute():
-            path = REPO_ROOT / path
+            return resolve_project_path(path, root=REPO_ROOT)
         return path.resolve()
 
     def _current_sorter_config_path(self) -> Path | None:
