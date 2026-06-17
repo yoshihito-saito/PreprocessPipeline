@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 from pathlib import Path
 import shutil
 import sys
@@ -56,6 +57,7 @@ from .config_model import (
     parse_int_list,
 )
 from .preflight import CheckResult, run_preflight
+from .run_pipeline import ERROR_PREFIX, RESULT_PREFIX
 
 
 REPO_ROOT = find_project_root()
@@ -475,7 +477,13 @@ class MainWindow(QMainWindow):
         self._process: QProcess | None = None
         self._process_config_path: Path | None = None
         self._process_result: dict[str, Any] | None = None
+        self._process_error: dict[str, Any] | None = None
         self._process_tail = ""
+        self._log_buffer = ""
+        self._log_flush_timer = QTimer(self)
+        self._log_flush_timer.setSingleShot(True)
+        self._log_flush_timer.setInterval(80)
+        self._log_flush_timer.timeout.connect(self._flush_log_buffer)
         self._force_stop_requested = False
         self._probe_rows: list[dict[str, QWidget]] = []
         self.noise_threshold_fields: dict[str, QLineEdit] = {}
@@ -1904,14 +1912,21 @@ class MainWindow(QMainWindow):
             mode,
         ])
         process.setWorkingDirectory(str(REPO_ROOT))
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        if os.name != "nt" and hasattr(process, "setChildProcessModifier"):
+            process.setChildProcessModifier(os.setsid)
         process.readyReadStandardOutput.connect(self._read_process_stdout)
         process.readyReadStandardError.connect(self._read_process_stderr)
         process.finished.connect(self._process_finished)
+        process.errorOccurred.connect(self._process_error_occurred)
         self._process = process
         self._process_config_path = config_path
         self._process_result = None
+        self._process_error = None
         self._process_tail = ""
         process.start()
+        if not process.waitForStarted(3000):
+            self._process_error_occurred(process.error())
 
     def _read_process_stdout(self) -> None:
         process = self._process
@@ -1925,7 +1940,7 @@ class MainWindow(QMainWindow):
         if process is None:
             return
         text = bytes(process.readAllStandardError()).decode(errors="replace")
-        self._append_log(text)
+        self._queue_log(text)
 
     def _handle_process_output(self, text: str) -> None:
         combined = self._process_tail + text
@@ -1936,17 +1951,23 @@ class MainWindow(QMainWindow):
                 self._process_tail = line
                 continue
             stripped = line.strip()
-            if stripped.startswith("__PREPROCESS_GUI_RESULT__"):
+            if stripped.startswith(RESULT_PREFIX):
                 try:
-                    self._process_result = json.loads(stripped.removeprefix("__PREPROCESS_GUI_RESULT__"))
+                    self._process_result = json.loads(stripped.removeprefix(RESULT_PREFIX))
                 except json.JSONDecodeError:
-                    self._append_log(line)
+                    self._queue_log(line)
+            elif stripped.startswith(ERROR_PREFIX):
+                try:
+                    self._process_error = json.loads(stripped.removeprefix(ERROR_PREFIX))
+                except json.JSONDecodeError:
+                    self._queue_log(line)
             else:
-                self._append_log(line)
+                self._queue_log(line)
 
     def _process_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
         if self._process_tail:
             self._handle_process_output("\n")
+        self._flush_log_buffer()
         stopped = self._force_stop_requested
         self._force_stop_requested = False
         self._set_running(False)
@@ -1966,7 +1987,12 @@ class MainWindow(QMainWindow):
                     self.sorting_phy_folder.setText(sorter_output)
         else:
             self._append_log("\n=== Run failed ===\n")
-            QMessageBox.critical(self, "Run failed", f"Pipeline process exited with code {exit_code}.")
+            message = f"Pipeline process exited with code {exit_code}."
+            if self._process_error:
+                err_type = self._process_error.get("type", "Error")
+                err_message = self._process_error.get("message", "")
+                message = f"{err_type}: {err_message}" if err_message else str(err_type)
+            QMessageBox.critical(self, "Run failed", message)
         self._refresh_preview()
 
     def _kill_process_tree(self) -> None:
@@ -1976,8 +2002,24 @@ class MainWindow(QMainWindow):
         pid = int(process.processId())
         if os.name == "nt" and pid > 0:
             QProcess.startDetached("taskkill", ["/PID", str(pid), "/T", "/F"])
+        elif pid > 0:
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            except OSError:
+                process.kill()
         else:
             process.kill()
+
+    def _process_error_occurred(self, error: QProcess.ProcessError) -> None:
+        self._force_stop_requested = False
+        self._set_running(False)
+        if self._process_config_path is not None:
+            self._process_config_path.unlink(missing_ok=True)
+            self._process_config_path = None
+        self._process = None
+        QMessageBox.critical(self, "Run failed", f"Pipeline process failed to start: {error.name}")
 
     def closeEvent(self, event: Any) -> None:
         if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
@@ -1999,6 +2041,22 @@ class MainWindow(QMainWindow):
         self.log.moveCursor(QTextCursor.MoveOperation.End)
         self.log.insertPlainText(text)
         self.log.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _queue_log(self, text: str) -> None:
+        if not text:
+            return
+        self._log_buffer += text
+        if len(self._log_buffer) > 8192:
+            self._flush_log_buffer()
+        elif not self._log_flush_timer.isActive():
+            self._log_flush_timer.start()
+
+    def _flush_log_buffer(self) -> None:
+        if not self._log_buffer:
+            return
+        text = self._log_buffer
+        self._log_buffer = ""
+        self._append_log(text)
 
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)

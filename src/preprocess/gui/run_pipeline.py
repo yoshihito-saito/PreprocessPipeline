@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import traceback
 from typing import Any
 
 from src.postprocess import PostprocessConfig, run_postprocess_session
@@ -12,6 +13,7 @@ from .config_model import PipelineGuiSettings, RunMode
 
 
 RESULT_PREFIX = "__PREPROCESS_GUI_RESULT__"
+ERROR_PREFIX = "__PREPROCESS_GUI_ERROR__"
 
 
 def _postprocess_config_from_preprocess_result(
@@ -80,10 +82,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--mode", required=True, choices=["all", "preprocess", "postprocess", "noise_label"])
     args = parser.parse_args(argv)
-    settings = PipelineGuiSettings.load(Path(args.config))
-    result = run_pipeline(settings, args.mode)
-    print(f"{RESULT_PREFIX}{json.dumps(result, sort_keys=True)}", flush=True)
-    return 0
+    try:
+        settings = PipelineGuiSettings.load(Path(args.config))
+        result = run_pipeline(settings, args.mode)
+        print(f"{RESULT_PREFIX}{json.dumps(result, sort_keys=True)}", flush=True)
+        return 0
+    except Exception as exc:
+        traceback.print_exc()
+        payload = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback_tail": traceback.format_exc().splitlines()[-12:],
+        }
+        print(f"{ERROR_PREFIX}{json.dumps(payload, sort_keys=True)}", flush=True)
+        return 1
 
 
 if __name__ == "__main__":
