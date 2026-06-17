@@ -131,7 +131,7 @@ def _save_default_settings(settings: PipelineGuiSettings, path: Path = DEFAULT_C
 
 
 def _move_local_output_to_basepath(
-    settings: PipelineGuiSettings, *, move_dat: bool, overwrite: bool
+    settings: PipelineGuiSettings, *, move_dat: bool, overwrite: bool, clean_after_move: bool
 ) -> dict[str, Any]:
     basepath = settings.basepath_path
     local_output_dir = settings.local_output_dir
@@ -189,6 +189,11 @@ def _move_local_output_to_basepath(
         set_tree_world_rw(dst)
         moved.append({"name": dst.name, "path": str(dst)})
 
+    cleaned = False
+    if clean_after_move and src_root.exists():
+        shutil.rmtree(src_root)
+        cleaned = True
+
     return {
         "basepath": str(dst_root),
         "local_output_dir": str(src_root),
@@ -196,6 +201,8 @@ def _move_local_output_to_basepath(
         "skipped": skipped,
         "overwrite": overwrite,
         "move_dat": move_dat,
+        "clean_after_move": clean_after_move,
+        "cleaned": cleaned,
     }
 
 
@@ -1193,6 +1200,8 @@ class MainWindow(QMainWindow):
         self.run_post = QPushButton("Run postprocess only")
         self.move_dat_to_basepath = QCheckBox("Move basename.dat")
         self.move_overwrite = QCheckBox("Overwrite moved files")
+        self.move_clean_local = QCheckBox("Clean local after move")
+        self.move_clean_local.setChecked(True)
         self.move_outputs = QPushButton("Move outputs to basepath")
         self.force_stop = QPushButton("Force stop")
         self.force_stop.setObjectName("dangerButton")
@@ -1209,6 +1218,7 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         layout.addWidget(self.move_dat_to_basepath)
         layout.addWidget(self.move_overwrite)
+        layout.addWidget(self.move_clean_local)
         layout.addWidget(self.move_outputs)
         layout.addWidget(self.force_stop)
         layout.addWidget(self.clear_log)
@@ -1828,7 +1838,8 @@ class MainWindow(QMainWindow):
                 f"Basepath: {settings.basepath or '-'}\n"
                 f"Local output: {settings.local_output_dir or '-'}\n"
                 f"Move basename.dat: {'yes' if self.move_dat_to_basepath.isChecked() else 'no'}\n"
-                f"Overwrite existing files: {'yes' if self.move_overwrite.isChecked() else 'no'}"
+                f"Overwrite existing files: {'yes' if self.move_overwrite.isChecked() else 'no'}\n"
+                f"Clean local after move: {'yes' if self.move_clean_local.isChecked() else 'no'}"
             )
             answer = QMessageBox.question(self, "Move outputs to basepath", message)
             if answer != QMessageBox.StandardButton.Yes:
@@ -1837,6 +1848,7 @@ class MainWindow(QMainWindow):
                 settings,
                 move_dat=self.move_dat_to_basepath.isChecked(),
                 overwrite=self.move_overwrite.isChecked(),
+                clean_after_move=self.move_clean_local.isChecked(),
             )
             lines = [
                 "Move to basepath finished",
@@ -1857,6 +1869,8 @@ class MainWindow(QMainWindow):
                 if result["skipped"]
                 else ["- none"]
             )
+            lines.append("")
+            lines.append(f"Cleaned local output: {'yes' if result['cleaned'] else 'no'}")
             lines.append("")
             lines.append("Move outputs to basepath complete!")
             text = "\n".join(lines)
