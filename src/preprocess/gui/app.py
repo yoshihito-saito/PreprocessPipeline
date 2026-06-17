@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import time
 from typing import Any
 
 import numpy as np
@@ -1998,6 +1999,7 @@ class MainWindow(QMainWindow):
                 sorter_output = pre_result.get("sorter_output_dir")
                 if sorter_output:
                     self.sorting_phy_folder.setText(sorter_output)
+                self._cleanup_postprocess_caches_from_result(self._process_result)
         else:
             self._append_log("\n=== Run failed ===\n")
             message = f"Pipeline process exited with code {exit_code}."
@@ -2007,6 +2009,36 @@ class MainWindow(QMainWindow):
                 message = f"{err_type}: {err_message}" if err_message else str(err_type)
             QMessageBox.critical(self, "Run failed", message)
         self._refresh_preview()
+
+    def _cleanup_postprocess_caches_from_result(self, result: dict[str, Any]) -> None:
+        post_result = result.get("postprocess_results") or {}
+        cache_dirs = post_result.get("analyzer_cache_dirs") or []
+        if not cache_dirs:
+            return
+        for cache_dir in cache_dirs:
+            path = Path(str(cache_dir))
+            if not path.exists():
+                continue
+            try:
+                self._append_log(f"Cleaning analyzer cache after process exit: {path}\n")
+                self._remove_tree_with_retry(path)
+                self._append_log(f"Analyzer cache removed: {path}\n")
+            except Exception as exc:
+                self._append_log(
+                    "[WARN] Analyzer cache could not be removed after process exit: "
+                    f"{path}. Close Python/Phy/MATLAB handles and delete it manually. "
+                    f"Original error: {exc}\n"
+                )
+
+    def _remove_tree_with_retry(self, path: Path, *, retries: int = 8, delay: float = 1.0) -> None:
+        for attempt in range(retries):
+            try:
+                shutil.rmtree(path)
+                return
+            except PermissionError:
+                if attempt >= retries - 1:
+                    raise
+                time.sleep(delay)
 
     def _kill_process_tree(self) -> None:
         process = self._process

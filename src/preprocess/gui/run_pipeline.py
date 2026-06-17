@@ -70,8 +70,15 @@ def run_pipeline(settings: PipelineGuiSettings, mode: RunMode) -> dict[str, Any]
         if mode == "noise_label":
             post_config.noise_label_only = True
         post_results = run_postprocess_session(post_config)
+        post_result_list = list(post_results) if isinstance(post_results, list) else [post_results]
+        analyzer_cache_dirs = [
+            str(result.analyzer_cache_dir)
+            for result in post_result_list
+            if getattr(result, "analyzer_cache_dir", None)
+        ]
         payload["postprocess_results"] = {
-            "count": len(post_results) if hasattr(post_results, "__len__") else 1,
+            "count": len(post_result_list),
+            "analyzer_cache_dirs": analyzer_cache_dirs,
         }
 
     return payload

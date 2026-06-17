@@ -7,6 +7,7 @@ import re
 import shutil
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -34,6 +35,10 @@ _SORTING_OUTPUT_PATTERNS = (
     "Kilosort2.5_*",
     "Kilosort4_*",
 )
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 def _find_sorting_output_dirs(root: Path) -> list[Path]:
@@ -233,6 +238,24 @@ def _safe_rmtree(path: Path, *, retries: int = 3, delay: float = 1.0) -> None:
                 time.sleep(delay)
             else:
                 raise
+
+
+def _delete_final_analyzer_cache(path: Path, log: Callable[[str], None]) -> bool:
+    """Delete postprocess cache after outputs are complete; tolerate Windows locks."""
+    retries = 8 if _is_windows() else 3
+    try:
+        gc.collect()
+        _safe_rmtree(path, retries=retries, delay=1.0)
+        return True
+    except PermissionError as exc:
+        if not _is_windows():
+            raise
+        log(
+            "[WARN] analyzer_cache is still locked by Windows; leaving it in place: "
+            f"{path}. Close Python/Phy handles and delete it manually if disk space matters. "
+            f"Original error: {exc}"
+        )
+        return False
 
 
 def _clear_folder_contents(folder: Path, *, keep_names: set[str] | None = None) -> None:
@@ -984,8 +1007,22 @@ def _run_postprocess_single_session(
 
     n_units_final, total_spikes_final = _count_units_and_spikes(sorting_split)
     if config.delete_analyzer_cache and analyzer_cache_root is not None and analyzer_cache_root.exists():
-        _safe_rmtree(analyzer_cache_root)
-        analyzer_cache_for_result = None
+        _intermediate_analyzers.clear()
+        try:
+            del analyzer_split
+        except NameError:
+            pass
+        try:
+            del analyzer_merged
+        except NameError:
+            pass
+        try:
+            del analyzer
+        except NameError:
+            pass
+        gc.collect()
+        analyzer_cache_deleted = _delete_final_analyzer_cache(analyzer_cache_root, _log)
+        analyzer_cache_for_result = None if analyzer_cache_deleted else analyzer_cache_root
     else:
         analyzer_cache_for_result = analyzer_cache_root
 

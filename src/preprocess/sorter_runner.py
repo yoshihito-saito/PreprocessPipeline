@@ -121,7 +121,7 @@ def _prepend_to_windows_path(path_to_add: str) -> None:
 
 
 def _ensure_matlab_shell_env() -> None:
-    if os.name == "nt":
+    if _is_windows():
         return
     current = os.environ.get("MATLAB_SHELL", "").strip()
     if current:
@@ -132,6 +132,10 @@ def _ensure_matlab_shell_env() -> None:
 
 def _repo_root() -> Path:
     return find_project_root()
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 def _runtime_root() -> Path:
@@ -145,8 +149,28 @@ def _matlab_shim_dir() -> Path:
     return _runtime_root() / "matlab_shim"
 
 
-def _matlab_log_path() -> Path:
-    return _matlab_shim_dir() / "matlab_run.log"
+def _matlab_log_path(output_folder: Path | None = None) -> Path:
+    if output_folder is None:
+        return _matlab_shim_dir() / "matlab_run.log"
+    return _matlab_shim_dir() / f"{Path(output_folder).name}_matlab_run.log"
+
+
+def _sorter_matlab_log_path(output_folder: Path) -> Path:
+    return Path(output_folder) / "matlab_run.log"
+
+
+def _persist_matlab_log(runtime_log: Path, output_folder: Path) -> Path:
+    final_log = _sorter_matlab_log_path(output_folder)
+    final_log.parent.mkdir(parents=True, exist_ok=True)
+    if runtime_log.exists():
+        if runtime_log.resolve() != final_log.resolve():
+            shutil.copy2(runtime_log, final_log)
+    elif not final_log.exists():
+        final_log.write_text(
+            f"[preprocess] MATLAB log was not created at runtime path: {runtime_log}\n",
+            encoding="utf-8",
+        )
+    return final_log
 
 
 def _default_sorter_config_path(sorter: str) -> Path:
@@ -199,7 +223,7 @@ def _resolve_matlab_cmd(matlab_path: Path | None) -> str | None:
     if matlab_cmd is not None:
         return matlab_cmd
 
-    if os.name == "nt":
+    if _is_windows():
         program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
         root = Path(program_files) / "MATLAB"
         if root.exists():
@@ -269,10 +293,32 @@ def _inject_matlab_shim(
         str(shim_dir) if not existing_matlabpath else str(shim_dir) + os.pathsep + existing_matlabpath
     )
 
-    if os.name == "nt":
+    if _is_windows():
         shim_path = shim_dir / "matlab.bat"
+        matlab_engine_log = str(matlab_log) + ".matlab.log"
+        matlab_stdout_log = str(matlab_log) + ".stdout.log"
         shim_path.write_text(
-            f'@echo off\r\n"{matlab_cmd}" -logfile "{matlab_log}" %*\r\n',
+            (
+                "@echo off\r\n"
+                f'set "MATLAB_LOG={matlab_log}"\r\n'
+                f'set "MATLAB_ENGINE_LOG={matlab_engine_log}"\r\n'
+                f'set "MATLAB_STDOUT_LOG={matlab_stdout_log}"\r\n'
+                f'if not exist "{matlab_log.parent}" mkdir "{matlab_log.parent}"\r\n'
+                '> "%MATLAB_LOG%" echo [matlab-shim] starting MATLAB\r\n'
+                f'>> "%MATLAB_LOG%" echo [matlab-shim] matlab: "{matlab_cmd}"\r\n'
+                f'"{matlab_cmd}" -logfile "%MATLAB_ENGINE_LOG%" %* > "%MATLAB_STDOUT_LOG%" 2>&1\r\n'
+                "set MATLAB_EXIT=%ERRORLEVEL%\r\n"
+                '>> "%MATLAB_LOG%" echo [matlab-shim] MATLAB exit code %MATLAB_EXIT%\r\n'
+                'if exist "%MATLAB_ENGINE_LOG%" (\r\n'
+                '  >> "%MATLAB_LOG%" echo [matlab-shim] MATLAB -logfile output follows\r\n'
+                '  type "%MATLAB_ENGINE_LOG%" >> "%MATLAB_LOG%"\r\n'
+                ")\r\n"
+                'if exist "%MATLAB_STDOUT_LOG%" (\r\n'
+                '  >> "%MATLAB_LOG%" echo [matlab-shim] MATLAB stdout/stderr follows\r\n'
+                '  type "%MATLAB_STDOUT_LOG%" >> "%MATLAB_LOG%"\r\n'
+                ")\r\n"
+                "exit /b %MATLAB_EXIT%\r\n"
+            ),
             encoding="utf-8",
         )
         _prepend_to_windows_path(str(shim_dir))
@@ -1453,6 +1499,7 @@ def execute_sorting_job(
     ks4_auto_geom_options: dict[str, Any] = {}
     ks25_ops_overrides: dict[str, Any] = {}
     kilosort4_import_root: Path | None = None
+    matlab_log: Path | None = None
     output_folder = Path(output_folder).resolve()
 
     if sorter_input in _MATLAB_SORTER_INPUTS:
@@ -1475,14 +1522,16 @@ def execute_sorting_job(
             )
 
         matlab_bin = str(Path(matlab_cmd).parent)
-        if os.name == "nt":
+        if _is_windows():
             _prepend_to_windows_path(matlab_bin)
         else:
             _prepend_to_path(matlab_bin)
             _ensure_matlab_shell_env()
         print(f"Prepended MATLAB bin to PATH for this run: {matlab_bin}")
 
-        matlab_log = _matlab_log_path()
+        matlab_log = _matlab_log_path(output_folder)
+        matlab_log.parent.mkdir(parents=True, exist_ok=True)
+        matlab_log.write_text("", encoding="utf-8")
         shim_path = _inject_matlab_shim(
             matlab_cmd,
             matlab_log,
@@ -1490,6 +1539,7 @@ def execute_sorting_job(
         )
         print(f"Injected MATLAB shim: {shim_path}")
         print(f"MATLAB output will be logged to: {matlab_log}")
+        print(f"MATLAB log will be saved to sorter output: {_sorter_matlab_log_path(output_folder)}")
 
         matlab_resolved = shutil.which("matlab")
         if matlab_resolved is None:
@@ -1652,13 +1702,14 @@ def execute_sorting_job(
                 f"Sorting failed for sorter={sorter_name}. Original error: {err}"
             ) from err
         # Surface MATLAB-side failure reasons (GPU, license/service, etc).
-        matlab_log = _matlab_log_path()
+        runtime_matlab_log = matlab_log or _matlab_log_path(output_folder)
+        final_matlab_log = _persist_matlab_log(runtime_matlab_log, output_folder)
         hint = ""
         cause = "MATLAB runtime error"
-        if matlab_log.exists():
-            log_tail = matlab_log.read_text(encoding="utf-8", errors="replace")[-3000:]
+        if final_matlab_log.exists():
+            log_tail = final_matlab_log.read_text(encoding="utf-8", errors="replace")[-3000:]
             if bool(sorter_verbose):
-                print(f"\n[MATLAB log: {matlab_log}]")
+                print(f"\n[MATLAB log: {final_matlab_log}]")
                 print(log_tail)
             if "higher compute capability" in log_tail:
                 cause = "possible GPU initialization error"
@@ -1691,10 +1742,12 @@ def execute_sorting_job(
                 )
         raise RuntimeError(
             f"Kilosort failed ({cause}). "
-            f"Check MATLAB log at: {matlab_log}, then re-run the cell.{hint}\nOriginal error: {err}"
+            f"Check MATLAB log at: {final_matlab_log}, then re-run the cell.{hint}\nOriginal error: {err}"
         ) from err
     finally:
         if sorter_input in _MATLAB_SORTER_INPUTS:
+            if matlab_log is not None:
+                _persist_matlab_log(matlab_log, output_folder)
             _trace_sorter_stage(
                 "before runtime cleanup",
                 output_folder=output_folder,
