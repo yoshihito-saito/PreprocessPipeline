@@ -5,6 +5,7 @@ import os
 import signal
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -14,11 +15,13 @@ import numpy as np
 from scipy.io import loadmat
 
 from PySide6.QtCore import QProcess, Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QTextCursor
+from PySide6.QtGui import QColor, QDesktopServices, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -35,6 +38,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -44,12 +48,21 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
+from src.preprocess.behavior import (
+    dlc_point_names,
+    discover_dlc_files,
+    inspect_dlc_ttl_sync,
+    load_representative_frame,
+    load_dlc_tracking,
+    process_dlc_behavior,
+)
 from src.preprocess import prepare_chanmap, select_paths_with_gui
 from src.preprocess.io import build_channel_map_data, set_tree_world_rw
 from src.preprocess.paths import find_project_root, resolve_project_path
 from src.worker_defaults import default_worker_count, normalize_worker_count
 
 from .config_model import (
+    BehaviorGuiSettings,
     PipelineGuiSettings,
     PostprocessGuiSettings,
     PreprocessGuiSettings,
@@ -477,6 +490,500 @@ class ChanMapCanvas(QWidget):
         self.canvas.draw_idle()
 
 
+class CalibrationFrameCanvas(QWidget):
+    def __init__(self, on_distance: Any) -> None:
+        super().__init__()
+        self._on_distance = on_distance
+        self._drag_start: tuple[float, float] | None = None
+        self._line: Any | None = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.figure = Figure(figsize=(5.0, 3.2), facecolor="#2f2f2f")
+        self.canvas = FigureCanvas(self.figure)
+        self._ax = self.figure.add_subplot(111)
+        self._ax.set_axis_off()
+        self._ax.text(0.5, 0.5, "Load a video frame", ha="center", va="center", color="#d4d4d4")
+        self.canvas.mpl_connect("button_press_event", self._on_button_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_button_release)
+        layout.addWidget(self.canvas)
+
+    def show_frame(self, frame: np.ndarray, *, title: str) -> None:
+        self.figure.clear()
+        self._ax = self.figure.add_subplot(111)
+        self._ax.imshow(frame)
+        self._ax.set_title(title, color="#f5f5f5")
+        self._ax.set_axis_off()
+        self._drag_start = None
+        self._line = None
+        self.canvas.draw_idle()
+
+    def _on_button_press(self, event: Any) -> None:
+        if event.inaxes is not self._ax or event.xdata is None or event.ydata is None:
+            return
+        self._drag_start = (float(event.xdata), float(event.ydata))
+        if self._line is not None:
+            self._line.remove()
+        self._line = self._ax.plot([event.xdata, event.xdata], [event.ydata, event.ydata], color="#ef4b2d", linewidth=2)[0]
+        self.canvas.draw_idle()
+
+    def _on_motion(self, event: Any) -> None:
+        if self._drag_start is None or self._line is None:
+            return
+        if event.inaxes is not self._ax or event.xdata is None or event.ydata is None:
+            return
+        x0, y0 = self._drag_start
+        self._line.set_data([x0, float(event.xdata)], [y0, float(event.ydata)])
+        self.canvas.draw_idle()
+
+    def _on_button_release(self, event: Any) -> None:
+        if self._drag_start is None or event.xdata is None or event.ydata is None:
+            return
+        x0, y0 = self._drag_start
+        x1, y1 = float(event.xdata), float(event.ydata)
+        distance = float(np.hypot(x1 - x0, y1 - y0))
+        self._drag_start = None
+        if distance > 0:
+            self._on_distance(distance)
+        self.canvas.draw_idle()
+
+
+class BehaviorFrameCanvas(QWidget):
+    def __init__(self, epoch_name: str, on_line_changed: Any) -> None:
+        super().__init__()
+        self.epoch_name = epoch_name
+        self._on_line_changed = on_line_changed
+        self.pixel_distance: float | None = None
+        self._pending_start: tuple[float, float] | None = None
+        self._line: Any | None = None
+        self._start_marker: Any | None = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.figure = Figure(figsize=(7.0, 5.0), facecolor="#2f2f2f")
+        self.canvas = FigureCanvas(self.figure)
+        self._ax = self.figure.add_subplot(111)
+        self.canvas.mpl_connect("button_press_event", self._on_button_press)
+        layout.addWidget(self.canvas, 1)
+        self.show_message("No frame loaded")
+
+    def show_message(self, message: str) -> None:
+        self.figure.clear()
+        self._ax = self.figure.add_subplot(111)
+        self._ax.set_facecolor("#252525")
+        self._ax.text(0.5, 0.5, message, ha="center", va="center", color="#d4d4d4", wrap=True)
+        self._ax.set_axis_off()
+        self._pending_start = None
+        self._line = None
+        self._start_marker = None
+        self.pixel_distance = None
+        self.canvas.draw_idle()
+        self._on_line_changed()
+
+    def show_frame(self, frame: np.ndarray, *, title: str) -> None:
+        self.figure.clear()
+        self._ax = self.figure.add_subplot(111)
+        self.figure.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.98)
+        self._ax.imshow(frame)
+        self._ax.set_axis_off()
+        self._pending_start = None
+        self._line = None
+        self._start_marker = None
+        self.pixel_distance = None
+        self.canvas.draw_idle()
+        self._on_line_changed()
+
+    def reset_line(self) -> None:
+        if self._line is not None:
+            self._line.remove()
+            self._line = None
+        if self._start_marker is not None:
+            self._start_marker.remove()
+            self._start_marker = None
+        self._pending_start = None
+        self.pixel_distance = None
+        self.canvas.draw_idle()
+        self._on_line_changed()
+
+    def _on_button_press(self, event: Any) -> None:
+        if event.inaxes is not self._ax or event.xdata is None or event.ydata is None:
+            return
+        x1, y1 = float(event.xdata), float(event.ydata)
+        if self._pending_start is None:
+            self.reset_line()
+            self._pending_start = (x1, y1)
+            self._start_marker = self._ax.plot(
+                [x1],
+                [y1],
+                marker="o",
+                markersize=6,
+                color="#ef4b2d",
+                markeredgecolor="#ffffff",
+                markeredgewidth=0.8,
+            )[0]
+            self.canvas.draw_idle()
+            return
+
+        x0, y0 = self._pending_start
+        if self._line is not None:
+            self._line.remove()
+        self._line = self._ax.plot([x0, x1], [y0, y1], color="#ef4b2d", linewidth=2.2)[0]
+        if self._start_marker is not None:
+            self._start_marker.remove()
+            self._start_marker = None
+        self._pending_start = None
+        distance = float(np.hypot(x1 - x0, y1 - y0))
+        self.pixel_distance = distance if distance > 0 else None
+        self.canvas.draw_idle()
+        self._on_line_changed()
+
+
+def _points_near_closed_polyline(points: np.ndarray, polygon: np.ndarray, margin: float) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64)
+    polygon = np.asarray(polygon, dtype=np.float64)
+    if points.size == 0 or polygon.shape[0] < 2 or margin <= 0:
+        return np.zeros(points.shape[0], dtype=bool)
+    closed = np.vstack([polygon, polygon[0]])
+    margin_sq = float(margin) ** 2
+    near = np.zeros(points.shape[0], dtype=bool)
+    for start, stop in zip(closed[:-1], closed[1:]):
+        segment = stop - start
+        denom = float(np.dot(segment, segment))
+        if denom <= 0:
+            closest = np.broadcast_to(start, points.shape)
+        else:
+            t = np.clip(((points - start) @ segment) / denom, 0.0, 1.0)
+            closest = start + t[:, None] * segment
+        distances_sq = np.sum((points - closest) ** 2, axis=1)
+        near |= distances_sq <= margin_sq
+    return near
+
+
+def _points_in_closed_polygon(points: np.ndarray, polygon: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64)
+    polygon = np.asarray(polygon, dtype=np.float64)
+    if points.size == 0 or polygon.shape[0] < 3:
+        return np.zeros(points.shape[0], dtype=bool)
+    x = points[:, 0]
+    y = points[:, 1]
+    finite = np.isfinite(x) & np.isfinite(y)
+    inside = np.zeros(points.shape[0], dtype=bool)
+    poly_x = polygon[:, 0]
+    poly_y = polygon[:, 1]
+    j = polygon.shape[0] - 1
+    for i in range(polygon.shape[0]):
+        yi = poly_y[i]
+        yj = poly_y[j]
+        crosses_y = finite & ((yi > y) != (yj > y))
+        if np.any(crosses_y):
+            xi = poly_x[i]
+            xj = poly_x[j]
+            x_intersection = (xj - xi) * (y[crosses_y] - yi) / (yj - yi) + xi
+            selected = np.flatnonzero(crosses_y)
+            inside[selected] ^= x[selected] < x_intersection
+        j = i
+    return inside
+
+
+class BehaviorTrackCanvas(QWidget):
+    def __init__(self, on_mask_changed: Any) -> None:
+        super().__init__()
+        self._on_mask_changed = on_mask_changed
+        self.timestamps = np.empty((0,), dtype=np.float64)
+        self.x = np.empty((0,), dtype=np.float64)
+        self.y = np.empty((0,), dtype=np.float64)
+        self.good_mask = np.empty((0,), dtype=bool)
+        self._keep_polygons: list[np.ndarray] = []
+        self._current_polygon: list[tuple[float, float]] = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.figure = Figure(figsize=(7.0, 5.0), facecolor="#2f2f2f")
+        self.canvas = FigureCanvas(self.figure)
+        self.ax = self.figure.add_subplot(111)
+        self.summary = QLabel("")
+        self.summary.setWordWrap(True)
+        self.canvas.mpl_connect("button_press_event", self._on_button_press)
+        layout.addWidget(self.canvas, 1)
+        layout.addWidget(self.summary)
+        self.show_empty()
+
+    def show_empty(self) -> None:
+        self.figure.clear()
+        self.ax = self.figure.add_subplot(111)
+        self.ax.set_facecolor("#252525")
+        self.ax.text(
+            0.5,
+            0.5,
+            "Load outlier cleanup preview",
+            ha="center",
+            va="center",
+            color="#d4d4d4",
+        )
+        self.ax.set_axis_off()
+        self.summary.setText("No behavior track loaded")
+        self.canvas.draw_idle()
+
+    def show_message(self, message: str) -> None:
+        self.figure.clear()
+        self.ax = self.figure.add_subplot(111)
+        self.ax.set_facecolor("#252525")
+        self.ax.text(
+            0.5,
+            0.5,
+            message,
+            ha="center",
+            va="center",
+            color="#d4d4d4",
+            wrap=True,
+        )
+        self.ax.set_axis_off()
+        self.summary.setText("")
+        self.canvas.draw_idle()
+
+    def set_track(self, timestamps: np.ndarray, x: np.ndarray, y: np.ndarray) -> None:
+        self.timestamps = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+        self.x = np.asarray(x, dtype=np.float64).reshape(-1)
+        self.y = np.asarray(y, dtype=np.float64).reshape(-1)
+        n = min(self.timestamps.size, self.x.size, self.y.size)
+        self.timestamps = self.timestamps[:n]
+        self.x = self.x[:n]
+        self.y = self.y[:n]
+        self.good_mask = np.isfinite(self.x) & np.isfinite(self.y)
+        self._keep_polygons = []
+        self._current_polygon = []
+        self._render()
+        self._on_mask_changed(None)
+
+    def set_processed_track(self, timestamps: np.ndarray, x: np.ndarray, y: np.ndarray) -> None:
+        self.timestamps = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+        self.x = np.asarray(x, dtype=np.float64).reshape(-1)
+        self.y = np.asarray(y, dtype=np.float64).reshape(-1)
+        n = min(self.timestamps.size, self.x.size, self.y.size)
+        self.timestamps = self.timestamps[:n]
+        self.x = self.x[:n]
+        self.y = self.y[:n]
+        self.good_mask = np.isfinite(self.x) & np.isfinite(self.y)
+        self._keep_polygons = []
+        self._current_polygon = []
+        self._render()
+
+    def reset_keep_ranges(self) -> None:
+        self._keep_polygons = []
+        self._current_polygon = []
+        self.good_mask = np.isfinite(self.x) & np.isfinite(self.y)
+        self._render()
+        self._on_mask_changed(None)
+
+    def _render(self) -> None:
+        self.figure.clear()
+        self.ax = self.figure.add_subplot(111)
+        self.figure.subplots_adjust(left=0.10, right=0.98, bottom=0.12, top=0.94)
+        self.ax.set_facecolor("#252525")
+        finite = np.isfinite(self.x) & np.isfinite(self.y)
+        rejected = finite & ~self.good_mask
+        accepted = finite & self.good_mask
+        self.ax.scatter(self.x[accepted], self.y[accepted], s=5, c="#80deea", alpha=0.55, linewidth=0)
+        if np.any(rejected):
+            self.ax.scatter(self.x[rejected], self.y[rejected], s=8, c="#ef4b2d", alpha=0.70, linewidth=0)
+        for polygon in self._keep_polygons:
+            closed = np.vstack([polygon, polygon[0]])
+            self.ax.fill(closed[:, 0], closed[:, 1], facecolor="#80deea18", edgecolor="#80deea", linewidth=1.2)
+        if self._current_polygon:
+            current = np.asarray(self._current_polygon, dtype=np.float64)
+            self.ax.plot(current[:, 0], current[:, 1], color="#f5d76e", linewidth=1.4, marker="o", markersize=4)
+            if current.shape[0] >= 3:
+                closed = np.vstack([current, current[0]])
+                self.ax.plot(closed[:, 0], closed[:, 1], color="#f5d76e", linewidth=0.9, linestyle="--")
+        self.ax.set_xlabel("x (cm)", color="#d4d4d4")
+        self.ax.set_ylabel("y (cm)", color="#d4d4d4")
+        self.ax.tick_params(colors="#a3a3a3")
+        for spine in self.ax.spines.values():
+            spine.set_color("#404040")
+        self._set_padded_limits()
+        self.ax.set_aspect("equal", adjustable="box")
+        self.ax.grid(True, alpha=0.20, color="#737373")
+        self.summary.setText(
+            f"keep polygons={len(self._keep_polygons)}, current vertices={len(self._current_polygon)}, "
+            f"accepted={int(np.sum(accepted))}, outlier/NaN={int(np.sum(~accepted))}"
+        )
+        self.canvas.draw_idle()
+
+    def _set_padded_limits(self) -> None:
+        arrays_x: list[np.ndarray] = []
+        arrays_y: list[np.ndarray] = []
+        finite = np.isfinite(self.x) & np.isfinite(self.y)
+        if np.any(finite):
+            arrays_x.append(self.x[finite])
+            arrays_y.append(self.y[finite])
+        for polygon in self._keep_polygons:
+            arrays_x.append(polygon[:, 0])
+            arrays_y.append(polygon[:, 1])
+        if self._current_polygon:
+            current = np.asarray(self._current_polygon, dtype=np.float64)
+            arrays_x.append(current[:, 0])
+            arrays_y.append(current[:, 1])
+        if not arrays_x:
+            return
+        x_values = np.concatenate(arrays_x)
+        y_values = np.concatenate(arrays_y)
+        x_values = x_values[np.isfinite(x_values)]
+        y_values = y_values[np.isfinite(y_values)]
+        if x_values.size == 0 or y_values.size == 0:
+            return
+        x_min = float(np.min(x_values))
+        x_max = float(np.max(x_values))
+        y_min = float(np.min(y_values))
+        y_max = float(np.max(y_values))
+        x_span = max(x_max - x_min, 1.0)
+        y_span = max(y_max - y_min, 1.0)
+        self.ax.set_xlim(x_min - x_span * 0.10, x_max + x_span * 0.10)
+        self.ax.set_ylim(y_min - y_span * 0.10, y_max + y_span * 0.10)
+
+    def _apply_keep_polygons(self) -> None:
+        finite = np.isfinite(self.x) & np.isfinite(self.y)
+        if not self._keep_polygons:
+            self.good_mask = finite
+            self._on_mask_changed(None)
+            return
+        keep = np.zeros(self.x.shape, dtype=bool)
+        points = np.column_stack([self.x, self.y])
+        for polygon in self._keep_polygons:
+            inside = _points_in_closed_polygon(points, polygon)
+            near_boundary = _points_near_closed_polyline(points, polygon, 1e-9)
+            keep |= finite & (inside | near_boundary)
+        self.good_mask = keep
+        self._on_mask_changed(self.good_mask.copy())
+
+    def _on_button_press(self, event: Any) -> None:
+        if event.inaxes is not self.ax or event.xdata is None or event.ydata is None:
+            return
+        self._current_polygon.append((float(event.xdata), float(event.ydata)))
+        if len(self._current_polygon) >= 3:
+            polygon = np.asarray(self._current_polygon, dtype=np.float64)
+            if np.linalg.matrix_rank(polygon - polygon[0]) >= 2:
+                self._keep_polygons = [polygon]
+                self._apply_keep_polygons()
+        self._render()
+
+
+class TrackerJumpDialog(QDialog):
+    def __init__(self, parent: QWidget, timestamps: np.ndarray, x: np.ndarray, y: np.ndarray) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Clean Tracker Jumps")
+        self.resize(900, 700)
+        self.timestamps = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+        self.x = np.asarray(x, dtype=np.float64).reshape(-1)
+        self.y = np.asarray(y, dtype=np.float64).reshape(-1)
+        n = min(self.timestamps.size, self.x.size, self.y.size)
+        self.timestamps = self.timestamps[:n]
+        self.x = self.x[:n]
+        self.y = self.y[:n]
+        self.good_mask = np.isfinite(self.x) & np.isfinite(self.y)
+        self._drag_start: tuple[float, float] | None = None
+        self._selection_patch: Rectangle | None = None
+
+        layout = QVBoxLayout(self)
+        hint = QLabel("Drag a rectangle around outlier points to reject them. Rejected points are saved as NaN.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.figure = Figure(figsize=(7.0, 5.0), facecolor="#2f2f2f")
+        self.canvas = FigureCanvas(self.figure)
+        self.ax = self.figure.add_subplot(111)
+        self.canvas.mpl_connect("button_press_event", self._on_button_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_button_release)
+        layout.addWidget(self.canvas, 1)
+        self.summary = QLabel("")
+        layout.addWidget(self.summary)
+
+        buttons_row = QWidget()
+        buttons_layout = QHBoxLayout(buttons_row)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        reset = QPushButton("Reset mask")
+        reset.clicked.connect(self._reset_mask)
+        buttons_layout.addWidget(reset)
+        buttons_layout.addStretch(1)
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        buttons_layout.addWidget(button_box)
+        layout.addWidget(buttons_row)
+        self._render()
+
+    def _render(self) -> None:
+        self.ax.clear()
+        self.ax.set_facecolor("#252525")
+        finite = np.isfinite(self.x) & np.isfinite(self.y)
+        rejected = finite & ~self.good_mask
+        accepted = finite & self.good_mask
+        self.ax.scatter(self.x[accepted], self.y[accepted], s=6, c="#80deea", alpha=0.65, linewidth=0)
+        if np.any(rejected):
+            self.ax.scatter(self.x[rejected], self.y[rejected], s=12, c="#ef4b2d", alpha=0.9, linewidth=0)
+        self.ax.set_xlabel("x (cm)", color="#d4d4d4")
+        self.ax.set_ylabel("y (cm)", color="#d4d4d4")
+        self.ax.tick_params(colors="#a3a3a3")
+        for spine in self.ax.spines.values():
+            spine.set_color("#404040")
+        self.ax.set_aspect("equal", adjustable="datalim")
+        self.summary.setText(f"accepted={int(np.sum(accepted))}, rejected={int(np.sum(rejected))}")
+        self.canvas.draw_idle()
+
+    def _on_button_press(self, event: Any) -> None:
+        if event.inaxes is not self.ax or event.xdata is None or event.ydata is None:
+            return
+        self._drag_start = (float(event.xdata), float(event.ydata))
+        if self._selection_patch is not None:
+            self._selection_patch.remove()
+        self._selection_patch = Rectangle(
+            self._drag_start,
+            0,
+            0,
+            facecolor="#ef4b2d22",
+            edgecolor="#ef4b2d",
+            linewidth=1.2,
+        )
+        self.ax.add_patch(self._selection_patch)
+        self.canvas.draw_idle()
+
+    def _on_motion(self, event: Any) -> None:
+        if self._drag_start is None or self._selection_patch is None:
+            return
+        if event.inaxes is not self.ax or event.xdata is None or event.ydata is None:
+            return
+        x0, y0 = self._drag_start
+        x1, y1 = float(event.xdata), float(event.ydata)
+        self._selection_patch.set_x(min(x0, x1))
+        self._selection_patch.set_y(min(y0, y1))
+        self._selection_patch.set_width(abs(x1 - x0))
+        self._selection_patch.set_height(abs(y1 - y0))
+        self.canvas.draw_idle()
+
+    def _on_button_release(self, event: Any) -> None:
+        if self._drag_start is None or event.xdata is None or event.ydata is None:
+            return
+        x0, y0 = self._drag_start
+        x1, y1 = float(event.xdata), float(event.ydata)
+        xmin, xmax = sorted((x0, x1))
+        ymin, ymax = sorted((y0, y1))
+        selected = (
+            np.isfinite(self.x)
+            & np.isfinite(self.y)
+            & (self.x >= xmin)
+            & (self.x <= xmax)
+            & (self.y >= ymin)
+            & (self.y <= ymax)
+        )
+        self.good_mask[selected] = False
+        if self._selection_patch is not None:
+            self._selection_patch.remove()
+            self._selection_patch = None
+        self._drag_start = None
+        self._render()
+
+    def _reset_mask(self) -> None:
+        self.good_mask = np.isfinite(self.x) & np.isfinite(self.y)
+        self._render()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -498,6 +1005,14 @@ class MainWindow(QMainWindow):
         self._refresh_suspended = False
         self._last_chanmap_preview_key: tuple[Any, ...] | None = None
         self._chanmap_controls_dirty = False
+        self._behavior_dlc_files: list[Any] = []
+        self._behavior_frame_canvases: dict[str, BehaviorFrameCanvas] = {}
+        self._behavior_pixel_distances_by_folder: dict[str, float] = {}
+        self._behavior_pixel_to_cm_ratios_by_folder: dict[str, float] = {}
+        self._behavior_clean_mask: np.ndarray | None = None
+        self._behavior_outlier_canvases: dict[str, tuple[BehaviorTrackCanvas, np.ndarray]] = {}
+        self._reported_behavior_warnings: set[str] = set()
+        self._behavior_outlier_processed_preview = False
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(150)
@@ -782,15 +1297,46 @@ class MainWindow(QMainWindow):
 
         self.basepath.textChanged.connect(self._schedule_refresh)
         self.local_root.textChanged.connect(self._schedule_refresh)
+        self.basepath.textChanged.connect(self._reset_behavior_discovery_state)
+        self.local_root.textChanged.connect(self._reset_behavior_discovery_state)
         return panel
 
     def _build_settings_tabs(self) -> QWidget:
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._scroll_area(self._build_preprocess_tab()), "Preprocess setting")
-        self.tabs.addTab(self._scroll_area(self._build_postprocess_tab()), "Postprocess setting")
+        self.tabs.addTab(self._build_ephys_tab(), "Ephys")
+        self.tabs.addTab(self._scroll_area(self._build_behavior_tab()), "Behavior")
         self.tabs.setMinimumWidth(500)
         self.tabs.currentChanged.connect(lambda _index: self._schedule_refresh())
         return self.tabs
+
+    def _build_ephys_tab(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("settingsPage")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.ephys_tabs = QTabWidget()
+        self.ephys_tabs.addTab(self._scroll_area(self._build_preprocess_tab()), "Preprocess")
+        self.ephys_tabs.addTab(self._scroll_area(self._build_postprocess_tab()), "Postprocess")
+        self.ephys_tabs.currentChanged.connect(lambda _index: self._schedule_refresh())
+
+        run_box = QGroupBox("Ephys run")
+        run_layout = QHBoxLayout(run_box)
+        self.run_all = QPushButton("Run all")
+        self.run_all.setObjectName("primaryButton")
+        self.run_pre = QPushButton("Run preprocess")
+        self.run_post = QPushButton("Run postprocess")
+        self.run_all.clicked.connect(lambda: self._start_run("all"))
+        self.run_pre.clicked.connect(lambda: self._start_run("preprocess"))
+        self.run_post.clicked.connect(lambda: self._start_run("postprocess"))
+        run_layout.addWidget(self.run_all)
+        run_layout.addWidget(self.run_pre)
+        run_layout.addWidget(self.run_post)
+
+        layout.addWidget(self.ephys_tabs, 1)
+        layout.addWidget(run_box)
+        return panel
 
     def _scroll_area(self, widget: QWidget) -> QScrollArea:
         area = QScrollArea()
@@ -1025,6 +1571,90 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return panel
 
+    def _build_behavior_tab(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("settingsPage")
+        layout = QVBoxLayout(panel)
+        layout.setSpacing(8)
+
+        options = QGroupBox("Behavior export")
+        options_form = self._form_layout(options)
+        self.behavior_enabled = QCheckBox("enable behavior export")
+        self.behavior_enabled.setChecked(True)
+        self.behavior_enabled.setVisible(False)
+        self.behavior_overwrite = QCheckBox("overwrite behavior output")
+        self.behavior_clean_jumps = QCheckBox("clean tracker jumps")
+        self.behavior_clean_jumps.setChecked(True)
+        self.behavior_clean_jumps.setVisible(False)
+        self.behavior_dlc_batch_path = QLineEdit()
+        self.behavior_dlc_batch_path.setPlaceholderText("optional DLC batch/script path")
+        browse_batch = QPushButton("Browse")
+        browse_batch.clicked.connect(self._browse_behavior_dlc_batch)
+        options_form.addRow(self.behavior_overwrite)
+        options_form.addRow("DLC batch/script", self._field_with_button(self.behavior_dlc_batch_path, browse_batch))
+
+        dlc = QGroupBox("DLC detection")
+        dlc_form = self._form_layout(dlc)
+        self.behavior_primary_coords = self._spin(1, 128, 2)
+        self.behavior_primary_coords.setVisible(False)
+        self.behavior_primary_point = NoWheelComboBox()
+        self.behavior_primary_point.addItem("Discover DLC files first", "")
+        self.behavior_primary_point.currentIndexChanged.connect(self._on_behavior_primary_point_changed)
+        self.behavior_likelihood = self._double_spin(0.0, 1.0, 0.6)
+        self.behavior_ttl_tolerance = self._double_spin(0.0, 1.0, 0.01)
+        self.behavior_ttl_tolerance.setToolTip(
+            "Fractional tolerance for removing camera TTL intervals shorter than one video frame. "
+            "0.010 means pulses closer than 99% of the expected frame interval are treated as extra pulses."
+        )
+        self.behavior_fallback_fps = self._double_spin(0.001, 1000.0, 40.0)
+        discover = QPushButton("Discover DLC files")
+        discover.clicked.connect(self._discover_behavior_dlc)
+        self.behavior_dlc_summary = QPlainTextEdit()
+        self.behavior_dlc_summary.setReadOnly(True)
+        self.behavior_dlc_summary.setMinimumHeight(110)
+        self.behavior_dlc_summary.setVisible(False)
+        dlc_form.addRow("tracking point", self.behavior_primary_point)
+        dlc_form.addRow("likelihood threshold", self.behavior_likelihood)
+        dlc_form.addRow("TTL duplicate tolerance", self.behavior_ttl_tolerance)
+        dlc_form.addRow("fallback video FPS (Hz)", self.behavior_fallback_fps)
+        dlc_form.addRow(discover)
+
+        self.behavior_distance_cm = self._double_spin(0.001, 1_000_000.0, 100.0)
+        self.behavior_pixel_distance = self._double_spin(0.0, 1_000_000.0, 0.0)
+        self.behavior_pixel_distance.setVisible(False)
+        self.behavior_gap_sec = self._double_spin(0.0, 3600.0, 1.0)
+
+        run = QGroupBox("Run")
+        run_form = self._form_layout(run)
+        run_behavior = QPushButton("Export behavior to local")
+        run_behavior.setObjectName("primaryButton")
+        run_behavior.clicked.connect(self._run_behavior_export)
+        self.run_behavior = run_behavior
+        run_form.addRow(run_behavior)
+
+        for widget in [
+            self.behavior_enabled,
+            self.behavior_overwrite,
+            self.behavior_clean_jumps,
+            self.behavior_dlc_batch_path,
+            self.behavior_primary_point,
+            self.behavior_primary_coords,
+            self.behavior_likelihood,
+            self.behavior_ttl_tolerance,
+            self.behavior_fallback_fps,
+            self.behavior_distance_cm,
+            self.behavior_pixel_distance,
+            self.behavior_gap_sec,
+        ]:
+            self._connect_refresh(widget)
+        self.behavior_distance_cm.valueChanged.connect(self._invalidate_behavior_calibration)
+
+        layout.addWidget(options)
+        layout.addWidget(dlc)
+        layout.addWidget(run)
+        layout.addStretch(1)
+        return panel
+
     def _build_postprocess_tab(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("settingsPage")
@@ -1159,6 +1789,76 @@ class MainWindow(QMainWindow):
         chanmap_layout.addWidget(chanmap_head)
         chanmap_layout.addWidget(self.chanmap_canvas, 1)
 
+        behavior_panel = QFrame()
+        behavior_panel.setObjectName("miniPanel")
+        behavior_layout = QVBoxLayout(behavior_panel)
+        behavior_layout.setContentsMargins(0, 0, 0, 0)
+        behavior_layout.setSpacing(0)
+        behavior_head = QLabel("Behavior track preview")
+        behavior_head.setObjectName("miniHead")
+        self.behavior_mode_tabs = QTabWidget()
+
+        calibration_page = QWidget()
+        calibration_layout = QVBoxLayout(calibration_page)
+        calibration_layout.setContentsMargins(0, 0, 0, 0)
+        calibration_layout.setSpacing(0)
+        self.behavior_frame_tabs = QTabWidget()
+        self.behavior_frame_tabs.setObjectName("behaviorFrameTabs")
+        calibration_controls = QWidget()
+        calibration_controls_layout = QHBoxLayout(calibration_controls)
+        calibration_controls_layout.setContentsMargins(8, 6, 8, 6)
+        calibration_controls_layout.setSpacing(8)
+        known_distance_label = QLabel("known distance cm")
+        self.behavior_reset_calibration = QPushButton("Reset")
+        self.behavior_reset_calibration.clicked.connect(self._reset_behavior_calibration_viewer)
+        self.behavior_run_calibration = QPushButton("Run calibration")
+        self.behavior_run_calibration.setObjectName("primaryButton")
+        self.behavior_run_calibration.clicked.connect(self._run_behavior_calibration)
+        calibration_controls_layout.addStretch(1)
+        calibration_controls_layout.addWidget(known_distance_label)
+        calibration_controls_layout.addWidget(self.behavior_distance_cm)
+        calibration_controls_layout.addWidget(self.behavior_reset_calibration)
+        calibration_controls_layout.addWidget(self.behavior_run_calibration)
+        calibration_layout.addWidget(self.behavior_frame_tabs, 1)
+        calibration_layout.addWidget(calibration_controls)
+
+        outlier_page = QWidget()
+        outlier_layout = QVBoxLayout(outlier_page)
+        outlier_layout.setContentsMargins(0, 0, 0, 0)
+        outlier_layout.setSpacing(0)
+        self.behavior_outlier_tabs = QTabWidget()
+        self.behavior_track_canvas = BehaviorTrackCanvas(lambda _mask: None)
+        self.behavior_outlier_tabs.addTab(self.behavior_track_canvas, "Track")
+        outlier_controls = QWidget()
+        outlier_controls_layout = QHBoxLayout(outlier_controls)
+        outlier_controls_layout.setContentsMargins(8, 6, 8, 6)
+        outlier_controls_layout.setSpacing(8)
+        interpolate_label = QLabel("interpolate gaps <= sec")
+        self.behavior_reset_outlier = QPushButton("Reset")
+        self.behavior_reset_outlier.clicked.connect(self._reset_behavior_keep_ranges)
+        self.run_behavior_cleanup = QPushButton("Apply outlier cleanup + interpolate")
+        self.run_behavior_cleanup.clicked.connect(self._run_behavior_outlier_cleanup)
+        outlier_controls_layout.addStretch(1)
+        outlier_controls_layout.addWidget(interpolate_label)
+        outlier_controls_layout.addWidget(self.behavior_gap_sec)
+        outlier_controls_layout.addWidget(self.behavior_reset_outlier)
+        outlier_controls_layout.addWidget(self.run_behavior_cleanup)
+        outlier_layout.addWidget(self.behavior_outlier_tabs, 1)
+        outlier_layout.addWidget(outlier_controls)
+
+        self.behavior_mode_tabs.addTab(calibration_page, "Calibration")
+        self.behavior_mode_tabs.addTab(outlier_page, "Outlier cleanup & interpolation")
+        self.behavior_mode_tabs.currentChanged.connect(self._on_behavior_mode_tab_changed)
+        self.behavior_preview_status = QLabel("Discover DLC files to load epoch frames")
+        self.behavior_preview_status.setWordWrap(True)
+        self.behavior_preview_status.setVisible(False)
+        behavior_layout.addWidget(behavior_head)
+        behavior_layout.addWidget(self.behavior_mode_tabs, 1)
+
+        self.monitor_stack = QStackedWidget()
+        self.monitor_stack.addWidget(chanmap_panel)
+        self.monitor_stack.addWidget(behavior_panel)
+
         log_panel = QFrame()
         log_panel.setObjectName("miniPanel")
         log_layout = QVBoxLayout(log_panel)
@@ -1172,7 +1872,7 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(log_head)
         log_layout.addWidget(self.log, 1)
 
-        monitor_layout.addWidget(chanmap_panel, 3)
+        monitor_layout.addWidget(self.monitor_stack, 3)
         monitor_layout.addWidget(log_panel, 2)
 
         preview_panel = QFrame()
@@ -1196,10 +1896,6 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QHBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.run_all = QPushButton("Run all process")
-        self.run_all.setObjectName("primaryButton")
-        self.run_pre = QPushButton("Run preprocess only")
-        self.run_post = QPushButton("Run postprocess only")
         self.move_dat_to_basepath = QCheckBox("Move basename.dat")
         self.move_overwrite = QCheckBox("Overwrite moved files")
         self.move_clean_local = QCheckBox("Clean local after move")
@@ -1208,15 +1904,9 @@ class MainWindow(QMainWindow):
         self.force_stop = QPushButton("Force stop")
         self.force_stop.setObjectName("dangerButton")
         self.clear_log = QPushButton("Clear log")
-        self.run_all.clicked.connect(lambda: self._start_run("all"))
-        self.run_pre.clicked.connect(lambda: self._start_run("preprocess"))
-        self.run_post.clicked.connect(lambda: self._start_run("postprocess"))
         self.move_outputs.clicked.connect(self._move_outputs_to_basepath)
         self.force_stop.clicked.connect(self._force_stop_process)
         self.clear_log.clicked.connect(self.log.clear)
-        layout.addWidget(self.run_all)
-        layout.addWidget(self.run_pre)
-        layout.addWidget(self.run_post)
         layout.addStretch(1)
         layout.addWidget(self.move_dat_to_basepath)
         layout.addWidget(self.move_overwrite)
@@ -1573,6 +2263,530 @@ class MainWindow(QMainWindow):
         if path:
             self.sorting_search_root.setText(path)
 
+    def _browse_behavior_dlc_batch(self) -> None:
+        path = self._select_open_file(
+            "Select DLC batch/script",
+            self.behavior_dlc_batch_path.text() or self.basepath.text() or str(Path.cwd()),
+            "Scripts (*.bat *.cmd *.sh *.py);;All files (*)",
+        )
+        if path:
+            self.behavior_dlc_batch_path.setText(path)
+
+    def _behavior_paths(self) -> tuple[PipelineGuiSettings, Path, str, Path]:
+        settings = self._collect_settings()
+        basepath = settings.basepath_path
+        if basepath is None:
+            raise ValueError("basepath is required.")
+        basename = settings.basename
+        if not basename:
+            raise ValueError("basename cannot be resolved.")
+        local_output = settings.local_output_dir
+        if local_output is None:
+            raise ValueError("local output directory cannot be resolved.")
+        return settings, basepath, basename, local_output
+
+    def _discover_behavior_dlc(self) -> None:
+        try:
+            settings, basepath, basename, local_output = self._behavior_paths()
+            files = discover_dlc_files(basepath, output_dir=local_output, basename=basename)
+            if not files:
+                text = "No DLC files found."
+            else:
+                lines = [f"Found {len(files)} DLC file(s):"]
+                for item in files:
+                    video = item.video_path.name if item.video_path is not None else "no video"
+                    lines.append(f"- {item.folder_name}: {item.path.name} ({video})")
+                text = "\n".join(lines)
+            self.behavior_dlc_summary.setPlainText(text)
+            self._populate_behavior_primary_points(files)
+            self._populate_behavior_frame_tabs(files)
+            self._append_log(text + "\n")
+            if files:
+                try:
+                    sync_warnings = inspect_dlc_ttl_sync(
+                        basepath,
+                        output_dir=local_output,
+                        basename=basename,
+                        dlc_files=files,
+                        pulses_delta_range=settings.behavior.pulses_delta_range,
+                        fallback_video_fps=settings.behavior.fallback_video_fps,
+                    )
+                    self._append_behavior_warnings("Behavior sync warnings", sync_warnings)
+                except Exception as sync_exc:
+                    self._append_behavior_warnings("Behavior sync warnings", [f"Sync check skipped: {sync_exc}"])
+        except Exception as exc:
+            QMessageBox.critical(self, "DLC discovery failed", str(exc))
+
+    def _reset_behavior_discovery_state(self, *_args: Any) -> None:
+        if self._refresh_suspended or not hasattr(self, "behavior_frame_tabs"):
+            return
+        self._behavior_dlc_files = []
+        self._behavior_frame_canvases = {}
+        self._behavior_pixel_distances_by_folder = {}
+        self._behavior_pixel_to_cm_ratios_by_folder = {}
+        self._behavior_clean_mask = None
+        self._reported_behavior_warnings = set()
+        while self.behavior_frame_tabs.count():
+            widget = self.behavior_frame_tabs.widget(0)
+            self.behavior_frame_tabs.removeTab(0)
+            widget.deleteLater()
+        self._clear_behavior_outlier_tabs()
+        self.behavior_mode_tabs.setCurrentIndex(0)
+        self.behavior_preview_status.setText("Discover DLC files to load epoch frames")
+        self.behavior_pixel_distance.setValue(0.0)
+        self.behavior_primary_point.blockSignals(True)
+        try:
+            self.behavior_primary_point.clear()
+            self.behavior_primary_point.addItem("Discover DLC files first", "")
+        finally:
+            self.behavior_primary_point.blockSignals(False)
+
+    def _load_behavior_calibration_frame(self) -> None:
+        self._discover_behavior_dlc()
+
+    @staticmethod
+    def _short_dlc_point_label(name: str) -> str:
+        return str(name).strip()
+
+    def _clear_behavior_outlier_tabs(
+        self,
+        message: str = "Load outlier cleanup preview",
+        *,
+        add_placeholder: bool = True,
+        preserve_clean_mask: bool = False,
+    ) -> None:
+        if not hasattr(self, "behavior_outlier_tabs"):
+            return
+        while self.behavior_outlier_tabs.count():
+            widget = self.behavior_outlier_tabs.widget(0)
+            self.behavior_outlier_tabs.removeTab(0)
+            widget.deleteLater()
+        self._behavior_outlier_canvases = {}
+        self.behavior_track_canvas = BehaviorTrackCanvas(lambda _mask: None)
+        if add_placeholder:
+            self.behavior_track_canvas.show_message(message)
+            self.behavior_outlier_tabs.addTab(self.behavior_track_canvas, "Track")
+        if not preserve_clean_mask:
+            self._behavior_clean_mask = None
+        self._behavior_outlier_processed_preview = False
+
+    def _populate_behavior_track_tabs_from_result(self, result: Any, *, processed: bool) -> None:
+        behavior = result.behavior
+        timestamps = np.asarray(behavior["timestamps"], dtype=np.float64).reshape(-1)
+        x = np.asarray(behavior["position"]["x"], dtype=np.float64).reshape(-1)
+        y = np.asarray(behavior["position"]["y"], dtype=np.float64).reshape(-1)
+        sub_mask = result.sub_session_mask
+        self._clear_behavior_outlier_tabs(
+            message="No behavior track loaded",
+            add_placeholder=False,
+            preserve_clean_mask=processed,
+        )
+        if sub_mask is None or np.asarray(sub_mask).size != timestamps.size:
+            indices = np.arange(timestamps.size, dtype=np.int64)
+            canvas = BehaviorTrackCanvas(
+                (lambda _mask: None)
+                if processed
+                else (lambda _mask: self._update_behavior_clean_mask_from_outlier_tabs())
+            )
+            if processed:
+                canvas.set_processed_track(timestamps, x, y)
+            else:
+                canvas.set_track(timestamps, x, y)
+                self._behavior_outlier_canvases = {"Track": (canvas, indices)}
+            self.behavior_outlier_tabs.addTab(canvas, "Track")
+        else:
+            sub_mask = np.asarray(sub_mask, dtype=np.int32).reshape(-1)
+            for idx, item in enumerate(result.dlc_files, start=1):
+                indices = np.flatnonzero(sub_mask == idx).astype(np.int64)
+                if indices.size == 0:
+                    continue
+                canvas = BehaviorTrackCanvas(
+                    (lambda _mask: None)
+                    if processed
+                    else (lambda _mask: self._update_behavior_clean_mask_from_outlier_tabs())
+                )
+                if processed:
+                    canvas.set_processed_track(timestamps[indices], x[indices], y[indices])
+                else:
+                    canvas.set_track(timestamps[indices], x[indices], y[indices])
+                    self._behavior_outlier_canvases[item.folder_name] = (canvas, indices)
+                self.behavior_outlier_tabs.addTab(canvas, item.folder_name)
+        if not processed:
+            self._update_behavior_clean_mask_from_outlier_tabs()
+        self._behavior_outlier_processed_preview = processed
+
+    def _populate_behavior_primary_points(self, files: list[Any]) -> None:
+        previous = str(self.behavior_primary_point.currentData() or "")
+        point_sets: list[list[str]] = []
+        errors: list[str] = []
+        for item in files:
+            try:
+                point_sets.append(dlc_point_names(load_dlc_tracking(item.path)))
+            except Exception as exc:
+                errors.append(f"{item.folder_name}: {exc}")
+        all_points: list[str] = []
+        if point_sets:
+            common = set(point_sets[0])
+            for names in point_sets[1:]:
+                common &= set(names)
+            source_names = [name for name in point_sets[0] if name in common] if common else []
+            if not source_names:
+                seen: set[str] = set()
+                source_names = []
+                for names in point_sets:
+                    for name in names:
+                        if name not in seen:
+                            seen.add(name)
+                            source_names.append(name)
+            all_points = source_names
+
+        self.behavior_primary_point.blockSignals(True)
+        try:
+            self.behavior_primary_point.clear()
+            self.behavior_primary_point.addItem("Select tracking point", "")
+            if all_points:
+                label_counts: dict[str, int] = {}
+                for name in all_points:
+                    label = self._short_dlc_point_label(name)
+                    label_counts[label] = label_counts.get(label, 0) + 1
+                    display = label if label_counts[label] == 1 else f"{label} ({label_counts[label]})"
+                    self.behavior_primary_point.addItem(display, name)
+                idx = self.behavior_primary_point.findData(previous)
+                if idx < 0:
+                    idx = 0
+            else:
+                idx = 0
+            self.behavior_primary_point.setCurrentIndex(max(0, idx))
+        finally:
+            self.behavior_primary_point.blockSignals(False)
+        if errors:
+            self._append_warning_log("DLC point discovery warnings:\n" + "\n".join(f"- {item}" for item in errors) + "\n")
+
+    def _populate_behavior_frame_tabs(self, files: list[Any]) -> None:
+        while self.behavior_frame_tabs.count():
+            widget = self.behavior_frame_tabs.widget(0)
+            self.behavior_frame_tabs.removeTab(0)
+            widget.deleteLater()
+        self._behavior_dlc_files = list(files)
+        self._behavior_frame_canvases = {}
+        self._behavior_pixel_distances_by_folder = {}
+        self._behavior_pixel_to_cm_ratios_by_folder = {}
+        self._behavior_clean_mask = None
+        self._clear_behavior_outlier_tabs()
+        self.behavior_mode_tabs.setCurrentIndex(0)
+        if not files:
+            self.behavior_preview_status.setText("No DLC files found")
+            return
+
+        frame_errors: list[str] = []
+        for item in files:
+            canvas = BehaviorFrameCanvas(item.folder_name, self._on_behavior_calibration_line_changed)
+            self._behavior_frame_canvases[item.folder_name] = canvas
+            if item.video_path is None:
+                canvas.show_message("No video found beside DLC file")
+            else:
+                try:
+                    frame = load_representative_frame(item.video_path)
+                    canvas.show_frame(frame, title=f"{item.folder_name}: {item.video_path.name}")
+                except Exception as exc:
+                    frame_errors.append(f"{item.folder_name}: {exc}")
+                    canvas.show_message(f"Could not load first frame:\n{exc}")
+            self.behavior_frame_tabs.addTab(canvas, item.folder_name)
+        self._on_behavior_calibration_line_changed()
+        if frame_errors:
+            self._append_warning_log("Behavior frame preview warnings:\n" + "\n".join(f"- {item}" for item in frame_errors) + "\n")
+
+    def _ensure_behavior_dlc_files_loaded(self) -> list[Any]:
+        if self._behavior_dlc_files:
+            return self._behavior_dlc_files
+        settings, basepath, basename, local_output = self._behavior_paths()
+        files = discover_dlc_files(basepath, output_dir=local_output, basename=basename)
+        self._populate_behavior_frame_tabs(files)
+        return files
+
+    def _on_behavior_calibration_line_changed(self) -> None:
+        distances: dict[str, float] = {}
+        for folder, canvas in getattr(self, "_behavior_frame_canvases", {}).items():
+            if canvas.pixel_distance is not None and canvas.pixel_distance > 0:
+                distances[folder] = float(canvas.pixel_distance)
+        self._behavior_pixel_distances_by_folder = distances
+        self._behavior_pixel_to_cm_ratios_by_folder = {
+            folder: ratio
+            for folder, ratio in self._behavior_pixel_to_cm_ratios_by_folder.items()
+            if folder in distances
+        }
+        if len(distances) == 1:
+            self.behavior_pixel_distance.setValue(next(iter(distances.values())))
+        elif not distances:
+            self.behavior_pixel_distance.setValue(0.0)
+        total = len(getattr(self, "_behavior_dlc_files", []))
+        self.behavior_preview_status.setText(
+            f"Calibration lines: {len(distances)}/{total}. "
+            "Click two endpoints in each epoch tab, then run calibration."
+        )
+        self._schedule_refresh()
+
+    def _invalidate_behavior_calibration(self) -> None:
+        if self._refresh_suspended:
+            return
+        if self._behavior_pixel_to_cm_ratios_by_folder:
+            self._behavior_pixel_to_cm_ratios_by_folder = {}
+            self.behavior_preview_status.setText("Known distance changed. Run calibration again.")
+        self._schedule_refresh()
+
+    def _reset_behavior_calibration_viewer(self) -> None:
+        widget = self.behavior_frame_tabs.currentWidget()
+        if isinstance(widget, BehaviorFrameCanvas):
+            self._behavior_pixel_distances_by_folder.pop(widget.epoch_name, None)
+            self._behavior_pixel_to_cm_ratios_by_folder.pop(widget.epoch_name, None)
+            widget.reset_line()
+        self._on_behavior_calibration_line_changed()
+
+    def _run_behavior_calibration(self) -> None:
+        try:
+            files = self._ensure_behavior_dlc_files_loaded()
+            if not files:
+                raise FileNotFoundError("No DLC files found.")
+            current = self.behavior_frame_tabs.currentWidget()
+            if not isinstance(current, BehaviorFrameCanvas):
+                raise ValueError("Select a calibration epoch tab first.")
+            folder = current.epoch_name
+            if current.pixel_distance is None or current.pixel_distance <= 0:
+                raise ValueError("Click two calibration endpoints in the current epoch tab first.")
+            known_cm = float(self.behavior_distance_cm.value())
+            if known_cm <= 0:
+                raise ValueError("known distance cm must be positive.")
+            self._behavior_pixel_distances_by_folder[folder] = float(current.pixel_distance)
+            self._behavior_pixel_to_cm_ratios_by_folder[folder] = float(current.pixel_distance) / known_cm
+            ratios = self._behavior_pixel_to_cm_ratios_by_folder
+            self.behavior_pixel_distance.setValue(float(current.pixel_distance))
+            missing = [item.folder_name for item in files if item.folder_name not in ratios]
+            lines = [f"Behavior calibration updated: {folder}: {ratios[folder]:.6g} pixel/cm"]
+            if missing:
+                lines.append("Remaining epochs: " + ", ".join(missing))
+            else:
+                lines.append("All epochs calibrated.")
+            text = "\n".join(lines)
+            self.behavior_preview_status.setText(text)
+            self._append_log(text + "\n")
+            self._refresh_preview()
+        except Exception as exc:
+            QMessageBox.critical(self, "Behavior calibration failed", str(exc))
+
+    def _require_behavior_calibration(self) -> dict[str, float]:
+        files = self._ensure_behavior_dlc_files_loaded()
+        if not files:
+            raise FileNotFoundError("No DLC files found.")
+        if not self._behavior_pixel_to_cm_ratios_by_folder:
+            raise ValueError("Click two calibration endpoints and press Run calibration before this step.")
+        missing = [
+            item.folder_name
+            for item in files
+            if item.folder_name not in self._behavior_pixel_to_cm_ratios_by_folder
+        ]
+        if missing:
+            raise ValueError("Calibration is missing for DLC epoch(s): " + ", ".join(missing))
+        return dict(self._behavior_pixel_to_cm_ratios_by_folder)
+
+    def _require_behavior_primary_point(self) -> str:
+        point = str(self.behavior_primary_point.currentData() or "").strip()
+        if not point:
+            raise ValueError("Select a DLC tracking point before running behavior processing.")
+        return point
+
+    def _set_behavior_clean_mask(self, mask: np.ndarray | None) -> None:
+        self._behavior_clean_mask = None if mask is None else np.asarray(mask, dtype=bool).reshape(-1)
+
+    def _reset_behavior_keep_ranges(self) -> None:
+        if getattr(self, "_behavior_outlier_processed_preview", False):
+            self._behavior_clean_mask = None
+            self._load_behavior_outlier_preview(show_errors=False)
+            self._append_log("Reset outlier cleanup preview to raw track.\n")
+            return
+        widget = self.behavior_outlier_tabs.currentWidget()
+        if isinstance(widget, BehaviorTrackCanvas):
+            widget.reset_keep_ranges()
+
+    def _update_behavior_clean_mask_from_outlier_tabs(self) -> None:
+        if not self._behavior_outlier_canvases:
+            self._behavior_clean_mask = None
+            return
+        nonempty = [
+            indices
+            for _canvas, indices in self._behavior_outlier_canvases.values()
+            if indices.size
+        ]
+        if not nonempty:
+            self._behavior_clean_mask = None
+            return
+        max_index = max(
+            int(indices.max())
+            for indices in nonempty
+        )
+        mask = np.ones(max_index + 1, dtype=bool)
+        any_rejected = False
+        for canvas, indices in self._behavior_outlier_canvases.values():
+            if indices.size != canvas.good_mask.size:
+                continue
+            mask[indices] = canvas.good_mask
+            any_rejected = any_rejected or bool(np.any(~canvas.good_mask))
+        self._behavior_clean_mask = mask if any_rejected else None
+
+    def _on_behavior_mode_tab_changed(self, index: int) -> None:
+        if index == 1:
+            self._load_behavior_outlier_preview(show_errors=False)
+
+    def _on_behavior_primary_point_changed(self, *_args: Any) -> None:
+        if self._refresh_suspended or not hasattr(self, "behavior_mode_tabs"):
+            return
+        self._behavior_clean_mask = None
+        if self.behavior_mode_tabs.currentIndex() != 1:
+            return
+        if not str(self.behavior_primary_point.currentData() or "").strip():
+            self._clear_behavior_outlier_tabs("Select a tracking point to load the behavior track.")
+            return
+        if not self._behavior_dlc_files:
+            return
+        calibrated = {
+            item.folder_name
+            for item in self._behavior_dlc_files
+            if item.folder_name in self._behavior_pixel_to_cm_ratios_by_folder
+        }
+        if len(calibrated) != len(self._behavior_dlc_files):
+            return
+        self._load_behavior_outlier_preview(show_errors=False)
+
+    def _load_behavior_outlier_preview(self, *, show_errors: bool) -> bool:
+        try:
+            settings, basepath, basename, local_output = self._behavior_paths()
+            b = settings.behavior
+            ratios = self._require_behavior_calibration()
+            primary_point = self._require_behavior_primary_point()
+            preview = process_dlc_behavior(
+                basepath=basepath,
+                output_dir=local_output,
+                basename=basename,
+                primary_coords=b.primary_coords,
+                primary_point=primary_point,
+                likelihood=b.likelihood,
+                pulses_delta_range=b.pulses_delta_range,
+                calibration_distance_cm=b.calibration_distance_cm,
+                pixel_to_cm_ratios_by_folder=ratios,
+                interpolate_gap_sec=0.0,
+                fallback_video_fps=b.fallback_video_fps,
+                overwrite=True,
+                save_mat=False,
+            )
+            self._populate_behavior_track_tabs_from_result(preview, processed=False)
+            self.behavior_mode_tabs.setCurrentIndex(1)
+            self._append_log(f"Loaded behavior 2D track map: {primary_point}\n")
+            return True
+        except Exception as exc:
+            if show_errors:
+                QMessageBox.critical(self, "Behavior outlier cleanup failed", str(exc))
+            else:
+                self._clear_behavior_outlier_tabs(str(exc))
+            return False
+
+    def _run_behavior_outlier_cleanup(self) -> None:
+        try:
+            if self._behavior_outlier_canvases:
+                self._update_behavior_clean_mask_from_outlier_tabs()
+            clean_mask = None if self._behavior_clean_mask is None else self._behavior_clean_mask.copy()
+            settings, basepath, basename, local_output = self._behavior_paths()
+            b = settings.behavior
+            ratios = self._require_behavior_calibration()
+            primary_point = self._require_behavior_primary_point()
+            result = process_dlc_behavior(
+                basepath=basepath,
+                output_dir=local_output,
+                basename=basename,
+                primary_coords=b.primary_coords,
+                primary_point=primary_point,
+                likelihood=b.likelihood,
+                pulses_delta_range=b.pulses_delta_range,
+                calibration_distance_cm=b.calibration_distance_cm,
+                pixel_to_cm_ratios_by_folder=ratios,
+                interpolate_gap_sec=b.interpolate_gap_sec,
+                clean_mask=clean_mask,
+                fallback_video_fps=b.fallback_video_fps,
+                overwrite=True,
+                save_mat=False,
+            )
+            self._behavior_clean_mask = clean_mask
+            self._populate_behavior_track_tabs_from_result(result, processed=True)
+            self.behavior_mode_tabs.setCurrentIndex(1)
+            rejected_frames = int(np.sum(~clean_mask)) if clean_mask is not None else 0
+            total_frames = int(clean_mask.size) if clean_mask is not None else 0
+            mask_text = (
+                f"applied, rejected frames={rejected_frames}/{total_frames}"
+                if clean_mask is not None
+                else "not applied"
+            )
+            note_items = result.behavior.get("notes", [])
+            if isinstance(note_items, np.ndarray):
+                note_lines = [str(item) for item in note_items.reshape(-1).tolist()]
+            elif isinstance(note_items, (list, tuple)):
+                note_lines = [str(item) for item in note_items]
+            else:
+                note_lines = [str(note_items)] if note_items else []
+            interpolation_note = next(
+                (item for item in reversed(note_lines) if item.startswith("interpolated_short_gaps:")),
+                "",
+            )
+            self._append_log(
+                f"Applied outlier cleanup & interpolation: {primary_point}, mask={mask_text}, "
+                f"interpolate gaps <= {b.interpolate_gap_sec:g} sec"
+                + (f", {interpolation_note}\n" if interpolation_note else "\n")
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Behavior outlier cleanup failed", str(exc))
+
+    def _run_behavior_export(self) -> None:
+        try:
+            settings, basepath, basename, local_output = self._behavior_paths()
+            b = settings.behavior
+            output_path = local_output / f"{basename}.animal.behavior.mat"
+            if output_path.exists() and not b.overwrite:
+                raise FileExistsError(f"Behavior output already exists. Enable overwrite to replace it:\n{output_path}")
+            ratios = self._require_behavior_calibration()
+            primary_point = self._require_behavior_primary_point()
+
+            batch_path = Path(b.dlc_batch_path).expanduser() if b.dlc_batch_path.strip() else None
+            if batch_path is not None and batch_path.exists():
+                self._append_log(f"Running DLC batch/script: {batch_path}\n")
+                subprocess.run([str(batch_path)], cwd=str(basepath), check=True)
+
+            result = process_dlc_behavior(
+                basepath=basepath,
+                output_dir=local_output,
+                basename=basename,
+                primary_coords=b.primary_coords,
+                primary_point=primary_point,
+                likelihood=b.likelihood,
+                pulses_delta_range=b.pulses_delta_range,
+                calibration_distance_cm=b.calibration_distance_cm,
+                pixel_to_cm_ratios_by_folder=ratios,
+                interpolate_gap_sec=b.interpolate_gap_sec,
+                clean_mask=self._behavior_clean_mask,
+                fallback_video_fps=b.fallback_video_fps,
+                overwrite=True,
+                save_mat=True,
+            )
+            lines = [
+                "Behavior export finished",
+                f"Output: {result.output_path}",
+                f"DLC files: {len(result.dlc_files)}",
+                f"pixel_to_cm_ratio: {result.pixel_to_cm_ratio}",
+                f"outlier mask: {'applied' if self._behavior_clean_mask is not None else 'not applied'}",
+            ]
+            text = "\n".join(lines)
+            self.behavior_dlc_summary.setPlainText(text)
+            self._append_log(text + "\n")
+            self._refresh_preview()
+        except Exception as exc:
+            QMessageBox.critical(self, "Behavior export failed", str(exc))
+
     def _load_config(self) -> None:
         path = self._select_open_file("Load GUI config", str(Path.cwd()), "JSON files (*.json);;All files (*)")
         if not path:
@@ -1722,6 +2936,20 @@ class MainWindow(QMainWindow):
             sorter_worker_count=normalize_worker_count(self.sorter_worker_count.value()),
             overwrite=self.pre_overwrite.isChecked(),
         )
+        behavior = BehaviorGuiSettings(
+            enabled=self.behavior_enabled.isChecked(),
+            primary_coords=self.behavior_primary_coords.value(),
+            primary_point=str(self.behavior_primary_point.currentData() or ""),
+            likelihood=self.behavior_likelihood.value(),
+            pulses_delta_range=self.behavior_ttl_tolerance.value(),
+            calibration_distance_cm=self.behavior_distance_cm.value(),
+            calibration_pixel_distance=self.behavior_pixel_distance.value(),
+            interpolate_gap_sec=self.behavior_gap_sec.value(),
+            fallback_video_fps=self.behavior_fallback_fps.value(),
+            clean_tracker_jumps=self.behavior_clean_jumps.isChecked(),
+            dlc_batch_path=self.behavior_dlc_batch_path.text().strip(),
+            overwrite=self.behavior_overwrite.isChecked(),
+        )
         postprocess = PostprocessGuiSettings(
             sorting_phy_folder=self.sorting_phy_folder.text().strip(),
             sorting_search_root=self.sorting_search_root.text().strip(),
@@ -1748,6 +2976,7 @@ class MainWindow(QMainWindow):
             local_root=self.local_root.text().strip(),
             chanmap_path=self.chanmap_path.text().strip(),
             preprocess=preprocess,
+            behavior=behavior,
             postprocess=postprocess,
         )
 
@@ -1811,6 +3040,26 @@ class MainWindow(QMainWindow):
             self.sorter_worker_count.setValue(normalize_worker_count(p.sorter_worker_count))
             self.pre_overwrite.setChecked(p.overwrite)
             self._update_sorter_enabled()
+            b = settings.behavior
+            self.behavior_enabled.setChecked(b.enabled)
+            self.behavior_overwrite.setChecked(b.overwrite)
+            self.behavior_clean_jumps.setChecked(b.clean_tracker_jumps)
+            self.behavior_dlc_batch_path.setText(b.dlc_batch_path)
+            if b.primary_point:
+                idx = self.behavior_primary_point.findData(b.primary_point)
+                if idx < 0:
+                    self.behavior_primary_point.addItem(b.primary_point, b.primary_point)
+                    idx = self.behavior_primary_point.findData(b.primary_point)
+                self.behavior_primary_point.setCurrentIndex(idx)
+            else:
+                self.behavior_primary_point.setCurrentIndex(0)
+            self.behavior_primary_coords.setValue(b.primary_coords)
+            self.behavior_likelihood.setValue(b.likelihood)
+            self.behavior_ttl_tolerance.setValue(b.pulses_delta_range)
+            self.behavior_fallback_fps.setValue(b.fallback_video_fps)
+            self.behavior_distance_cm.setValue(b.calibration_distance_cm)
+            self.behavior_pixel_distance.setValue(b.calibration_pixel_distance)
+            self.behavior_gap_sec.setValue(b.interpolate_gap_sec)
             pp = settings.postprocess
             self.sorting_phy_folder.setText(pp.sorting_phy_folder)
             self.sorting_search_root.setText(pp.sorting_search_root)
@@ -1850,21 +3099,46 @@ class MainWindow(QMainWindow):
     def _refresh_preview(self) -> None:
         try:
             settings = self._collect_settings()
-            mode: RunMode = "postprocess" if self.tabs.currentIndex() == 1 else "all"
+            current_tab = self.tabs.currentIndex()
+            if hasattr(self, "monitor_stack"):
+                self.monitor_stack.setCurrentIndex(1 if current_tab == 1 else 0)
+            ephys_tab = self.ephys_tabs.currentIndex() if hasattr(self, "ephys_tabs") else 0
+            mode: RunMode = "postprocess" if current_tab == 0 and ephys_tab == 1 else "preprocess"
             try:
-                checks = run_preflight(settings, mode)
+                checks = [] if current_tab == 1 else run_preflight(settings, mode)
             except Exception as exc:
                 checks = [CheckResult("Preflight", "warn", str(exc))]
+            behavior_output = (
+                settings.local_output_dir / (settings.basename + ".animal.behavior.mat")
+                if settings.local_output_dir and settings.basename
+                else None
+            )
+            behavior_ready = (
+                bool(self._behavior_pixel_to_cm_ratios_by_folder)
+                and len(self._behavior_pixel_to_cm_ratios_by_folder) == len(self._behavior_dlc_files)
+            )
             lines = [
                 f"Basepath: {settings.basepath or '-'}",
                 f"Basename: {settings.basename or '-'}",
                 f"Local output: {settings.local_output_dir or '-'}",
                 f"chanMap: {settings.resolved_chanmap_path() or '-'}",
-                f"Preview mode: {mode}",
-                "",
-                "Preflight:",
+                f"Behavior output: {behavior_output or '-'}",
+                f"Active workflow: {'Behavior' if current_tab == 1 else 'Ephys ' + mode}",
             ]
-            lines.extend(self._format_checks(checks))
+            if current_tab == 1:
+                lines.extend(
+                    [
+                        "",
+                        "Behavior:",
+                        f"[{'OK' if settings.basepath_path else 'ERROR'}] Basepath: {'set' if settings.basepath_path else 'not set'}",
+                        f"[{'OK' if settings.local_output_dir else 'ERROR'}] Local output: {settings.local_output_dir or 'not set'}",
+                        f"[{'OK' if behavior_ready else 'ERROR'}] Calibration: {'ready' if behavior_ready else 'click endpoints for all epochs and run calibration'}",
+                        f"[OK] Export target: local output only",
+                    ]
+                )
+            else:
+                lines.extend(["", "Ephys preflight:"])
+                lines.extend(self._format_checks(checks))
             self.run_preview.setPlainText("\n".join(lines))
             chanmap = settings.resolved_chanmap_path()
             explicit_chanmap = Path(settings.chanmap_path).expanduser() if settings.chanmap_path.strip() else None
@@ -2172,14 +3446,38 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _set_running(self, running: bool) -> None:
-        for button in [self.run_all, self.run_pre, self.run_post, self.run_noise_label, self.move_outputs]:
+        for button in [
+            self.run_all,
+            self.run_pre,
+            self.run_post,
+            self.run_noise_label,
+            self.run_behavior_cleanup,
+            self.run_behavior,
+            self.move_outputs,
+        ]:
             button.setEnabled(not running)
         self.force_stop.setEnabled(running)
 
-    def _append_log(self, text: str) -> None:
+    def _append_log(self, text: str, *, warning: bool = False) -> None:
         self.log.moveCursor(QTextCursor.MoveOperation.End)
-        self.log.insertPlainText(text)
+        cursor = self.log.textCursor()
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("#ff8a80" if warning else "#d4d4d4"))
+        cursor.insertText(text, fmt)
         self.log.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _append_warning_log(self, text: str) -> None:
+        self._append_log(text, warning=True)
+
+    def _append_behavior_warnings(self, header: str, warnings_list: list[str]) -> None:
+        new_warnings: list[str] = []
+        for item in warnings_list:
+            if item in self._reported_behavior_warnings:
+                continue
+            self._reported_behavior_warnings.add(item)
+            new_warnings.append(item)
+        if new_warnings:
+            self._append_warning_log(header + ":\n" + "\n".join(f"- {item}" for item in new_warnings) + "\n")
 
     def _queue_log(self, text: str) -> None:
         if not text:

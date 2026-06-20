@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 import json
 from pathlib import Path
 from typing import Any, Literal
@@ -203,11 +203,28 @@ class PostprocessGuiSettings:
 
 
 @dataclass
+class BehaviorGuiSettings:
+    enabled: bool = False
+    primary_coords: int = 2
+    primary_point: str = ""
+    likelihood: float = 0.6
+    pulses_delta_range: float = 0.01
+    calibration_distance_cm: float = 100.0
+    calibration_pixel_distance: float = 0.0
+    interpolate_gap_sec: float = 1.0
+    fallback_video_fps: float = 40.0
+    clean_tracker_jumps: bool = True
+    dlc_batch_path: str = ""
+    overwrite: bool = False
+
+
+@dataclass
 class PipelineGuiSettings:
     basepath: str = ""
     local_root: str = ""
     chanmap_path: str = ""
     preprocess: PreprocessGuiSettings = field(default_factory=PreprocessGuiSettings)
+    behavior: BehaviorGuiSettings = field(default_factory=BehaviorGuiSettings)
     postprocess: PostprocessGuiSettings = field(default_factory=PostprocessGuiSettings)
 
     @property
@@ -393,9 +410,14 @@ class PipelineGuiSettings:
         preprocess = PreprocessGuiSettings(**preprocess_data)
         preprocess.preprocess_worker_count = normalize_worker_count(preprocess.preprocess_worker_count)
         preprocess.sorter_worker_count = normalize_worker_count(preprocess.sorter_worker_count)
+        behavior_data = data.pop("behavior", {})
+        behavior_fields = {item.name for item in fields(BehaviorGuiSettings)}
+        behavior = BehaviorGuiSettings(
+            **{key: value for key, value in behavior_data.items() if key in behavior_fields}
+        )
         postprocess = PostprocessGuiSettings(**data.pop("postprocess", {}))
         postprocess.worker_count = normalize_worker_count(postprocess.worker_count)
-        return cls(**data, preprocess=preprocess, postprocess=postprocess)
+        return cls(**data, preprocess=preprocess, behavior=behavior, postprocess=postprocess)
 
     def save(self, path: Path) -> None:
         path.write_text(self.to_json(), encoding="utf-8")
