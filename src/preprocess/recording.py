@@ -311,6 +311,7 @@ def _validate_existing_binary_size(
     dtype: str | np.dtype,
     num_channels: int,
     expected_frames: int | None = None,
+    frame_tolerance: int = 0,
     label: str,
 ) -> None:
     dtype_np = np.dtype(dtype)
@@ -325,9 +326,12 @@ def _validate_existing_binary_size(
         )
     if expected_frames is not None:
         actual_frames = size // frame_bytes
-        if int(actual_frames) != int(expected_frames):
+        tolerance = max(0, int(frame_tolerance))
+        if abs(int(actual_frames) - int(expected_frames)) > tolerance:
+            tolerance_suffix = f" with tolerance {tolerance}" if tolerance else ""
             raise ValueError(
-                f"Existing {label} has stale sample count: {actual_frames} != {expected_frames} "
+                f"Existing {label} has stale sample count: {actual_frames} != {expected_frames}"
+                f"{tolerance_suffix} "
                 f"({path}). Re-run with overwrite=True or remove the stale file."
             )
 
@@ -818,6 +822,7 @@ def write_lfp(
             dtype=dtype,
             num_channels=n_channels,
             expected_frames=expected_lfp_frames,
+            frame_tolerance=1,
             label="lfp",
         )
         return lfp_path
