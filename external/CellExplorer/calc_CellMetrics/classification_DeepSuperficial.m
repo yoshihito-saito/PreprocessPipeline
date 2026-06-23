@@ -1,0 +1,485 @@
+function deepSuperficialfromRipple = classification_DeepSuperficial(session,varargin)
+% SWR ripples classification of Deep-superficial channels
+% Defines the deep superficial boundary defined by the reversal of the average sharp wave.
+%
+% The algorith assigned both distance to the reversal point and labels.
+% The assigned label are (ordered by depth):
+%   'Cortical'    : Assigned to channels belonging to a spikegroup with the channelTag Cortical
+%   'Deep'        : Assigned to channels above the reversal
+%   'Superficial' : Assigned to channels below the reversal
+%   ''            : Assigned to channels belonging to a spikegroup with the channelTag Bad
+%
+% Distance to the boundary in µm for electrode groups where the reversal is detected.
+%
+% INPUT
+% session struct with required fields:
+%
+% session.general.basePath: basePath e.g. 'Z:\peterp03\IntanData\MS22\Peter_MS22_180629_110319_concat'
+% session.general.name: name of the recording, e.g. 'Peter_MS22_180629_110319_concat'
+% session.channelTags.(Bad or Cortical) specifying electrodeGroups (1-indexed), channels (1-indexed)
+%   e.g. session.channelTags.Bad.channels = [1,25,128]; session.channelTags.Bad.electrodeGroups = 1;
+% session.extracellular.chanCoords.verticalSpacing: in µm, default: 20. This is the vertical distance between each channel
+% session.extracellular.chanCoords.layout: ['staggered','linear','poly2','poly3','poly5']
+% session.extracellular.srLfp: in Hz, e.g. 1250
+% session.extracellular.nChannels: integer, e.g. 128
+% session.extracellular.nElectrodeGroups: integer, e.g. 8
+% session.extracellular.spikeGroups struct following the xml anatomical format but 1-indexed
+%
+% Requirements
+% downsampled (and lowpass filtered) basename.lfp file in basepath
+%
+% Dependencies:
+% nanconv (included with CellExplorer)
+% LoadBinary (included with CellExplorer)
+% ce_FindRipples (included with CellExplorer) / bz_FindRipples (included with buzcode)
+%
+% Part of CellExplorer: https://CellExplorer.org
+% By Peter Petersen
+% petersen.peter@gmail.com
+% Last edited: 20-02-2021
+
+p = inputParser;
+addParameter(p,'buzcode',false,@islogical); % Defines whether bz_FindRipples or ce_FindRipples is called
+addParameter(p,'saveMat',true,@islogical); % Defines if a mat file is created
+addParameter(p,'saveFig',true,@islogical); % Defines if the summary figure is saved to basepath
+addParameter(p,'skip_cortical',true,@islogical);
+addParameter(p,'notch_filter_60z',false,@islogical); % option to remove 60hz if badly contaminated
+addParameter(p,'remove_opto_stim',true,@islogical); % option to remove ripples overlapping with opto
+addParameter(p,'sample_ripples',false,@islogical); % option to sample ripples
+addParameter(p,'n_samples',2000,@isnumeric); % if sample_ripples, number of samples
+addParameter(p,'basepath',[]);
+
+% Parsing inputs
+parse(p,varargin{:})
+buzcode = p.Results.buzcode;
+saveMat = p.Results.saveMat;
+saveFig = p.Results.saveFig;
+skip_cortical = p.Results.skip_cortical;
+notch_filter_60z = p.Results.notch_filter_60z;
+remove_opto_stim = p.Results.remove_opto_stim;
+sample_ripples = p.Results.sample_ripples;
+n_samples = p.Results.n_samples;
+basepath = p.Results.basepath;
+
+% Gets basepath and basename from session struct
+if isempty(basepath)
+    basepath = session.general.basePath;
+    basename = session.general.name;
+else
+    basename = basenameFromBasepath(basepath);
+end
+
+% Loading detected ripples
+if exist(fullfile(basepath,[basename,'.ripples.events.mat']),'file')
+    load(fullfile(basepath,[basename,'.ripples.events.mat']));
+elseif buzcode
+    if isfield(session,'channelTags') && isfield(session.channelTags,'RippleNoise') && isfield(session.channelTags,'Ripple')
+        disp('  Using RippleNoise reference channel')
+        RippleNoiseChannel = double(LoadBinary(fullfile(basepath,[basename, '.lfp']),...
+            'nChannels',session.extracellular.nChannels,...
+            'channels',session.channelTags.RippleNoise.channels,...
+            'precision','int16',...
+            'frequency',session.extracellular.srLfp));
+        ripples = bz_FindRipples(basename,session.channelTags.Ripple.channels-1,...
+            'basepath',basepath,...
+            'durations',[50 150],...
+            'passband',[120 180],...
+            'EMGThresh',0.9,...
+            'noise',RippleNoiseChannel);
+    elseif isfield(session,'channelTags') && isfield(session.channelTags,'Ripple')
+        ripples = bz_FindRipples(basename,...
+            session.channelTags.Ripple.channels-1,...
+            'basepath',basepath,...
+            'durations',[50 150],...
+            'passband',[120 180],...
+            'EMGThresh',0.5);
+    else
+        error('Ripple channel not defined!')
+    end
+else
+    if isfield(session,'channelTags') && isfield(session.channelTags,'RippleNoise') && isfield(session.channelTags,'Ripple')
+        disp('  Using RippleNoise reference channel')
+        RippleNoiseChannel = double(LoadBinary(fullfile(basepath,[basename, '.lfp']),...
+            'nChannels',session.extracellular.nChannels,...
+            'channels',session.channelTags.RippleNoise.channels,...
+            'precision','int16',...
+            'frequency',session.extracellular.srLfp));
+        ripples = ce_FindRipples(session,...
+            'thresholds', [2 3],...
+            'passband', [80 240],...
+            'EMGThresh', 0.9,...
+            'durations', [20 150],...
+            'saveMat',true,...
+            'noise',RippleNoiseChannel);
+    elseif isfield(session,'channelTags') && isfield(session.channelTags,'Ripple')
+        ripples = ce_FindRipples(session,...
+            'thresholds', [2 3],...
+            'passband', [80 240],...
+            'EMGThresh', 0.5,...
+            'durations', [20 150],...
+            'saveMat',true);
+    else
+        error('Ripple channel not defined!')
+    end
+end
+
+try
+    ripple_channel_detector = ripples.detectorinfo.detectionparms.channel;
+catch
+    try
+        ripple_channel_detector = ripples.detectorinfo.detectionparms.ripple_channel;
+    catch
+        try
+            ripple_channel_detector = ripples.detectorinfo.detectionparms.Channels(1);
+        catch
+            ripple_channel_detector = 0;
+        end
+    end
+end
+
+% Excluding ripples that have been flagged
+if isfield(ripples,'flagged')
+    disp('Excluding flagged ripples events')
+    ripples.timestamps(ripples.flagged,:) = [];
+    ripples.peaks(ripples.flagged) = [];
+end
+
+% remove ripples that overlap with opto stimulation
+if remove_opto_stim && exist(fullfile(basepath,[basename,'.optoStim.manipulation.mat']),'file')
+    load(fullfile(basepath,[basename,'.optoStim.manipulation.mat']),'optoStim');
+
+    [~,indices] = ExcludeIntervals(ripples.timestamps,optoStim.timestamps);
+    ripples.timestamps = ripples.timestamps(indices,:);
+    ripples.peaks = ripples.peaks(indices,:);
+end
+
+% take a sample of ripples 
+if sample_ripples
+    idx = sort(randperm(length(ripples.peaks),min(length(ripples.peaks),n_samples)));
+    ripples.timestamps = ripples.timestamps(idx,:);
+    ripples.peaks = ripples.peaks(idx,:);
+end
+
+% Determines which electrode groups that should be excluded from the analysis
+% by two channelTags: Cortical and Bad
+% Use Cortical channelTag to electrode groups not belonging to the hippocampus
+electrodeGroupsToExclude = [];
+try
+    electrodeGroupsToExclude = [electrodeGroupsToExclude,session.channelTags.Cortical.electrodeGroups];
+end
+
+% Use Bad channelTag for electrode groups, that are not working properly (i.e. broken shanks)
+try
+    electrodeGroupsToExclude = [electrodeGroupsToExclude,session.channelTags.Bad.electrodeGroups];
+end
+
+if isfield(session.extracellular,'chanCoords') && isfield(session.extracellular.chanCoords,'verticalSpacing')
+    VerticalSpacing = session.extracellular.chanCoords.verticalSpacing;
+else
+    warning('No vertical spacing defined. Defaults to 20um')
+    VerticalSpacing = 20;
+end
+
+if ischar(session.extracellular.chanCoords.layout)
+    Layout = session.extracellular.chanCoords.layout;
+end
+
+% The number of channel convoluted to get a better estimate of the reversal point of the sharpwave
+if any(strcmp(Layout,{'staggered','poly2','poly 2','edge'}))
+    conv_length = 3;
+elseif strcmp(Layout,{'linear'})
+    conv_length = 2;
+elseif any(strcmp(Layout,{'poly3','poly 3'}))
+    conv_length = 3;
+elseif any(strcmp(Layout,{'poly5','poly 5'}))
+    conv_length = 5;
+else
+    % If no probe design is provided, it assumes use a convolution length of 3
+    conv_length = 3;
+    warning('No probe layout defined. Channel convolution length set to 3');
+end
+
+ripple_average = [];
+ripple_power = [];
+ripple_amplitude = [];
+ripple_channels = [];
+srLfp = session.extracellular.srLfp;
+ripple_time_axis = [-150:150]/srLfp*1000;
+nChannels = session.extracellular.nChannels;
+deepSuperficial_ChClass3 = repmat({''},1,nChannels);
+deepSuperficial_ChClass = repmat({''},1,nChannels);
+deepSuperficial_ChDistance3 = nan(1,nChannels);
+deepSuperficial_ChDistance = nan(1,nChannels);
+
+% excluding channels that has the channelTags Bad as the algorithm is sensitive to artifacts
+channels_to_exclude = [];
+if isfield(session.channelTags,'Bad') && ~isempty(session.channelTags.Bad.channels)
+    channels_to_exclude = session.channelTags.Bad.channels;
+end
+
+% % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % %
+% Main algorithm  (two versions below)
+% % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % %
+
+% set up output vars in order to be the same size
+for jj = 1:session.extracellular.nElectrodeGroups
+    % Get list of channels belong to electrode group (1-indexed)
+    ripple_channels{jj} = session.extracellular.electrodeGroups.channels{jj};
+    
+    % remove ripple channels that are labeled 'Bad'
+    ripple_channels{jj}(ismember(ripple_channels{jj},channels_to_exclude)) = [];
+    
+    ripple_average{jj} = ones(301,length(ripple_channels{jj}))*nan;
+    ripple_power{jj} = ripple_channels{jj}*nan;
+    ripple_amplitude{jj} = ripple_channels{jj}*nan;
+    SWR_diff{jj} = ripple_channels{jj}*nan;
+    SWR_amplitude{jj} = ripple_channels{jj}*nan;
+end
+
+% Loading .lfp file
+if exist(fullfile(basepath,[basename '.lfp']),'file')
+    fileName = fullfile(basepath,[basename '.lfp']);
+elseif exist(fullfile(basepath,[basename '.eeg']),'file')
+    fileName = fullfile(basepath,[basename '.eeg']);
+else
+    error('lfp file not found')
+end
+
+filenamestruct = dir(fileName);
+dataTypeNBytes = numel(typecast(cast(0, 'int16'), 'uint8')); % determine number of bytes per sample
+nSamp = filenamestruct.bytes/(nChannels*dataTypeNBytes);  % Number of samples per channel
+mmf = memmapfile(fileName, 'Format', {'int16', [nChannels,nSamp], 'data'},'Writable',false);
+
+SWR_slope = [];
+for jj = 1:session.extracellular.nElectrodeGroups
+    
+    if any(jj == electrodeGroupsToExclude) && skip_cortical
+        fprintf(['Skipping cortical electrode group ', num2str(jj),', ']);
+        continue
+    end
+    % Analysing the electrode groups separately
+    fprintf(['Analysing electrode group ', num2str(jj),', ']);
+    
+    if isempty(ripple_channels{jj})
+        continue
+    end
+
+    ripple_ave2 = [];
+    % Only include ripples outside 151 samples from the start/end of the lfp file
+    ripples.peaks = ripples.peaks(find(ripples.peaks*srLfp>151 & ripples.peaks*srLfp<nSamp-151));
+    for i = 1:size(ripples.peaks,1)
+        ts_idx = round(ripples.peaks(i)*srLfp)-150:round(ripples.peaks(i)*srLfp)+150;
+        ripple_ave2(:,:,i) = mmf.Data.data(ripple_channels{jj},ts_idx);
+    end
+    if notch_filter_60z
+        for ch = 1:size(ripple_ave2,1)
+            for rip_i = 1:size(ripple_ave2,3)
+                ripple_ave2(ch,:,rip_i) = notch_filter(ripple_ave2(ch,:,rip_i),...
+                    session.extracellular.srLfp, 60, 10);
+            end
+        end
+    end
+    ripple_average{jj} = mean(ripple_ave2 * 0.000195,3)';
+    ripple_power{jj} = sum(ripple_average{jj}.^2)./max(sum(ripple_average{jj}.^2));
+    ripple_amplitude{jj} = double(mean(ripple_average{jj})/max(abs(mean(ripple_average{jj}))));
+    
+    % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % %
+    % First algorithm (check new algorithm below)
+    % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % %
+    
+    % Assigns Superficial label to all channels if all channels have negative ripple amplitude
+    deepSuperficial_ChClass3(ripple_channels{jj}(find(ripple_amplitude{jj}<=0))) = repmat({'Superficial'},sum(ripple_amplitude{jj}<=0),1);
+    % Assigns Deep label to all channels if all channels have positive ripple amplitude
+    deepSuperficial_ChClass3(ripple_channels{jj}(find(ripple_amplitude{jj}>0))) = repmat({'Deep'},sum(ripple_amplitude{jj}>0),1);
+    
+    % assigning distance to reversal
+    if sum(ripple_amplitude{jj}>0)==0
+        % Superficial
+        % Positive distance to reversal assigned to channels in electrode group
+        % if all channels are below reversal
+        deepSuperficial_ChDistance3(ripple_channels{jj}) = 1:size(ripple_average{jj},2);
+    elseif sum(ripple_amplitude{jj}>0) == size(ripple_average{jj},2)
+        % Deep
+        % Negative distance to reversal assigned to channels in electrode group
+        % if all channels are above reversal
+        deepSuperficial_ChDistance3(ripple_channels{jj}) = -(size(ripple_average{jj},2):-1:1);
+    end
+    % Deals with the electrode groups where a reversal is detected
+    if any(ripple_amplitude{jj}<0) && any(ripple_amplitude{jj}>0)
+        % Performs a linear interpolation to determine the reversal point.
+        % This limits the variance that can exist because of variance in
+        % the ripple amplitude and due to sub-optimal probe layouts
+        threshold = interp1(unique(ripple_amplitude{jj}),[1:size(unique(ripple_amplitude{jj}),2)],0);
+        deepSuperficial_ChClass3(ripple_channels{jj}([1:threshold])) = repmat({'Deep'},length([1:threshold]),1);
+        deepSuperficial_ChClass3(ripple_channels{jj}([ceil(threshold):size(ripple_average{jj},2)])) = repmat({'Superficial'},length([ceil(threshold):size(ripple_average{jj},2)]),1);
+        deepSuperficial_ChDistance3(ripple_channels{jj}) = (1:size(ripple_average{jj},2))-threshold;
+    end
+    
+    % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % %
+    % Second algorithm (newest)
+    % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % %
+    % Seems to do much better across mouse and rat recordings where the
+    % sharp wave can have very different shape and amplitude.
+    
+    [~,ia,~] = intersect(ripple_channels{jj}, channels_to_exclude);
+    [ripple_channels2,ia2] = setdiff(ripple_channels{jj}, channels_to_exclude,'legacy');
+    ia2 = sort(ia2);
+    SWR_average = nanconv(ripple_average{jj},ones(40,1)/40,'edge');
+    SWR_average = SWR_average-SWR_average(100,:);
+    SWR_diff{jj} = sum(SWR_average(100:135,:));
+    SWR_diff2 = SWR_diff{jj};
+    SWR_diff2(ia) = [];
+    SWR_diff2 = nanconv(SWR_diff2,[ones(1,conv_length)]/conv_length,'edge');
+    
+    if isempty(SWR_diff2)
+        continue
+    end
+    
+    SWR_average2 = nanconv(ripple_average{jj},ones(20,1)/20,'edge');
+    SWR_amplitude{jj} = sum(abs(ripple_average{jj}(100:201,:)-SWR_average2(100:201,:)));
+    SWR_amplitude2 = SWR_amplitude{jj};
+    SWR_amplitude2(ia) = [];
+    
+    coefs = polyfit([1:length(SWR_amplitude2)], SWR_amplitude2, 1);
+    SWR_slope = coefs(1);
+    
+    SWR_diff{jj} = SWR_diff{jj}./max(abs(SWR_diff{jj}));
+    SWR_amplitude{jj} = (SWR_amplitude{jj}-min(SWR_amplitude{jj}))./max(abs(SWR_amplitude{jj}-min(SWR_amplitude{jj})));
+    
+    if any(diff(SWR_diff2<0)==1) && ~any(jj == electrodeGroupsToExclude)
+        indx = find(diff(SWR_diff2<0)==1);indx = indx(end);
+        threshold = interp1(SWR_diff2([indx,indx+1]),[ia2(indx),ia2(indx+1)],0);
+        deepSuperficial_ChClass(ripple_channels{jj}([1:threshold])) = repmat({'Deep'},length([1:threshold]),1);
+        deepSuperficial_ChClass(ripple_channels{jj}([ceil(threshold):size(SWR_diff{jj},2)])) = repmat({'Superficial'},length([ceil(threshold):size(SWR_diff{jj},2)]),1);
+        
+        if isfield(session.extracellular,'chanCoords')
+            % pull out y coords and flip as chanCoords will start ~0 and go negative
+            y = session.extracellular.chanCoords.y(ripple_channels{jj});
+            y = abs(y - max(y));
+            threshold = interp1(SWR_diff2([indx,indx+1]),[y(indx),y(indx+1)],0);
+            deepSuperficial_ChDistance(ripple_channels{jj}) = y - threshold;
+        else
+            deepSuperficial_ChDistance(ripple_channels{jj}) = (1:size(SWR_diff{jj},2))-threshold;
+        end
+    else
+        if SWR_slope > 0
+            deepSuperficial_ChClass(ripple_channels{jj}) = repmat({'Deep'},length(ripple_channels{jj}),1); % Deep
+            if SWR_diff2(end)*5<max(SWR_diff2) && SWR_diff2(end) > 0
+                if isfield(session.extracellular,'chanCoords')
+                    y = session.extracellular.chanCoords.y(ripple_channels{jj});
+                    y = abs(y - max(y));
+                    deepSuperficial_ChDistance(ripple_channels{jj}) = y - max(y);
+                else
+                    deepSuperficial_ChDistance(ripple_channels{jj}) = (1:size(SWR_diff{jj},2))-length(ripple_channels{jj})-1;
+                end
+            end
+        else
+            deepSuperficial_ChClass(ripple_channels{jj}) = repmat({'Superficial'},length(ripple_channels{jj}),1); % Superficial
+            if ~isempty(SWR_diff2) && SWR_diff2(1)*5>min(SWR_diff2)  && SWR_diff2(1) < 0
+                if isfield(session.extracellular,'chanCoords')
+                    y = session.extracellular.chanCoords.y(ripple_channels{jj});
+                    y = abs(y - max(y));
+                    deepSuperficial_ChDistance(ripple_channels{jj}) = y;
+                else
+                    deepSuperficial_ChDistance(ripple_channels{jj}) = (1:size(SWR_diff{jj},2))+1;
+                end
+            end
+        end
+    end
+end
+
+% Labels channels Cortical if electrode group has channelTags
+if isfield(session.channelTags,'Cortical') && ~isempty(session.channelTags.Cortical.electrodeGroups)
+    for jj = session.channelTags.Cortical.electrodeGroups
+        deepSuperficial_ChClass3(ripple_channels{jj}) = repmat({'Cortical'},length(ripple_channels{jj}),1);
+        deepSuperficial_ChClass(ripple_channels{jj}) = repmat({'Cortical'},length(ripple_channels{jj}),1);
+    end
+end
+
+% Removes channel-labels if electrode group has channelTags Bad
+if isfield(session.channelTags,'Bad') && isfield(session.channelTags.Bad,'electrodeGroups') && ~isempty(session.channelTags.Bad.electrodeGroups)
+    for jj = session.channelTags.Bad.electrodeGroups
+        deepSuperficial_ChClass3(ripple_channels{jj}) = repmat({''},length(ripple_channels{jj}),1);
+        deepSuperficial_ChClass(ripple_channels{jj}) = repmat({''},length(ripple_channels{jj}),1);
+    end
+end
+if ~isfield(session.extracellular,'chanCoords')
+    deepSuperficial_ChDistance3 = deepSuperficial_ChDistance3 * VerticalSpacing;
+    deepSuperficial_ChDistance = deepSuperficial_ChDistance * VerticalSpacing;
+end
+% Saving the result to basename.deepSuperficialfromRipple.channelinfo.mat
+deepSuperficialfromRipple.channel = [1:length(deepSuperficial_ChDistance)]'; % 1-indexed
+deepSuperficialfromRipple.channelClass = deepSuperficial_ChClass';
+deepSuperficialfromRipple.channelDistance = deepSuperficial_ChDistance';
+deepSuperficialfromRipple.ripple_power = ripple_power;
+deepSuperficialfromRipple.ripple_amplitude = ripple_amplitude;
+deepSuperficialfromRipple.ripple_average = ripple_average;
+deepSuperficialfromRipple.ripple_time_axis = ripple_time_axis;
+deepSuperficialfromRipple.ripple_channels = ripple_channels; %  index 1 for channels
+deepSuperficialfromRipple.SWR_diff = SWR_diff;
+deepSuperficialfromRipple.SWR_amplitude = SWR_amplitude;
+if isfield(ripples,'detectorinfo')
+    deepSuperficialfromRipple.detectorinfo = ripples.detectorinfo;
+end
+deepSuperficialfromRipple.processinginfo.function = 'classification_deepSuperficial';
+deepSuperficialfromRipple.processinginfo.date = now;
+deepSuperficialfromRipple.processinginfo.params.verticalSpacing = VerticalSpacing;
+deepSuperficialfromRipple.processinginfo.params.electrodeGroupsToExclude = electrodeGroupsToExclude;
+if isfield(session.extracellular,'chanCoords')
+    deepSuperficialfromRipple.processinginfo.params.deepSuperficial_ChDistance_method = 'chanCoords';
+else
+    deepSuperficialfromRipple.processinginfo.params.deepSuperficial_ChDistance_method = 'VerticalSpacing';
+end
+if saveMat
+    save(fullfile(basepath, [basename,'.deepSuperficialfromRipple.channelinfo.mat']),'deepSuperficialfromRipple');
+end
+
+% Plotting the average ripple with sharp wave across all electrode groups
+figure
+for jj = 1:session.extracellular.nElectrodeGroups
+    if jj > length(SWR_amplitude)
+        break
+    end
+    subplot(2,ceil(session.extracellular.nElectrodeGroups/2),jj)
+    plot((SWR_diff{jj}*50)+ripple_time_axis(1)-50,-[0:size(SWR_diff{jj},2)-1]*0.04,'-k','linewidth',2), hold on, grid on
+    plot((SWR_amplitude{jj}*50)+ripple_time_axis(1)-50,-[0:size(SWR_amplitude{jj},2)-1]*0.04,'k','linewidth',1)
+    % Plotting ripple amplitude along vertical axis
+    plot((ripple_amplitude{jj}*50)+ripple_time_axis(1)-50,-[0:size(ripple_amplitude{jj},2)-1]*0.04,'m','linewidth',1)
+    
+    for jjj = 1:size(ripple_average{jj},2)
+        % Plotting depth (µm)
+        text(ripple_time_axis(end)+5,ripple_average{jj}(1,jjj)-(jjj-1)*0.04,[num2str(round(deepSuperficial_ChDistance(ripple_channels{jj}(jjj))))])
+        % Plotting channel number (0 indexes)
+        text((SWR_diff{jj}(jjj)*50)+ripple_time_axis(1)-50-10,-(jjj-1)*0.04,num2str(ripple_channels{jj}(jjj)-1),'HorizontalAlignment','Right')
+        plot(ripple_time_axis,ripple_average{jj}(:,jjj)-(jjj-1)*0.04)
+        % Plotting assigned channel labels
+        if strcmp(deepSuperficial_ChClass(ripple_channels{jj}(jjj)),'Superficial')
+            plot((SWR_diff{jj}(jjj)*50)+ripple_time_axis(1)-50,-(jjj-1)*0.04,'or','linewidth',2)
+        elseif strcmp(deepSuperficial_ChClass(ripple_channels{jj}(jjj)),'Deep')
+            plot((SWR_diff{jj}(jjj)*50)+ripple_time_axis(1)-50,-(jjj-1)*0.04,'ob','linewidth',2)
+        elseif strcmp(deepSuperficial_ChClass(ripple_channels{jj}(jjj)),'Cortical')
+            plot((SWR_diff{jj}(jjj)*50)+ripple_time_axis(1)-50,-(jjj-1)*0.04,'og','linewidth',2)
+        else
+            plot((SWR_diff{jj}(jjj)*50)+ripple_time_axis(1)-50,-(jjj-1)*0.04,'ok')
+        end
+        % Plotting the channel used for the ripple detection if it is part of current electrode group
+        if ripple_channel_detector==ripple_channels{jj}(jjj)
+            plot(ripple_time_axis,ripple_average{jj}(:,jjj)-(jjj-1)*0.04,'k','linewidth',2)
+        end
+    end
+    
+    title(['Electrode group ' num2str(jj)]),xlabel('Time (ms)'),if jj ==1; ylabel(basename, 'Interpreter', 'none'); end
+    axis tight, ax6 = axis; grid on
+    plot([-120, -120;-170,-170;120,120], [ax6(3) ax6(4)],'color','k');
+    xlim([-220,ripple_time_axis(end)+45]), xticks([-120:40:120])
+    ht1 = text(0.02,0.03,'Superficial','Units','normalized','FontWeight','Bold','Color','r');
+    ht2 = text(0.02,0.97,'Deep','Units','normalized','FontWeight','Bold','Color','b');
+    if ceil(session.extracellular.nElectrodeGroups/2) == jj || session.extracellular.nElectrodeGroups == jj
+        ht3 = text(1.05,0.4,'Depth (µm)','Units','normalized','Color','k'); set(ht3,'Rotation',90)
+    end
+end
+
+% Saving figure
+if saveFig
+    saveas(gcf,fullfile(basepath,'deepSuperficial_classification_fromRipples.png'));
+end
