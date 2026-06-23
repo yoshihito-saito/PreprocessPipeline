@@ -69,6 +69,7 @@ from .config_model import (
     RunMode,
     parse_float_pair,
     parse_int_list,
+    postprocess_output_folder_for_sorting,
 )
 from .preflight import CheckResult, run_preflight
 from .run_pipeline import ERROR_PREFIX, RESULT_PREFIX
@@ -1324,7 +1325,6 @@ class MainWindow(QMainWindow):
         run_box = QGroupBox("Ephys run")
         run_layout = QHBoxLayout(run_box)
         self.run_all = QPushButton("Run all")
-        self.run_all.setObjectName("primaryButton")
         self.run_pre = QPushButton("Run preprocess")
         self.run_post = QPushButton("Run postprocess")
         self.run_all.clicked.connect(lambda: self._start_run("all"))
@@ -1334,8 +1334,16 @@ class MainWindow(QMainWindow):
         run_layout.addWidget(self.run_pre)
         run_layout.addWidget(self.run_post)
 
+        manual_box = QGroupBox("Manual Curation")
+        manual_layout = QHBoxLayout(manual_box)
+        self.run_phy = QPushButton("Run phy")
+        self.run_phy.clicked.connect(self._run_phy)
+        manual_layout.addWidget(self.run_phy)
+        manual_layout.addStretch(1)
+
         layout.addWidget(self.ephys_tabs, 1)
         layout.addWidget(run_box)
+        layout.addWidget(manual_box)
         return panel
 
     def _scroll_area(self, widget: QWidget) -> QScrollArea:
@@ -3233,6 +3241,73 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Move outputs failed", str(exc))
 
+    def _resolve_phy_params_path(self, sorting_folder: Path) -> Path:
+        sorting_folder = sorting_folder.expanduser().resolve()
+        run_root = sorting_folder.parent if sorting_folder.name == "sorter_output" else sorting_folder
+        candidate_folders: list[Path] = []
+
+        def _add_candidate(folder: Path) -> None:
+            folder = folder.resolve()
+            if folder not in candidate_folders:
+                candidate_folders.append(folder)
+
+        if sorting_folder.name.endswith("_spi"):
+            _add_candidate(sorting_folder)
+        else:
+            _add_candidate(postprocess_output_folder_for_sorting(sorting_folder))
+            _add_candidate(sorting_folder)
+            _add_candidate(run_root)
+            _add_candidate(run_root / "sorter_output")
+
+        candidates = [folder / "params.py" for folder in candidate_folders]
+        for params_path in candidates:
+            if params_path.exists() and params_path.is_file():
+                return params_path
+        raise FileNotFoundError(
+            "Could not find params.py for Phy. Checked:\n"
+            + "\n".join(str(path) for path in candidates)
+        )
+
+    def _resolve_phy_program(self) -> str:
+        executable_dir = Path(sys.executable).resolve().parent
+        candidate_names = ["phy.exe", "phy"] if os.name == "nt" else ["phy"]
+        for name in candidate_names:
+            candidate = executable_dir / name
+            if candidate.exists() and candidate.is_file():
+                return str(candidate)
+        phy_program = shutil.which("phy")
+        if phy_program is not None:
+            return phy_program
+        raise FileNotFoundError(
+            "Could not find 'phy'. Start this GUI from the phy2 environment or install Phy there."
+        )
+
+    def _run_phy(self) -> None:
+        if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.warning(self, "Run active", "Cannot launch Phy while a pipeline job is running.")
+            return
+        try:
+            settings = self._collect_settings()
+            sorting_folder = settings.postprocess_sorting_folder()
+            if sorting_folder is None:
+                raise FileNotFoundError(
+                    "No sorting folder could be resolved. Run sorting first or set Postprocess target > sorting folder."
+                )
+            params_path = self._resolve_phy_params_path(sorting_folder)
+            phy_program = self._resolve_phy_program()
+            working_dir = params_path.parent
+            self._append_log(f"\n=== Launching Phy ===\n{phy_program} template-gui {params_path.name}\n")
+            self._append_log(f"Working directory: {working_dir}\n")
+            started = QProcess.startDetached(
+                phy_program,
+                ["template-gui", params_path.name],
+                str(working_dir),
+            )
+            if not started:
+                raise RuntimeError("QProcess.startDetached returned false while launching Phy.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Run phy failed", str(exc))
+
     def _force_stop_process(self) -> None:
         if self._process is None or self._process.state() == QProcess.ProcessState.NotRunning:
             self._append_log("\n=== Force stop requested, but no pipeline job is running ===\n")
@@ -3450,6 +3525,7 @@ class MainWindow(QMainWindow):
             self.run_all,
             self.run_pre,
             self.run_post,
+            self.run_phy,
             self.run_noise_label,
             self.run_behavior_cleanup,
             self.run_behavior,
