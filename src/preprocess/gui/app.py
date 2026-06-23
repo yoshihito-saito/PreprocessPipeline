@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
+import re
 import signal
 from pathlib import Path
 import shutil
@@ -995,6 +997,12 @@ class MainWindow(QMainWindow):
         self._process_result: dict[str, Any] | None = None
         self._process_error: dict[str, Any] | None = None
         self._process_tail = ""
+        self._phy_process: QProcess | None = None
+        self._phy_working_dir: Path | None = None
+        self._phy_last_counts: dict[str, int] | None = None
+        self._phy_status_timer = QTimer(self)
+        self._phy_status_timer.setInterval(30000)
+        self._phy_status_timer.timeout.connect(self._append_phy_curation_status)
         self._log_buffer = ""
         self._log_flush_timer = QTimer(self)
         self._log_flush_timer.setSingleShot(True)
@@ -3282,9 +3290,138 @@ class MainWindow(QMainWindow):
             "Could not find 'phy'. Start this GUI from the phy2 environment or install Phy there."
         )
 
+    def _phy_is_running(self) -> bool:
+        return self._phy_process is not None and self._phy_process.state() != QProcess.ProcessState.NotRunning
+
+    def _format_seconds(self, total_seconds: float) -> str:
+        total_seconds = max(0.0, float(total_seconds))
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        seconds = total_seconds - hours * 3600 - minutes * 60
+        if hours:
+            return f"{hours} h {minutes:02d} min {seconds:06.3f} s"
+        if minutes:
+            return f"{minutes} min {seconds:06.3f} s"
+        return f"{seconds:.3f} s"
+
+    def _format_phy_duration(self, duration: Any) -> str:
+        if duration is None:
+            return "-"
+        if isinstance(duration, (int, float, np.integer, np.floating)):
+            return self._format_seconds(float(duration))
+        text = str(duration).strip()
+        match = re.fullmatch(r"(\d+):(\d{2}):(\d{2}):(\d{3})\s+hours", text)
+        if match:
+            hours, minutes, seconds, millis = (int(part) for part in match.groups())
+            return f"{hours} h {minutes:02d} min {seconds:02d}.{millis:03d} s"
+        return text
+
+    def _read_phy_cluster_counts(self, phy_dir: Path) -> dict[str, int]:
+        cluster_info_path = phy_dir / "cluster_info.tsv"
+        if not cluster_info_path.exists():
+            raise FileNotFoundError(f"cluster_info.tsv not found: {cluster_info_path}")
+
+        counts = {
+            "total": 0,
+            "good": 0,
+            "mua": 0,
+            "noise": 0,
+            "unclassified": 0,
+            "other": 0,
+        }
+        unclassified_labels = {"", "nan", "none", "unsorted", "unclassified"}
+        with cluster_info_path.open("r", encoding="utf-8", errors="replace", newline="") as file:
+            reader = csv.DictReader(file, delimiter="\t")
+            if reader.fieldnames is None or "group" not in reader.fieldnames:
+                raise ValueError(f"cluster_info.tsv does not contain a group column: {cluster_info_path}")
+            for row in reader:
+                counts["total"] += 1
+                group = str(row.get("group") or "").strip().lower()
+                if group in unclassified_labels:
+                    counts["unclassified"] += 1
+                elif group in ("good", "mua", "noise"):
+                    counts[group] += 1
+                else:
+                    counts["other"] += 1
+        return counts
+
+    def _format_phy_cluster_counts(self, counts: dict[str, int]) -> str:
+        return (
+            f"total={counts['total']}, good={counts['good']}, mua={counts['mua']}, "
+            f"noise={counts['noise']}, unclassified={counts['unclassified']}, other={counts['other']}"
+        )
+
+    def _append_phy_curation_status(self, *, force: bool = False, final: bool = False) -> None:
+        if self._phy_working_dir is None:
+            return
+        try:
+            counts = self._read_phy_cluster_counts(self._phy_working_dir)
+        except Exception as exc:
+            if force or self._phy_last_counts is None:
+                self._append_warning_log(f"[WARN] Could not read Phy curation status: {exc}\n")
+            return
+
+        if not force and counts == self._phy_last_counts:
+            return
+        self._phy_last_counts = dict(counts)
+        prefix = "Final Phy curation status" if final else "Phy curation status"
+        self._append_log(f"{prefix}: {self._format_phy_cluster_counts(counts)}\n")
+
+    def _append_phy_log_summary(self, phy_log_path: Path) -> None:
+        try:
+            phy_log_path = phy_log_path.resolve()
+            if not phy_log_path.exists():
+                self._append_warning_log(f"[WARN] Phy log not found yet: {phy_log_path}\n")
+                return
+            os.environ.setdefault(
+                "MPLCONFIGDIR",
+                str((Path(tempfile.gettempdir()) / "matplotlib-preprocess-gui").resolve()),
+            )
+            os.environ.setdefault(
+                "NUMBA_CACHE_DIR",
+                str((Path(tempfile.gettempdir()) / "numba-preprocess-gui").resolve()),
+            )
+            from neuro_py.raw.spike_sorting import phy_log_to_epocharray
+
+            epochs = phy_log_to_epocharray(str(phy_log_path))
+            n_epochs = getattr(epochs, "n_epochs", None)
+            duration = getattr(epochs, "duration", None)
+            self._append_log(
+                "Phy log summary:\n"
+                f"Log file: {phy_log_path}\n"
+                f"Curation epochs: {n_epochs if n_epochs is not None else '-'}\n"
+                f"Estimated curation time: {self._format_phy_duration(duration)}\n"
+            )
+        except Exception as exc:
+            self._append_warning_log(f"[WARN] Could not summarize Phy log: {exc}\n")
+
+    def _phy_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        self._phy_status_timer.stop()
+        self._append_log(f"\n=== Phy closed (exit code {exit_code}) ===\n")
+        self._append_phy_curation_status(force=True, final=True)
+        if self._phy_working_dir is not None:
+            self._append_phy_log_summary(self._phy_working_dir / "phy.log")
+        self._phy_process = None
+        self._phy_working_dir = None
+        self._phy_last_counts = None
+        if self._process is None or self._process.state() == QProcess.ProcessState.NotRunning:
+            self.run_phy.setEnabled(True)
+
+    def _phy_error_occurred(self, error: QProcess.ProcessError) -> None:
+        self._phy_status_timer.stop()
+        self._phy_process = None
+        self._phy_working_dir = None
+        self._phy_last_counts = None
+        if self._process is None or self._process.state() == QProcess.ProcessState.NotRunning:
+            self.run_phy.setEnabled(True)
+        QMessageBox.critical(self, "Run phy failed", f"Phy process failed to start: {error.name}")
+
     def _run_phy(self) -> None:
         if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
             QMessageBox.warning(self, "Run active", "Cannot launch Phy while a pipeline job is running.")
+            return
+        if self._phy_is_running():
+            QMessageBox.warning(self, "Phy already active", "A Phy process is already running.")
             return
         try:
             settings = self._collect_settings()
@@ -3298,13 +3435,24 @@ class MainWindow(QMainWindow):
             working_dir = params_path.parent
             self._append_log(f"\n=== Launching Phy ===\n{phy_program} template-gui {params_path.name}\n")
             self._append_log(f"Working directory: {working_dir}\n")
-            started = QProcess.startDetached(
-                phy_program,
-                ["template-gui", params_path.name],
-                str(working_dir),
-            )
-            if not started:
-                raise RuntimeError("QProcess.startDetached returned false while launching Phy.")
+            process = QProcess(self)
+            process.setProgram(phy_program)
+            process.setArguments(["template-gui", params_path.name])
+            process.setWorkingDirectory(str(working_dir))
+            process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+            process.finished.connect(self._phy_finished)
+            process.errorOccurred.connect(self._phy_error_occurred)
+            self._phy_process = process
+            self._phy_working_dir = working_dir
+            self._phy_last_counts = None
+            self.run_phy.setEnabled(False)
+            process.start()
+            if not process.waitForStarted(3000):
+                self._phy_error_occurred(process.error())
+                return
+            QTimer.singleShot(3000, lambda: self._append_phy_curation_status(force=True))
+            QTimer.singleShot(3000, lambda path=working_dir / "phy.log": self._append_phy_log_summary(path))
+            self._phy_status_timer.start()
         except Exception as exc:
             QMessageBox.critical(self, "Run phy failed", str(exc))
 
@@ -3518,6 +3666,14 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        if self._phy_is_running():
+            QMessageBox.warning(
+                self,
+                "Phy active",
+                "A Phy process is still running. Close Phy first so the GUI can write the final curation summary.",
+            )
+            event.ignore()
+            return
         super().closeEvent(event)
 
     def _set_running(self, running: bool) -> None:
@@ -3532,6 +3688,8 @@ class MainWindow(QMainWindow):
             self.move_outputs,
         ]:
             button.setEnabled(not running)
+        if self._phy_is_running():
+            self.run_phy.setEnabled(False)
         self.force_stop.setEnabled(running)
 
     def _append_log(self, text: str, *, warning: bool = False) -> None:
