@@ -16,8 +16,8 @@ from typing import Any
 import numpy as np
 from scipy.io import loadmat
 
-from PySide6.QtCore import QProcess, Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QPointF, QProcess, QRectF, Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPen, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -31,8 +31,10 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -59,7 +61,7 @@ from src.preprocess.behavior import (
     process_dlc_behavior,
 )
 from src.preprocess import prepare_chanmap, select_paths_with_gui
-from src.preprocess.io import build_channel_map_data, set_tree_world_rw
+from src.preprocess.io import build_channel_map_data, save_cell_explorer_chan_coords, set_tree_world_rw
 from src.preprocess.paths import find_project_root, resolve_project_path
 from src.worker_defaults import default_worker_count, normalize_worker_count
 
@@ -73,6 +75,13 @@ from .config_model import (
     parse_int_list,
     postprocess_output_folder_for_sorting,
 )
+from .anatomical_map import (
+    AnatomicalChannelGroup,
+    AnatomicalMapError,
+    channel_groups_from_chanmap_data,
+    load_anatomical_map_csv,
+    save_anatomical_map_csv,
+)
 from .preflight import CheckResult, run_preflight
 from .run_pipeline import ERROR_PREFIX, RESULT_PREFIX
 
@@ -80,6 +89,9 @@ from .run_pipeline import ERROR_PREFIX, RESULT_PREFIX
 REPO_ROOT = find_project_root()
 PUBLIC_DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "preprocess_gui_default_config.json"
 LOCAL_DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "preprocess_gui_default_config.local.json"
+VENDORED_CELLEXPLORER_ROOT = REPO_ROOT / "external" / "CellExplorer"
+MATLAB_SUPPORT_ROOT = REPO_ROOT / "external" / "matlab"
+ANATOMICAL_MAP_FILENAME = "anatomical_map.csv"
 
 
 def _default_config_path() -> Path:
@@ -491,6 +503,427 @@ class ChanMapCanvas(QWidget):
         ax.set_xlim(*self._full_xlim)
         ax.set_ylim(*self._full_ylim)
         self.canvas.draw_idle()
+
+
+class BrainRegionProbeWidget(QWidget):
+    def __init__(
+        self,
+        groups: list[AnatomicalChannelGroup],
+        channel_regions: dict[int, str],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._groups = list(groups)
+        self._channel_regions = dict(channel_regions)
+        self._selected_channels: set[int] = set()
+        self._drag_preview_channels: set[int] = set()
+        self._dot_hits: dict[int, tuple[float, float, float]] = {}
+        self._drag_start: QPointF | None = None
+        self._drag_current: QPointF | None = None
+        self._zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self.setMinimumWidth(980)
+        self.setMinimumHeight(520)
+        self.setMouseTracking(True)
+
+    @property
+    def selected_channels(self) -> set[int]:
+        return set(self._selected_channels)
+
+    @property
+    def channel_regions(self) -> dict[int, str]:
+        return dict(self._channel_regions)
+
+    def assign_region(self, name: str) -> None:
+        label = name.strip()
+        if not label:
+            return
+        for channel in self._selected_channels:
+            self._channel_regions[channel] = label
+        self.update()
+
+    def clear_region(self) -> None:
+        for channel in self._selected_channels:
+            self._channel_regions.pop(channel, None)
+        self.update()
+
+    def region_names(self) -> list[str]:
+        return sorted({label for label in self._channel_regions.values() if label.strip()})
+
+    def paintEvent(self, _event: Any) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#101216"))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self._dot_hits = {}
+
+        channels = self._geometry_channels()
+        if not channels:
+            painter.setPen(QPen(QColor("#8a9099")))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No channel groups")
+            return
+
+        title_height = 28
+        view = self._geometry_view(channels)
+        radius = max(3.5, min(7.0, view["scale"] * 20.0))
+
+        painter.setPen(QPen(QColor("#d6dde8")))
+        painter.drawText(QRectF(0, 0, self.width(), title_height), Qt.AlignmentFlag.AlignCenter, "Brain Regions")
+
+        painter.setPen(QPen(QColor("#252b34")))
+        painter.drawRect(QRectF(view["x_origin"], view["y_origin"], view["draw_width"], view["draw_height"]))
+
+        group_centers: dict[int, list[float]] = {}
+        for group_id, _channel, x, _y in channels:
+            group_centers.setdefault(group_id, []).append(self._to_canvas(x, view["y_min"], view).x())
+        small_font = painter.font()
+        small_font.setPointSizeF(7.0)
+        painter.setFont(small_font)
+        for group_id, positions in group_centers.items():
+            x_center = sum(positions) / max(1, len(positions))
+            painter.setPen(QPen(QColor("#303743")))
+            painter.drawLine(
+                int(x_center),
+                int(view["y_origin"]),
+                int(x_center),
+                int(view["y_origin"] + view["draw_height"]),
+            )
+            painter.setPen(QPen(QColor("#9aa4b2")))
+            painter.drawText(
+                QRectF(x_center - 16, view["y_origin"] - 16, 32, 12),
+                Qt.AlignmentFlag.AlignCenter,
+                f"G{group_id}",
+            )
+
+        label_font = painter.font()
+        label_font.setPointSizeF(6.5)
+        painter.setFont(label_font)
+        for _group_id, channel, x, y in channels:
+            point = self._to_canvas(x, y, view)
+            label = self._channel_regions.get(channel, "")
+            selected = channel in self._selected_channels or channel in self._drag_preview_channels
+            painter.setBrush(QColor(self._region_color(label)))
+            pen = QPen(QColor("#facc15") if selected else QColor("#c3ccd8"))
+            pen.setWidth(3 if selected else 1)
+            painter.setPen(pen)
+            painter.drawEllipse(point, radius, radius)
+            self._dot_hits[channel] = (point.x(), point.y(), radius + 7)
+
+            painter.setPen(QPen(QColor("#b8c7da")))
+            painter.drawText(
+                QRectF(point.x() + radius + 1, point.y() - 6, 28, 11),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                str(channel - 1),
+            )
+            if label:
+                painter.setPen(QPen(QColor("#9bd1ff")))
+                painter.drawText(
+                    QRectF(point.x() + radius + 22, point.y() - 6, 56, 11),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    label,
+                )
+
+        if self._drag_start is not None and self._drag_current is not None:
+            rect = QRectF(self._drag_start, self._drag_current).normalized()
+            painter.setPen(QPen(QColor("#facc15"), 1, Qt.PenStyle.DashLine))
+            painter.setBrush(QColor(250, 204, 21, 40))
+            painter.drawRect(rect)
+
+    def wheelEvent(self, event: Any) -> None:  # noqa: N802
+        channels = self._geometry_channels()
+        if not channels:
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+
+        old_view = self._geometry_view(channels)
+        old_zoom = self._zoom
+        zoom_factor = 1.15 ** (delta / 120.0)
+        new_zoom = min(24.0, max(0.5, old_zoom * zoom_factor))
+        if abs(new_zoom - old_zoom) < 1e-6:
+            return
+
+        cursor = event.position()
+        scale_ratio = new_zoom / old_zoom
+        new_origin_x = cursor.x() - (cursor.x() - old_view["x_origin"]) * scale_ratio
+        new_origin_y = cursor.y() - (cursor.y() - old_view["y_origin"]) * scale_ratio
+        centered_view = self._geometry_view(channels, zoom=new_zoom, pan=QPointF(0.0, 0.0))
+        self._zoom = new_zoom
+        self._pan = QPointF(
+            new_origin_x - centered_view["x_origin"],
+            new_origin_y - centered_view["y_origin"],
+        )
+        self.update()
+        event.accept()
+
+    def mousePressEvent(self, event: Any) -> None:  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        channel = self._channel_at(event.position().x(), event.position().y())
+        modifiers = event.modifiers()
+        if channel is not None:
+            if modifiers & Qt.KeyboardModifier.ControlModifier:
+                if channel in self._selected_channels:
+                    self._selected_channels.remove(channel)
+                else:
+                    self._selected_channels.add(channel)
+            else:
+                self._selected_channels = {channel}
+            self._drag_preview_channels.clear()
+            self._drag_start = None
+            self._drag_current = None
+            self.update()
+            return
+        self._drag_start = event.position()
+        self._drag_current = event.position()
+        self._drag_preview_channels.clear()
+        if not (modifiers & Qt.KeyboardModifier.ControlModifier):
+            self._selected_channels.clear()
+        self.update()
+
+    def mouseMoveEvent(self, event: Any) -> None:  # noqa: N802
+        if self._drag_start is None:
+            return
+        self._drag_current = event.position()
+        self._drag_preview_channels = self._channels_in_rect(QRectF(self._drag_start, self._drag_current).normalized())
+        self.update()
+
+    def mouseReleaseEvent(self, event: Any) -> None:  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._drag_start is not None and self._drag_current is not None:
+            rect = QRectF(self._drag_start, self._drag_current).normalized()
+            if rect.width() > 3 or rect.height() > 3:
+                self._selected_channels |= self._channels_in_rect(rect)
+        self._drag_start = None
+        self._drag_current = None
+        self._drag_preview_channels.clear()
+        self.update()
+
+    def _channels_in_rect(self, rect: QRectF) -> set[int]:
+        selected: set[int] = set()
+        for channel, (cx, cy, radius) in self._dot_hits.items():
+            hit_rect = QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
+            if rect.intersects(hit_rect) or rect.contains(QPointF(cx, cy)):
+                selected.add(channel)
+        return selected
+
+    def _channel_at(self, x: float, y: float) -> int | None:
+        best_channel: int | None = None
+        best_distance = float("inf")
+        for channel, (cx, cy, radius) in self._dot_hits.items():
+            distance = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+            if distance <= radius and distance < best_distance:
+                best_channel = channel
+                best_distance = distance
+        return best_channel
+
+    def _geometry_channels(self) -> list[tuple[int, int, float, float]]:
+        return [
+            (group.group_id, channel_info.channel, channel_info.x, channel_info.y)
+            for group in self._groups
+            for channel_info in group.channels
+        ]
+
+    def _geometry_view(
+        self,
+        channels: list[tuple[int, int, float, float]],
+        *,
+        zoom: float | None = None,
+        pan: QPointF | None = None,
+    ) -> dict[str, float]:
+        zoom_value = self._zoom if zoom is None else zoom
+        pan_value = self._pan if pan is None else pan
+        margin = 22
+        title_height = 28
+        plot_rect = QRectF(
+            margin,
+            title_height + 8,
+            max(1, self.width() - 2 * margin),
+            max(1, self.height() - title_height - margin - 8),
+        )
+        xs = [x for _group_id, _channel, x, _y in channels]
+        ys = [y for _group_id, _channel, _x, y in channels]
+        x_min = min(xs)
+        x_max = max(xs)
+        y_min = min(ys)
+        y_max = max(ys)
+        x_range = max(1.0, x_max - x_min)
+        y_range = max(1.0, y_max - y_min)
+        x_pad = max(20.0, x_range * 0.04)
+        y_pad = max(20.0, y_range * 0.04)
+        x_min -= x_pad
+        x_max += x_pad
+        y_min -= y_pad
+        y_max += y_pad
+        x_range = max(1.0, x_max - x_min)
+        y_range = max(1.0, y_max - y_min)
+        scale = min(plot_rect.width() / x_range, plot_rect.height() / y_range) * zoom_value
+        draw_width = x_range * scale
+        draw_height = y_range * scale
+        x_origin = plot_rect.left() + (plot_rect.width() - draw_width) / 2 + pan_value.x()
+        y_origin = plot_rect.top() + (plot_rect.height() - draw_height) / 2 + pan_value.y()
+        return {
+            "x_min": x_min,
+            "y_min": y_min,
+            "scale": scale,
+            "draw_width": draw_width,
+            "draw_height": draw_height,
+            "x_origin": x_origin,
+            "y_origin": y_origin,
+        }
+
+    def _to_canvas(self, x: float, y: float, view: dict[str, float]) -> QPointF:
+        px = view["x_origin"] + (x - view["x_min"]) * view["scale"]
+        py = view["y_origin"] + view["draw_height"] - (y - view["y_min"]) * view["scale"]
+        return QPointF(px, py)
+
+    def _region_color(self, label: str) -> str:
+        if not label:
+            return "#808080"
+        palette = [
+            "#80deea",
+            "#ffcc80",
+            "#a5d6a7",
+            "#f48fb1",
+            "#90caf9",
+            "#ce93d8",
+            "#fff59d",
+            "#bcaaa4",
+            "#b0bec5",
+            "#d1c4e9",
+        ]
+        labels = sorted({value for value in self._channel_regions.values() if value.strip()})
+        return palette[labels.index(label) % len(palette)] if label in labels else "#808080"
+
+
+class BrainRegionEditorDialog(QDialog):
+    def __init__(
+        self,
+        groups: list[AnatomicalChannelGroup],
+        channel_regions: dict[int, str],
+        default_save_path: Path,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit anatomical map")
+        self.resize(1280, 740)
+        self.setMinimumSize(1120, 680)
+        self.setStyleSheet(
+            """
+            QDialog { background: #101216; color: #d6dde8; }
+            QLabel { color: #d6dde8; }
+            QListWidget {
+                background: #151922;
+                color: #d6dde8;
+                border: 1px solid #303743;
+                selection-background-color: #31425f;
+            }
+            QPushButton {
+                background: #34373d;
+                color: #f0f3f7;
+                border: 1px solid #4b515b;
+                border-radius: 4px;
+                padding: 6px 10px;
+            }
+            QPushButton:hover { background: #404651; }
+            QPushButton:pressed { background: #2b3038; }
+            """
+        )
+        self.groups = groups
+        self.default_save_path = default_save_path
+        self.viewer = BrainRegionProbeWidget(groups, channel_regions)
+        self.region_list = QListWidget()
+        self.status = QLabel(f"Default save: {default_save_path}")
+        self.status.setWordWrap(True)
+
+        layout = QHBoxLayout(self)
+        left = QVBoxLayout()
+        left.addWidget(self.viewer, 1)
+
+        controls = QHBoxLayout()
+        assign_button = QPushButton("Assign Region")
+        assign_button.clicked.connect(self._assign_region)
+        clear_button = QPushButton("Clear Region")
+        clear_button.clicked.connect(self._clear_region)
+        help_button = QPushButton("Help")
+        help_button.clicked.connect(self._show_help)
+        controls.addWidget(assign_button)
+        controls.addWidget(clear_button)
+        controls.addWidget(help_button)
+        controls.addStretch(1)
+        left.addLayout(controls)
+        layout.addLayout(left, 1)
+
+        side = QVBoxLayout()
+        side.addWidget(QLabel("Assigned regions"))
+        side.addWidget(self.region_list, 1)
+        save_as = QPushButton("Save anatomical map as CSV")
+        save_as.clicked.connect(self._save_as_csv)
+        side.addWidget(save_as)
+        side.addWidget(self.status)
+        dialog_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
+        dialog_buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.accept)
+        dialog_buttons.rejected.connect(self.reject)
+        side.addWidget(dialog_buttons)
+        layout.addLayout(side)
+        self._refresh_region_list()
+
+    @property
+    def channel_regions(self) -> dict[int, str]:
+        return self.viewer.channel_regions
+
+    def _assign_region(self) -> None:
+        selected = self.viewer.selected_channels
+        if not selected:
+            return
+        value, ok = QInputDialog.getText(
+            self,
+            "Assign Region",
+            f"Region name for {len(selected)} selected channel(s)",
+        )
+        if not ok:
+            return
+        self.viewer.assign_region(value)
+        self._refresh_region_list()
+
+    def _clear_region(self) -> None:
+        if not self.viewer.selected_channels:
+            return
+        self.viewer.clear_region()
+        self._refresh_region_list()
+
+    def _refresh_region_list(self) -> None:
+        self.region_list.clear()
+        self.region_list.addItems(self.viewer.region_names())
+
+    def _save_as_csv(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save anatomical_map.csv",
+            str(self.default_save_path),
+            "CSV files (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        saved = save_anatomical_map_csv(path, self.groups, self.viewer.channel_regions)
+        self.status.setText(f"Saved anatomical map: {saved}")
+
+    def _show_help(self) -> None:
+        QMessageBox.information(
+            self,
+            "How to Use Brain Regions",
+            "\n".join(
+                [
+                    "Click a channel to select one channel.",
+                    "Ctrl+click to add or remove individual channels.",
+                    "Drag an empty area to select a block of channels.",
+                    "Assign Region writes the label to all selected channels.",
+                    "Save anatomical map as CSV writes the pyNeuroscope-compatible anatomical_map.csv.",
+                    "Displayed channel numbers are 0-based; saved CellExplorer channels are 1-based.",
+                ]
+            ),
+        )
 
 
 class CalibrationFrameCanvas(QWidget):
@@ -1000,6 +1433,8 @@ class MainWindow(QMainWindow):
         self._phy_process: QProcess | None = None
         self._phy_working_dir: Path | None = None
         self._phy_last_counts: dict[str, int] | None = None
+        self._cell_explorer_process: QProcess | None = None
+        self._cell_explorer_working_dir: Path | None = None
         self._phy_status_timer = QTimer(self)
         self._phy_status_timer.setInterval(30000)
         self._phy_status_timer.timeout.connect(self._append_phy_curation_status)
@@ -1014,6 +1449,7 @@ class MainWindow(QMainWindow):
         self._refresh_suspended = False
         self._last_chanmap_preview_key: tuple[Any, ...] | None = None
         self._chanmap_controls_dirty = False
+        self._channel_regions: dict[int, str] = {}
         self._behavior_dlc_files: list[Any] = []
         self._behavior_frame_canvases: dict[str, BehaviorFrameCanvas] = {}
         self._behavior_pixel_distances_by_folder: dict[str, float] = {}
@@ -1344,9 +1780,12 @@ class MainWindow(QMainWindow):
 
         manual_box = QGroupBox("Manual Curation")
         manual_layout = QHBoxLayout(manual_box)
-        self.run_phy = QPushButton("Run phy")
+        self.run_phy = QPushButton("Launch Phy")
         self.run_phy.clicked.connect(self._run_phy)
+        self.launch_cell_explorer = QPushButton("Run CellExplore postprocess")
+        self.launch_cell_explorer.clicked.connect(self._launch_cell_explorer)
         manual_layout.addWidget(self.run_phy)
+        manual_layout.addWidget(self.launch_cell_explorer)
         manual_layout.addStretch(1)
 
         layout.addWidget(self.ephys_tabs, 1)
@@ -1802,8 +2241,19 @@ class MainWindow(QMainWindow):
         chanmap_head = QLabel("chanMap Preview")
         chanmap_head.setObjectName("miniHead")
         self.chanmap_canvas = ChanMapCanvas()
+        anatomical_controls = QWidget()
+        anatomical_layout = QHBoxLayout(anatomical_controls)
+        anatomical_layout.setContentsMargins(6, 6, 6, 6)
+        anatomical_layout.setSpacing(6)
+        load_anatomical = QPushButton("Load anatomical map")
+        load_anatomical.clicked.connect(self._load_anatomical_map)
+        edit_anatomical = QPushButton("Edit anatomical map")
+        edit_anatomical.clicked.connect(self._edit_anatomical_map)
+        anatomical_layout.addWidget(load_anatomical)
+        anatomical_layout.addWidget(edit_anatomical)
         chanmap_layout.addWidget(chanmap_head)
         chanmap_layout.addWidget(self.chanmap_canvas, 1)
+        chanmap_layout.addWidget(anatomical_controls)
 
         behavior_panel = QFrame()
         behavior_panel.setObjectName("miniPanel")
@@ -2218,6 +2668,108 @@ class MainWindow(QMainWindow):
             return True
         except Exception:
             return False
+
+    def _current_chanmap_data(self) -> dict[str, Any] | None:
+        settings = self._collect_settings()
+        chanmap_path = settings.resolved_chanmap_path()
+        if chanmap_path is not None and chanmap_path.exists():
+            return loadmat(chanmap_path)
+        basepath = settings.basepath_path
+        if basepath is None:
+            return None
+        xml_path = basepath / f"{settings.basename}.xml"
+        if not xml_path.exists():
+            return None
+        return build_channel_map_data(
+            basepath=basepath,
+            basename=settings.basename,
+            reject_channels=settings.preprocess.reject_channels,
+            probe_assignments=settings.preprocess.probe_assignments,
+        )
+
+    def _current_anatomical_channel_groups(self) -> list[AnatomicalChannelGroup]:
+        data = self._current_chanmap_data()
+        if data is None:
+            return []
+        return channel_groups_from_chanmap_data(data)
+
+    def _default_anatomical_map_path(self) -> Path:
+        settings = self._collect_settings()
+        if settings.local_output_dir is not None:
+            return settings.local_output_dir / ANATOMICAL_MAP_FILENAME
+        basepath = settings.basepath_path
+        if basepath is not None:
+            return basepath / ANATOMICAL_MAP_FILENAME
+        return REPO_ROOT / ANATOMICAL_MAP_FILENAME
+
+    def _persist_anatomical_map_to_default(self) -> Path | None:
+        groups = self._current_anatomical_channel_groups()
+        if not groups:
+            return None
+        return save_anatomical_map_csv(self._default_anatomical_map_path(), groups, self._channel_regions)
+
+    def _persist_cell_explorer_chan_coords(self) -> Path | None:
+        settings = self._collect_settings()
+        output_dir = settings.local_output_dir
+        if output_dir is None or not settings.basename:
+            return None
+        data = self._current_chanmap_data()
+        if data is None:
+            return None
+        return save_cell_explorer_chan_coords(
+            chanmap_data=data,
+            output_dir=output_dir,
+            basename=settings.basename,
+        )
+
+    def _load_anatomical_map(self) -> None:
+        groups = self._current_anatomical_channel_groups()
+        if not groups:
+            QMessageBox.information(
+                self,
+                "Anatomical map",
+                "Generate or load a chanMap before loading an anatomical map.",
+            )
+            return
+        default = self._default_anatomical_map_path()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load anatomical_map.csv",
+            str(default),
+            "CSV files (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            self._channel_regions = load_anatomical_map_csv(path, groups)
+            saved = save_anatomical_map_csv(default, groups, self._channel_regions)
+        except AnatomicalMapError as exc:
+            QMessageBox.critical(self, "Anatomical map", str(exc))
+            return
+        self._append_log(f"Loaded anatomical map: {path}\n")
+        self._append_log(f"Saved anatomical map for CellExplorer: {saved}\n")
+
+    def _edit_anatomical_map(self) -> None:
+        groups = self._current_anatomical_channel_groups()
+        if not groups:
+            QMessageBox.information(
+                self,
+                "Anatomical map",
+                "Generate or load a chanMap before editing an anatomical map.",
+            )
+            return
+        default = self._default_anatomical_map_path()
+        if not self._channel_regions and default.exists():
+            try:
+                self._channel_regions = load_anatomical_map_csv(default, groups)
+            except AnatomicalMapError:
+                self._channel_regions = {}
+        dialog = BrainRegionEditorDialog(groups, self._channel_regions, default, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._channel_regions = dialog.channel_regions
+        saved = save_anatomical_map_csv(default, groups, self._channel_regions)
+        self._append_log(f"Saved anatomical map for CellExplorer: {saved}\n")
 
     def _select_directory(self, title: str, start: str) -> str:
         dialog = QFileDialog(self, title, start or str(Path.cwd()))
@@ -3293,6 +3845,171 @@ class MainWindow(QMainWindow):
     def _phy_is_running(self) -> bool:
         return self._phy_process is not None and self._phy_process.state() != QProcess.ProcessState.NotRunning
 
+    def _cell_explorer_is_running(self) -> bool:
+        return (
+            self._cell_explorer_process is not None
+            and self._cell_explorer_process.state() != QProcess.ProcessState.NotRunning
+        )
+
+    def _resolve_matlab_program(self, settings: PipelineGuiSettings) -> str:
+        from src.preprocess.sorter_runner import _resolve_matlab_cmd
+
+        matlab_text = settings.preprocess.matlab_path.strip()
+        matlab_cmd = _resolve_matlab_cmd(Path(matlab_text).expanduser() if matlab_text else None)
+        if matlab_cmd is None:
+            raise FileNotFoundError(
+                "Could not find MATLAB. Set Preprocess > MATLAB path or add matlab to PATH."
+            )
+        return matlab_cmd
+
+    def _resolve_cell_explorer_sorting_dir(self, settings: PipelineGuiSettings) -> Path:
+        sorting_folder = settings.postprocess_sorting_folder()
+        if sorting_folder is None:
+            raise FileNotFoundError(
+                "No sorting folder could be resolved. Run sorting/postprocess first or set Postprocess target > sorting folder."
+            )
+        return self._resolve_phy_params_path(sorting_folder).parent
+
+    @staticmethod
+    def _matlab_string(value: Path | str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _read_cell_explorer_stdout(self) -> None:
+        process = self._cell_explorer_process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardOutput()).decode(errors="replace")
+        self._queue_log(text)
+
+    def _read_cell_explorer_stderr(self) -> None:
+        process = self._cell_explorer_process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardError()).decode(errors="replace")
+        self._queue_log(text)
+
+    def _cell_explorer_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        self._flush_log_buffer()
+        self._append_log(f"\n=== CellExplorer MATLAB process closed (exit code {exit_code}) ===\n")
+        self._cell_explorer_process = None
+        self._cell_explorer_working_dir = None
+        if self._process is None or self._process.state() == QProcess.ProcessState.NotRunning:
+            self.launch_cell_explorer.setEnabled(True)
+            if not self._phy_is_running():
+                self.run_phy.setEnabled(True)
+
+    def _cell_explorer_error_occurred(self, error: QProcess.ProcessError) -> None:
+        self._cell_explorer_process = None
+        self._cell_explorer_working_dir = None
+        if self._process is None or self._process.state() == QProcess.ProcessState.NotRunning:
+            self.launch_cell_explorer.setEnabled(True)
+        QMessageBox.critical(
+            self,
+            "Run CellExplore postprocess failed",
+            f"MATLAB process failed to start: {error.name}",
+        )
+
+    def _terminate_cell_explorer_process(self) -> None:
+        process = self._cell_explorer_process
+        if process is None or process.state() == QProcess.ProcessState.NotRunning:
+            self._cell_explorer_process = None
+            self._cell_explorer_working_dir = None
+            return
+        pid = int(process.processId())
+        if os.name == "nt" and pid > 0:
+            QProcess.startDetached("taskkill", ["/PID", str(pid), "/T", "/F"])
+        elif pid > 0:
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                process.terminate()
+        else:
+            process.terminate()
+        if not process.waitForFinished(3000):
+            process.kill()
+            process.waitForFinished(2000)
+        self._cell_explorer_process = None
+        self._cell_explorer_working_dir = None
+
+    def _launch_cell_explorer(self) -> None:
+        if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.warning(self, "Run active", "Cannot run CellExplore postprocess while a pipeline job is running.")
+            return
+        if self._phy_is_running():
+            QMessageBox.warning(self, "Phy active", "Close Phy before launching CellExplorer.")
+            return
+        if self._cell_explorer_is_running():
+            QMessageBox.warning(self, "CellExplorer active", "A CellExplorer MATLAB process is already running.")
+            return
+        try:
+            settings = self._collect_settings()
+            basepath = settings.local_output_dir
+            source_basepath = settings.basepath_path
+            if basepath is None or not settings.basename:
+                raise ValueError("Local output directory cannot be resolved.")
+            if source_basepath is None:
+                raise ValueError("Basepath is required.")
+            if not basepath.exists():
+                raise FileNotFoundError(f"Local output directory does not exist: {basepath}")
+            if not VENDORED_CELLEXPLORER_ROOT.exists():
+                raise FileNotFoundError(f"Vendored CellExplorer not found: {VENDORED_CELLEXPLORER_ROOT}")
+            wrapper_path = MATLAB_SUPPORT_ROOT / "run_cell_explorer_processing.m"
+            if not wrapper_path.exists():
+                raise FileNotFoundError(f"CellExplorer MATLAB wrapper not found: {wrapper_path}")
+            sorting_dir = self._resolve_cell_explorer_sorting_dir(settings)
+            matlab_program = self._resolve_matlab_program(settings)
+            if self._channel_regions:
+                saved = self._persist_anatomical_map_to_default()
+                if saved is not None:
+                    self._append_log(f"Saved anatomical map for CellExplorer: {saved}\n")
+            chan_coords_path = self._persist_cell_explorer_chan_coords()
+            if chan_coords_path is not None:
+                self._append_log(f"Saved chanCoords for CellExplorer: {chan_coords_path}\n")
+
+            addpath_arg = self._matlab_string(MATLAB_SUPPORT_ROOT)
+            args = [
+                self._matlab_string(basepath),
+                self._matlab_string(source_basepath),
+                self._matlab_string(sorting_dir),
+                self._matlab_string(VENDORED_CELLEXPLORER_ROOT),
+            ]
+            matlab_command = (
+                "try, "
+                f"addpath({addpath_arg}); "
+                f"run_cell_explorer_processing({', '.join(args)}, "
+                "'preferMergePointsDat', true, 'prePhy', false); "
+                "exit(0); "
+                "catch ME, disp(getReport(ME, 'extended', 'hyperlinks', 'off')); exit(1); end"
+            )
+            self._append_log("\n=== Running CellExplore postprocess ===\n")
+            self._append_log(f"MATLAB: {matlab_program}\n")
+            self._append_log(f"Working directory: {basepath}\n")
+            self._append_log(f"CellExplorer root: {VENDORED_CELLEXPLORER_ROOT}\n")
+            self._append_log(f"Sorting folder: {sorting_dir}\n")
+
+            process = QProcess(self)
+            process.setProgram(matlab_program)
+            process.setArguments(["-nosplash", "-r", matlab_command])
+            process.setWorkingDirectory(str(basepath))
+            process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+            if os.name != "nt" and hasattr(process, "setChildProcessModifier"):
+                process.setChildProcessModifier(os.setsid)
+            process.readyReadStandardOutput.connect(self._read_cell_explorer_stdout)
+            process.readyReadStandardError.connect(self._read_cell_explorer_stderr)
+            process.finished.connect(self._cell_explorer_finished)
+            process.errorOccurred.connect(self._cell_explorer_error_occurred)
+            self._cell_explorer_process = process
+            self._cell_explorer_working_dir = basepath
+            self.launch_cell_explorer.setEnabled(False)
+            self.run_phy.setEnabled(False)
+            process.start()
+            if not process.waitForStarted(5000):
+                self._cell_explorer_error_occurred(process.error())
+        except Exception as exc:
+            QMessageBox.critical(self, "Run CellExplore postprocess failed", str(exc))
+
     def _format_seconds(self, total_seconds: float) -> str:
         total_seconds = max(0.0, float(total_seconds))
         hours = int(total_seconds // 3600)
@@ -3406,6 +4123,8 @@ class MainWindow(QMainWindow):
         self._phy_last_counts = None
         if self._process is None or self._process.state() == QProcess.ProcessState.NotRunning:
             self.run_phy.setEnabled(True)
+            if not self._cell_explorer_is_running():
+                self.launch_cell_explorer.setEnabled(True)
 
     def _phy_error_occurred(self, error: QProcess.ProcessError) -> None:
         self._phy_status_timer.stop()
@@ -3414,6 +4133,8 @@ class MainWindow(QMainWindow):
         self._phy_last_counts = None
         if self._process is None or self._process.state() == QProcess.ProcessState.NotRunning:
             self.run_phy.setEnabled(True)
+            if not self._cell_explorer_is_running():
+                self.launch_cell_explorer.setEnabled(True)
         QMessageBox.critical(self, "Run phy failed", f"Phy process failed to start: {error.name}")
 
     def _run_phy(self) -> None:
@@ -3674,6 +4395,20 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        if self._cell_explorer_is_running():
+            dialog = QMessageBox(self)
+            dialog.setIcon(QMessageBox.Icon.Warning)
+            dialog.setWindowTitle("CellExplorer active")
+            dialog.setText("A CellExplorer MATLAB process is still running.")
+            terminate_button = dialog.addButton("Terminate and close", QMessageBox.ButtonRole.DestructiveRole)
+            dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            dialog.setDefaultButton(terminate_button)
+            dialog.exec()
+            if dialog.clickedButton() is not terminate_button:
+                event.ignore()
+                return
+            self._terminate_cell_explorer_process()
+            self._append_log("\n=== Terminated CellExplorer MATLAB process while closing GUI ===\n")
         super().closeEvent(event)
 
     def _set_running(self, running: bool) -> None:
@@ -3682,6 +4417,7 @@ class MainWindow(QMainWindow):
             self.run_pre,
             self.run_post,
             self.run_phy,
+            self.launch_cell_explorer,
             self.run_noise_label,
             self.run_behavior_cleanup,
             self.run_behavior,
@@ -3689,6 +4425,9 @@ class MainWindow(QMainWindow):
         ]:
             button.setEnabled(not running)
         if self._phy_is_running():
+            self.run_phy.setEnabled(False)
+        if self._cell_explorer_is_running():
+            self.launch_cell_explorer.setEnabled(False)
             self.run_phy.setEnabled(False)
         self.force_stop.setEnabled(running)
 

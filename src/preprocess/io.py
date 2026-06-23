@@ -569,6 +569,42 @@ def create_channel_map(
     return out_file
 
 
+def save_cell_explorer_chan_coords(
+    *,
+    chanmap_data: dict,
+    output_dir: Path | str,
+    basename: str,
+    source: str = "PreprocessPipeline chanMap.mat",
+) -> Path:
+    chan_map = np.asarray(chanmap_data["chanMap"]).reshape(-1).astype(int)
+    xcoords = np.asarray(chanmap_data["xcoords"]).reshape(-1).astype(float)
+    ycoords = np.asarray(chanmap_data["ycoords"]).reshape(-1).astype(float)
+    n = min(len(chan_map), len(xcoords), len(ycoords))
+    if n == 0:
+        raise ValueError("Cannot write chanCoords: chanMap has no channels.")
+
+    n_channels = int(np.nanmax(chan_map[:n]))
+    x = np.full((n_channels, 1), np.nan, dtype=float)
+    y = np.full((n_channels, 1), np.nan, dtype=float)
+    for channel_1based, x_value, y_value in zip(chan_map[:n], xcoords[:n], ycoords[:n]):
+        channel = int(channel_1based)
+        if 1 <= channel <= n_channels:
+            x[channel - 1, 0] = float(x_value)
+            y[channel - 1, 0] = float(y_value)
+
+    chan_coords = {
+        "x": x,
+        "y": y,
+        "source": source,
+        "layout": "custom",
+        "shankSpacing": np.asarray([[np.nan]], dtype=float),
+        "verticalSpacing": np.asarray([[np.nan]], dtype=float),
+    }
+    output_path = Path(output_dir) / f"{basename}.chanCoords.channelInfo.mat"
+    savemat(output_path, {"chanCoords": chan_coords}, do_compression=True)
+    return output_path
+
+
 def prepare_chanmap(
     *,
     basepath: Path,
@@ -588,6 +624,11 @@ def prepare_chanmap(
         raise RuntimeError("Failed to create chanMap.mat")
 
     chan = loadmat(chanmap_path)
+    save_cell_explorer_chan_coords(
+        chanmap_data=chan,
+        output_dir=local_output_dir,
+        basename=basename,
+    )
     connected = np.asarray(chan["connected"]).flatten().astype(int)
     device_ch_inds = np.asarray(chan.get("chanMap0ind", np.asarray(chan["chanMap"]).flatten() - 1)).flatten().astype(int)
     n = min(connected.size, device_ch_inds.size)

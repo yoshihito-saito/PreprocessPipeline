@@ -366,12 +366,13 @@ end
 
 segments = repmat(struct('foldername','','datFile','','startSample',0,'endSample',0,'nSamples',0,'fileNChannels',0,'dataChannels',[],'excludedChannels',[],'sourceType',''),1,numel(foldernames));
 for i = 1:numel(foldernames)
-    foldername = foldernames{i};
-    datPath = fullfile(basepath,foldername,'amplifier.dat');
+    foldername = localEpochNameFromPath(foldernames{i});
+    epochDir = resolveMergePointEpochDir(basepath,foldernames{i});
+    datPath = fullfile(epochDir,'amplifier.dat');
     if ~exist(datPath,'file')
-        datPath = findOpenEphysContinuousDat(fullfile(basepath,foldername));
+        datPath = findOpenEphysContinuousDat(epochDir);
         if isempty(datPath)
-            error('Expected amplifier.dat or Open Ephys continuous.dat for MergePoints segment is missing: %s',fullfile(basepath,foldername))
+            error('Expected amplifier.dat or Open Ephys continuous.dat for MergePoints segment is missing: %s',epochDir)
         end
         sourceType = 'Open Ephys continuous.dat';
     else
@@ -382,18 +383,21 @@ for i = 1:numel(foldernames)
     if expectedSamples <= 0
         error('Invalid MergePoints sample range for %s: start=%d, stop=%d.',foldername,starts(i),stops(i))
     end
-    fileNChannels = fileInfo.bytes/(sampleBytes*expectedSamples);
-    if abs(fileNChannels - round(fileNChannels)) > 1e-9
+    candidateSamples = unique([expectedSamples, expectedSamples + 1, expectedSamples - 1],'stable');
+    candidateSamples = candidateSamples(candidateSamples > 0);
+    candidateNChannels = fileInfo.bytes ./ (sampleBytes * candidateSamples);
+    isIntegerChannelCount = abs(candidateNChannels - round(candidateNChannels)) <= 1e-9;
+    isUsableChannelCount = isIntegerChannelCount & round(candidateNChannels) >= nChannels;
+    if ~any(isUsableChannelCount)
         error('Could not infer an integer channel count for %s from MergePoints samples (%d) and file size (%d bytes).',datPath,expectedSamples,fileInfo.bytes)
     end
-    fileNChannels = round(fileNChannels);
-    if fileNChannels < nChannels
-        error('Channel count mismatch for %s: file has %d channels but session expects %d.',datPath,fileNChannels,nChannels)
-    end
+    bestIdx = find(isUsableChannelCount,1,'first');
+    expectedSamples = candidateSamples(bestIdx);
+    fileNChannels = round(candidateNChannels(bestIdx));
     segments(i).foldername = foldername;
     segments(i).datFile = datPath;
     segments(i).startSample = starts(i);
-    segments(i).endSample = stops(i);
+    segments(i).endSample = starts(i) + expectedSamples;
     segments(i).nSamples = expectedSamples;
     segments(i).fileNChannels = fileNChannels;
     segments(i).dataChannels = 1:nChannels;
@@ -404,7 +408,7 @@ end
 waveformSource.mode = 'mergepoints';
 waveformSource.segments = segments;
 waveformSource.precision = precision;
-duration = stops(end)/sr;
+duration = max([segments.endSample])/sr;
 sourceTypes = unique({segments.sourceType});
 if numel(sourceTypes) == 1 && strcmp(sourceTypes{1},'amplifier.dat')
     waveformSourceLabel = 'MergePoints amplifier.dat files';
@@ -506,6 +510,31 @@ if ~isempty(idx)
 end
 
 foundFile = fullPaths{1};
+end
+
+function epochDir = resolveMergePointEpochDir(basepath,foldername)
+localFolderName = localEpochNameFromPath(foldername);
+candidates = {
+    fullfile(basepath,localFolderName), ...
+    fullfile(basepath,char(foldername)), ...
+    char(foldername)};
+for i = 1:numel(candidates)
+    if exist(candidates{i},'dir')
+        epochDir = candidates{i};
+        return
+    end
+end
+epochDir = fullfile(basepath,localFolderName);
+end
+
+function epochName = localEpochNameFromPath(foldername)
+foldername = char(foldername);
+parts = regexp(strrep(foldername,'\','/'),'[^/]+','match');
+if isempty(parts)
+    epochName = foldername;
+else
+    epochName = parts{end};
+end
 end
 
 function sampleBytes = getPrecisionBytes(precision)

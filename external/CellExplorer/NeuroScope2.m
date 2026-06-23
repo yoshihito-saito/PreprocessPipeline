@@ -7824,7 +7824,11 @@ end
                 expectedSamples = round((epoch.stopTime - epoch.startTime) * sr);
             end
 
-            [fileNChannels(i), dataChannels{i}, excludedChannels{i}] = inferSubEpochChannels(foundFile, expectedSamples, nChannels, sampleBytes);
+            [fileNChannels(i), dataChannels{i}, excludedChannels{i}, fileNSamples] = inferSubEpochChannels(foundFile, expectedSamples, nChannels, sampleBytes);
+            if ~isempty(fileNSamples) && ~isempty(expectedSamples)
+                stopTimes(i) = startTimes(i) + fileNSamples / sr;
+                lastStopTime = stopTimes(i);
+            end
             found_any = true;
         end
 
@@ -8035,22 +8039,38 @@ end
         for ii = 1:numel(foldernames)
             fieldName = matlab.lang.makeValidName(foldernames{ii});
             mergePointSamples.(fieldName) = double(MergePoints.timestamps_samples(ii,:));
+            localFieldName = matlab.lang.makeValidName(localEpochNameFromPath(foldernames{ii}));
+            mergePointSamples.(localFieldName) = double(MergePoints.timestamps_samples(ii,:));
         end
     end
 
-    function [fileNChannels, dataChannels, excludedChannels] = inferSubEpochChannels(filename, expectedSamples, nChannels, sampleBytes)
+    function epochName = localEpochNameFromPath(foldername)
+        foldername = char(foldername);
+        parts = regexp(strrep(foldername, '\', '/'), '[^/]+', 'match');
+        if isempty(parts)
+            epochName = foldername;
+        else
+            epochName = parts{end};
+        end
+    end
+
+    function [fileNChannels, dataChannels, excludedChannels, fileNSamples] = inferSubEpochChannels(filename, expectedSamples, nChannels, sampleBytes)
+        fileInfo = dir(filename);
         if isempty(expectedSamples)
             fileNChannels = nChannels;
+            fileNSamples = fileInfo.bytes / (fileNChannels * sampleBytes);
         else
-            fileInfo = dir(filename);
-            fileNChannels = fileInfo.bytes / (expectedSamples * sampleBytes);
-            if abs(fileNChannels - round(fileNChannels)) > 1e-9
+            candidateSamples = unique([expectedSamples, expectedSamples + 1, expectedSamples - 1], 'stable');
+            candidateSamples = candidateSamples(candidateSamples > 0);
+            candidateNChannels = fileInfo.bytes ./ (candidateSamples * sampleBytes);
+            isIntegerChannelCount = abs(candidateNChannels - round(candidateNChannels)) <= 1e-9;
+            isUsableChannelCount = isIntegerChannelCount & round(candidateNChannels) >= nChannels;
+            if ~any(isUsableChannelCount)
                 error('NeuroScope2: Could not infer integer channel count for %s from %d samples and %d bytes.', filename, expectedSamples, fileInfo.bytes)
             end
-            fileNChannels = round(fileNChannels);
-            if fileNChannels < nChannels
-                error('NeuroScope2: File %s has %d channels but session expects %d.', filename, fileNChannels, nChannels)
-            end
+            bestIdx = find(isUsableChannelCount, 1, 'first');
+            fileNSamples = candidateSamples(bestIdx);
+            fileNChannels = round(candidateNChannels(bestIdx));
         end
         dataChannels = 1:nChannels;
         excludedChannels = nChannels+1:fileNChannels;

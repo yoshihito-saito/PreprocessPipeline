@@ -4,7 +4,8 @@ This directory contains the ayalab1 CellExplorer working tree vendored for
 PreprocessPipeline MATLAB integration.
 
 - Source repository: https://github.com/ayalab1/CellExplorer
-- Vendored commit: `b7e9314bcb3b909fcfaf03e7d614a32cf1cacbba`
+- Vendored commit: `31ef26f9818b260a27273860f529ae40efa5b803`
+- Upstream summary: `Merge pull request #25 from ayalab1/fix-mergepoints-waveform-fallback`
 - Vendored on: 2026-06-23
 - Local integration branch: `feature/integrating-cellexplore`
 
