@@ -1945,6 +1945,10 @@ class MainWindow(QMainWindow):
         self.sorter.addItems(["Kilosort", "Kilosort2_5", "kilosort4", "disabled"])
         self.sorter.currentTextChanged.connect(self._sorter_changed)
         self.run_sorter.toggled.connect(self._update_sorter_enabled)
+        self.sorter_partition_mode = NoWheelComboBox()
+        self.sorter_partition_mode.addItem("All channels", "all")
+        self.sorter_partition_mode.addItem("Each probe", "probe")
+        self.sorter_partition_mode.addItem("Each shank", "shank")
         self.sorter_path = QLineEdit()
         self.sorter_config_path = QLineEdit()
         self.matlab_path = QLineEdit()
@@ -1960,6 +1964,7 @@ class MainWindow(QMainWindow):
         self.sorter_worker_count = self._worker_spin()
         sf.addRow(self.run_sorter)
         sf.addRow("Sorter", self.sorter)
+        sf.addRow("Run sorter on", self.sorter_partition_mode)
         sf.addRow("Sorter path", self.sorter_path)
         sf.addRow("Sorter config", sorter_config_row)
         sf.addRow("MATLAB path", self.matlab_path)
@@ -3443,6 +3448,7 @@ class MainWindow(QMainWindow):
         enabled = self.run_sorter.isChecked()
         for widget in [
             self.sorter,
+            self.sorter_partition_mode,
             self.sorter_path,
             self.sorter_config_path,
             self.open_sorter_config,
@@ -3499,6 +3505,7 @@ class MainWindow(QMainWindow):
             probe_assignments=self._probe_rows_to_assignments(),
             run_sorter=self.run_sorter.isChecked(),
             sorter=self.sorter.currentText(),
+            sorter_partition_mode=str(self.sorter_partition_mode.currentData() or "all"),
             matlab_path=self.matlab_path.text().strip(),
             preprocess_worker_count=normalize_worker_count(self.preprocess_worker_count.value()),
             sorter_worker_count=normalize_worker_count(self.sorter_worker_count.value()),
@@ -3600,6 +3607,8 @@ class MainWindow(QMainWindow):
             self._chanmap_controls_dirty = False
             self.run_sorter.setChecked(p.run_sorter and (p.sorter or "disabled") != "disabled")
             self.sorter.setCurrentText(p.sorter or "disabled")
+            partition_index = self.sorter_partition_mode.findData(getattr(p, "sorter_partition_mode", "all"))
+            self.sorter_partition_mode.setCurrentIndex(partition_index if partition_index >= 0 else 0)
             default_sorter_path, default_sorter_config = self._current_sorter_defaults()
             self.sorter_path.setText(p.sorter_path or default_sorter_path)
             self.sorter_config_path.setText(p.sorter_config_path or default_sorter_config)
@@ -3870,9 +3879,65 @@ class MainWindow(QMainWindow):
             )
         return self._resolve_phy_params_path(sorting_folder).parent
 
+    def _resolve_cell_explorer_sorting_dirs(self, settings: PipelineGuiSettings) -> list[Path]:
+        explicit = settings.postprocess.sorting_phy_folder.strip()
+        if explicit:
+            return [self._resolve_cell_explorer_sorting_dir(settings)]
+
+        roots = [
+            _path
+            for _path in (
+                settings.local_output_dir,
+                Path(settings.postprocess.sorting_search_root).expanduser()
+                if settings.postprocess.sorting_search_root.strip()
+                else None,
+            )
+            if _path is not None and _path.exists()
+        ]
+        for root in roots:
+            manifest_path = root / "sorter_partition_manifest.json"
+            if not manifest_path.exists():
+                continue
+            try:
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                folders = []
+                for partition in payload.get("partitions", []):
+                    folder_text = str(partition.get("output_folder") or "").strip()
+                    if not folder_text:
+                        continue
+                    folder = Path(folder_text).expanduser()
+                    if folder.exists():
+                        folders.append(self._resolve_phy_params_path(folder).parent)
+                unique = []
+                seen = set()
+                for folder in folders:
+                    key = str(folder.resolve())
+                    if key not in seen:
+                        unique.append(folder)
+                        seen.add(key)
+                if unique:
+                    return unique
+            except Exception as exc:
+                self._append_warning_log(f"[WARN] Failed to read sorter partition manifest {manifest_path}: {exc}\n")
+
+        candidates: list[Path] = []
+        for root in roots:
+            for pattern in ("Kilosort_*", "Kilosort2_5_*", "Kilosort2.5_*", "Kilosort4_*"):
+                for candidate in root.glob(pattern):
+                    if candidate.is_dir() and not candidate.name.endswith("_spi"):
+                        candidates.append(candidate)
+        if candidates:
+            ordered = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+            return [self._resolve_phy_params_path(path).parent for path in ordered]
+        return [self._resolve_cell_explorer_sorting_dir(settings)]
+
     @staticmethod
     def _matlab_string(value: Path | str) -> str:
         return "'" + str(value).replace("'", "''") + "'"
+
+    @classmethod
+    def _matlab_cellstr(cls, values: list[Path]) -> str:
+        return "{" + ", ".join(cls._matlab_string(value) for value in values) + "}"
 
     def _read_cell_explorer_stdout(self) -> None:
         process = self._cell_explorer_process
@@ -3958,7 +4023,7 @@ class MainWindow(QMainWindow):
             wrapper_path = MATLAB_SUPPORT_ROOT / "run_cell_explorer_processing.m"
             if not wrapper_path.exists():
                 raise FileNotFoundError(f"CellExplorer MATLAB wrapper not found: {wrapper_path}")
-            sorting_dir = self._resolve_cell_explorer_sorting_dir(settings)
+            sorting_dirs = self._resolve_cell_explorer_sorting_dirs(settings)
             matlab_program = self._resolve_matlab_program(settings)
             if self._channel_regions:
                 saved = self._persist_anatomical_map_to_default()
@@ -3972,7 +4037,7 @@ class MainWindow(QMainWindow):
             args = [
                 self._matlab_string(basepath),
                 self._matlab_string(source_basepath),
-                self._matlab_string(sorting_dir),
+                self._matlab_cellstr(sorting_dirs),
                 self._matlab_string(VENDORED_CELLEXPLORER_ROOT),
             ]
             matlab_command = (
@@ -3987,7 +4052,9 @@ class MainWindow(QMainWindow):
             self._append_log(f"MATLAB: {matlab_program}\n")
             self._append_log(f"Working directory: {basepath}\n")
             self._append_log(f"CellExplorer root: {VENDORED_CELLEXPLORER_ROOT}\n")
-            self._append_log(f"Sorting folder: {sorting_dir}\n")
+            self._append_log(
+                "Sorting folders:\n" + "".join(f"  - {path}\n" for path in sorting_dirs)
+            )
 
             process = QProcess(self)
             process.setProgram(matlab_program)
@@ -4309,8 +4376,17 @@ class MainWindow(QMainWindow):
             if self._process_result:
                 pre_result = self._process_result.get("preprocess_result") or {}
                 sorter_output = pre_result.get("sorter_output_dir")
+                sorter_outputs = pre_result.get("sorter_output_dirs") or []
                 if sorter_output:
                     self.sorting_phy_folder.setText(sorter_output)
+                elif len(sorter_outputs) > 1:
+                    self.sorting_phy_folder.clear()
+                    local_output_dir = pre_result.get("local_output_dir")
+                    if local_output_dir:
+                        self.sorting_search_root.setText(local_output_dir)
+                    self._append_log(
+                        "Multiple sorter folders were created; postprocess will use the sorting search root.\n"
+                    )
                 self._cleanup_postprocess_caches_from_result(self._process_result)
         else:
             self._append_log("\n=== Run failed ===\n")

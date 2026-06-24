@@ -21,7 +21,11 @@ def _postprocess_config_from_preprocess_result(
     pre_result: Any,
 ) -> PostprocessConfig:
     post_config = settings.to_postprocess_config()
-    post_config.sorting_phy_folder = pre_result.sorter_output_dir or post_config.sorting_phy_folder
+    sorter_output_dirs = list(getattr(pre_result, "sorter_output_dirs", []) or [])
+    if len(sorter_output_dirs) > 1:
+        post_config.sorting_phy_folder = None
+    else:
+        post_config.sorting_phy_folder = pre_result.sorter_output_dir or post_config.sorting_phy_folder
     post_config.sorting_search_root = pre_result.local_output_dir
     post_config.dat_path = pre_result.dat_path
     post_config.sampling_frequency = pre_result.sr
@@ -58,6 +62,14 @@ def run_pipeline(settings: PipelineGuiSettings, mode: RunMode) -> dict[str, Any]
         pre_result = run_preprocess_session(settings.to_preprocess_config())
         payload["preprocess_result"] = {
             "sorter_output_dir": str(pre_result.sorter_output_dir) if pre_result.sorter_output_dir else "",
+            "sorter_output_dirs": [
+                str(path) for path in getattr(pre_result, "sorter_output_dirs", []) or []
+            ],
+            "sorter_partition_manifest_path": (
+                str(pre_result.sorter_partition_manifest_path)
+                if getattr(pre_result, "sorter_partition_manifest_path", None)
+                else ""
+            ),
             "local_output_dir": str(pre_result.local_output_dir),
             "dat_path": str(pre_result.dat_path) if pre_result.dat_path else "",
         }

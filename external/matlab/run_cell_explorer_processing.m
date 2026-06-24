@@ -8,7 +8,7 @@ function run_cell_explorer_processing(basepath, sourceBasepath, sortingFolder, c
 p = inputParser;
 addRequired(p, 'basepath', @ischar);
 addRequired(p, 'sourceBasepath', @ischar);
-addRequired(p, 'sortingFolder', @ischar);
+addRequired(p, 'sortingFolder', @(x) ischar(x) || isstring(x) || iscell(x));
 addRequired(p, 'cellExplorerRoot', @ischar);
 addParameter(p, 'preferMergePointsDat', true, @islogical);
 addParameter(p, 'prePhy', false, @islogical);
@@ -17,7 +17,7 @@ parse(p, basepath, sourceBasepath, sortingFolder, cellExplorerRoot, varargin{:})
 
 basepath = char(p.Results.basepath);
 sourceBasepath = char(p.Results.sourceBasepath);
-sortingFolder = char(p.Results.sortingFolder);
+sortingFolders = normalize_sorting_folders(p.Results.sortingFolder);
 cellExplorerRoot = char(p.Results.cellExplorerRoot);
 preferMergePointsDat = p.Results.preferMergePointsDat;
 prePhy = p.Results.prePhy;
@@ -29,8 +29,10 @@ end
 if ~isfolder(sourceBasepath)
     error('Source basepath does not exist: %s', sourceBasepath);
 end
-if ~isfolder(sortingFolder)
-    error('Sorting folder does not exist: %s', sortingFolder);
+for i = 1:numel(sortingFolders)
+    if ~isfolder(sortingFolders{i})
+        error('Sorting folder does not exist: %s', sortingFolders{i});
+    end
 end
 if ~isfolder(cellExplorerRoot)
     error('Vendored CellExplorer root does not exist: %s', cellExplorerRoot);
@@ -65,7 +67,7 @@ else
     save(sessionFile, 'session');
 end
 
-session = configure_session_for_cell_explorer(session, basepath, basename, sortingFolder);
+session = configure_session_for_cell_explorer(session, basepath, basename, sortingFolders);
 if preferMergePointsDat
     normalize_mergepoints_to_source(basepath, sourceBasepath, basename);
     session.extracellular.fileName = fullfile(basepath, [basename, '.force_mergepoints.dat']);
@@ -78,22 +80,23 @@ if exist('statusExit', 'var') && isequal(statusExit, 0)
     error('gui_session was cancelled. CellExplorer processing was not run.');
 end
 
-session = configure_session_for_cell_explorer(session, basepath, basename, sortingFolder);
+session = configure_session_for_cell_explorer(session, basepath, basename, sortingFolders);
 if preferMergePointsDat
     session.extracellular.fileName = fullfile(basepath, [basename, '.force_mergepoints.dat']);
 end
 session = apply_anatomical_map_csv(session, fullfile(basepath, 'anatomical_map.csv'));
 save(sessionFile, 'session');
 
-relativeSortingPath = session.spikeSorting{1}.relativePath;
 if prePhy
-    spikes = loadSpikes( ...
+    spikes = load_spikes_from_sorting_folders( ...
         'session', session, ...
-        'clusteringpath', relativeSortingPath, ...
+        'sortingFolders', sortingFolders, ...
+        'basepath', basepath, ...
         'labelsToRead', spikeLabels, ...
         'getWaveformsFromDat', false, ...
         'forceReload', true, ...
-        'saveMat', true);
+        'saveMat', false);
+    save(fullfile(basepath, [basename, '.unsorted.spikes.cellinfo.mat']), 'spikes');
     cell_metrics = ProcessCellMetrics( ...
         'session', session, ...
         'spikes', spikes, ...
@@ -104,12 +107,14 @@ if prePhy
         'excludeMetrics', {'deepSuperficial', 'monoSynaptic_connections'}, ...
         'saveAs', 'unsorted.cell_metrics');
 else
-    spikes = loadSpikes( ...
+    spikes = load_spikes_from_sorting_folders( ...
         'session', session, ...
-        'clusteringpath', relativeSortingPath, ...
+        'sortingFolders', sortingFolders, ...
+        'basepath', basepath, ...
         'labelsToRead', spikeLabels, ...
         'forceReload', true, ...
-        'saveMat', true);
+        'saveMat', false);
+    save(fullfile(basepath, [basename, '.spikes.cellinfo.mat']), 'spikes');
     cell_metrics = ProcessCellMetrics( ...
         'session', session, ...
         'spikes', spikes, ...
@@ -119,6 +124,24 @@ end
 
 save(sessionFile, 'session');
 launch_cell_explorer_gui(basepath, basename, cell_metrics);
+end
+
+function sortingFolders = normalize_sorting_folders(value)
+if ischar(value) || isstring(value)
+    sortingFolders = cellstr(value);
+elseif iscell(value)
+    sortingFolders = value;
+else
+    error('sortingFolder must be a char, string, or cell array.');
+end
+sortingFolders = sortingFolders(:)';
+sortingFolders = sortingFolders(~cellfun(@isempty, sortingFolders));
+for i = 1:numel(sortingFolders)
+    sortingFolders{i} = char(sortingFolders{i});
+end
+if isempty(sortingFolders)
+    error('At least one sorting folder is required.');
+end
 end
 
 function ensure_cell_explorer_mex(cellExplorerRoot)
@@ -177,29 +200,112 @@ drawnow;
 cell_metrics = CellExplorer('basepath', basepath); %#ok<NASGU>
 end
 
-function session = configure_session_for_cell_explorer(session, basepath, basename, sortingFolder)
+function spikes = load_spikes_from_sorting_folders(varargin)
+p = inputParser;
+addParameter(p, 'session', struct(), @isstruct);
+addParameter(p, 'sortingFolders', {}, @iscell);
+addParameter(p, 'basepath', '', @ischar);
+addParameter(p, 'labelsToRead', {'good'}, @iscell);
+addParameter(p, 'getWaveformsFromDat', [], @(x) isempty(x) || islogical(x));
+addParameter(p, 'forceReload', true, @islogical);
+addParameter(p, 'saveMat', false, @islogical);
+parse(p, varargin{:});
+
+session = p.Results.session;
+sortingFolders = p.Results.sortingFolders;
+basepath = p.Results.basepath;
+labelsToRead = p.Results.labelsToRead;
+getWaveformsFromDat = p.Results.getWaveformsFromDat;
+forceReload = p.Results.forceReload;
+saveMat = p.Results.saveMat;
+
+for i = 1:numel(sortingFolders)
+    clusteringPath = relative_path(basepath, sortingFolders{i});
+    loadArgs = {
+        'session', session, ...
+        'clusteringpath', clusteringPath, ...
+        'labelsToRead', labelsToRead, ...
+        'forceReload', forceReload, ...
+        'saveMat', saveMat ...
+    };
+    if ~isempty(getWaveformsFromDat)
+        loadArgs = [loadArgs, {'getWaveformsFromDat', getWaveformsFromDat}]; %#ok<AGROW>
+    end
+    tempSpikes = loadSpikes(loadArgs{:});
+    if i == 1
+        spikes = tempSpikes;
+    else
+        spikes = append_spikes_struct(spikes, tempSpikes);
+    end
+end
+end
+
+function spikes = append_spikes_struct(spikes, nextSpikes)
+fieldsBase = fieldnames(spikes);
+fieldsNext = fieldnames(nextSpikes);
+prevUID = length(spikes.UID);
+for j = 1:numel(fieldsBase)
+    currentField = fieldsBase{j};
+    if ~any(strcmp(fieldsNext, currentField))
+        spikes = rmfield(spikes, currentField);
+        continue
+    end
+    if strcmp(currentField, 'spindices')
+        nextUnitIds = nextSpikes.spindices(:, 2) + prevUID;
+        spikes.spindices = [spikes.spindices; [nextSpikes.spindices(:, 1), nextUnitIds]];
+    elseif strcmp(currentField, 'UID')
+        spikes.UID = [spikes.UID, nextSpikes.UID + prevUID];
+    elseif strcmp(currentField, 'basename')
+        if ~isequal(spikes.basename, nextSpikes.basename)
+            error('Incompatible basenames across Kilosort folders.');
+        end
+    elseif strcmp(currentField, 'numcells')
+        spikes.numcells = spikes.numcells + nextSpikes.numcells;
+    elseif strcmp(currentField, 'sr')
+        if ~isequal(spikes.sr, nextSpikes.sr)
+            error('Incompatible sampling rates across Kilosort folders.');
+        end
+    elseif strcmp(currentField, 'processinginfo')
+        disp('Processing info assumed to be the same across Kilosort folders.');
+    elseif iscell(spikes.(currentField))
+        spikes.(currentField) = cat(2, spikes.(currentField), nextSpikes.(currentField));
+    else
+        spikes.(currentField) = [spikes.(currentField), nextSpikes.(currentField)];
+    end
+end
+end
+
+function session = configure_session_for_cell_explorer(session, basepath, basename, sortingFolders)
 session.general.basePath = basepath;
 session.general.name = basename;
 
-relativeSortingPath = relative_path(basepath, sortingFolder);
-entry.relativePath = relativeSortingPath;
-entry.format = 'Phy';
-entry.method = 'KiloSort';
-entry.manuallyCurated = 1;
-entry.notes = '';
+entries = cell(1, numel(sortingFolders));
+for sortingIdx = 1:numel(sortingFolders)
+    relativeSortingPath = relative_path(basepath, sortingFolders{sortingIdx});
+    entry.relativePath = relativeSortingPath;
+    entry.format = 'Phy';
+    entry.method = 'KiloSort';
+    entry.manuallyCurated = 1;
+    entry.notes = '';
+    entries{sortingIdx} = entry;
+end
 if isfield(session, 'spikeSorting') && ~isempty(session.spikeSorting)
     try
         prior = session.spikeSorting{1};
         fields = fieldnames(prior);
-        for i = 1:numel(fields)
-            if ~isfield(entry, fields{i})
-                entry.(fields{i}) = prior.(fields{i});
+        for sortingIdx = 1:numel(entries)
+            entry = entries{sortingIdx};
+            for i = 1:numel(fields)
+                if ~isfield(entry, fields{i})
+                    entry.(fields{i}) = prior.(fields{i});
+                end
             end
+            entries{sortingIdx} = entry;
         end
     catch
     end
 end
-session.spikeSorting = {entry};
+session.spikeSorting = entries;
 end
 
 function rel = relative_path(basepath, target)

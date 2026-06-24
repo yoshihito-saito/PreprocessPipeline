@@ -169,6 +169,7 @@ class PreprocessGuiSettings:
     )
     run_sorter: bool = True
     sorter: str | None = "Kilosort"
+    sorter_partition_mode: Literal["all", "probe", "shank"] = "all"
     sorter_path: str = str(Path("sorter") / "KiloSort1")
     sorter_config_path: str = str(Path("sorter") / "Kilosort1_config.yaml")
     matlab_path: str = ""
@@ -346,6 +347,7 @@ class PipelineGuiSettings:
             sorter=sorter,
             sorter_path=_repo_path_or_none(p.sorter_path) if sorter else None,
             sorter_config_path=_repo_path_or_none(p.sorter_config_path) if sorter else None,
+            sorter_partition_mode=p.sorter_partition_mode,  # type: ignore[arg-type]
             overwrite=p.overwrite,
             job_kwargs={
                 "pool_engine": "process",
