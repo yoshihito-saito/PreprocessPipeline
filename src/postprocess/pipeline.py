@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import gc
+import json
 import os
 import re
 import shutil
@@ -52,6 +53,28 @@ def _find_sorting_output_dirs(root: Path) -> list[Path]:
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
+
+
+def _find_sorting_output_dirs_from_manifest(root: Path) -> list[Path]:
+    manifest_path = root / "sorter_partition_manifest.json"
+    if not manifest_path.exists():
+        return []
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for partition in payload.get("partitions", []):
+        folder_text = str(partition.get("output_folder") or "").strip()
+        if not folder_text:
+            continue
+        folder = Path(folder_text).expanduser().resolve()
+        if not folder.exists() or not folder.is_dir() or folder.name.endswith("_spi"):
+            continue
+        if folder in seen:
+            continue
+        candidates.append(folder)
+        seen.add(folder)
+    return candidates
+
 
 def _resolve_sorting_run_root(sorting_phy_folder: Path) -> Path:
     # Legacy layouts may point to <Kilosort_xxx>/sorter_output.
@@ -108,9 +131,16 @@ def _resolve_postprocess_targets(config: PostprocessConfig) -> list[Path]:
             raise FileNotFoundError(f"sorting_phy_folder not found: {sorting_phy_folder}")
         if not sorting_phy_folder.is_dir():
             raise NotADirectoryError(f"sorting_phy_folder is not a directory: {sorting_phy_folder}")
+        if config.sorting_search_root is not None:
+            manifest_targets = _find_sorting_output_dirs_from_manifest(_resolve_postprocess_search_root(config))
+            if len(manifest_targets) > 1 and sorting_phy_folder in manifest_targets:
+                return manifest_targets
         return [sorting_phy_folder]
 
     root = _resolve_postprocess_search_root(config)
+    manifest_candidates = _find_sorting_output_dirs_from_manifest(root)
+    if manifest_candidates:
+        return manifest_candidates
     candidates = [p.resolve() for p in _find_sorting_output_dirs(root)]
     if not candidates:
         raise FileNotFoundError(f"No Kilosort result found under {root}.")

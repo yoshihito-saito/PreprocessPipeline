@@ -70,6 +70,7 @@ class PreprocessConfig:
     digital_inputs: bool = False
 
     chanmap_mat_path: Path | None = None
+    xml_path: Path | None = None
     reject_channels: list[int] = field(default_factory=list)
 
     export_intermediate_dat: bool = True
@@ -80,6 +81,7 @@ class PreprocessConfig:
     sorter: str | None = None
     sorter_path: Path | None = None
     sorter_config_path: Path | None = None
+    sorter_partition_mode: Literal["all", "probe", "shank"] = "all"
     matlab_path: Path | None = None
     matlab_max_workers: int = field(default_factory=_default_parallel_n_jobs)
     sorter_verbose: bool = False
@@ -180,5 +182,7 @@ class PreprocessResult:
 
     sorter: str | None = None
     sorter_output_dir: Path | None = None
+    sorter_output_dirs: list[Path] = field(default_factory=list)
+    sorter_partition_manifest_path: Path | None = None
     state_score_paths: list[Path] = field(default_factory=list)
     state_score_figure_paths: list[Path] = field(default_factory=list)

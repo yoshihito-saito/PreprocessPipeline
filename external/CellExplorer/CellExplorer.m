@@ -365,7 +365,23 @@ end
 % % % % % % % % % % % % % % % % % % %
 
 if ~verLessThan('matlab', '9.4')
-    set(UI.fig,'WindowState','maximize','visible','on'), drawnow nocallbacks;
+    if isunix && ~ismac && ~isempty(getenv('DISPLAY'))
+        screenWidth = maxFigureSize(3);
+        screenHeight = maxFigureSize(4);
+        figureWidth = min(1400, max(900, screenWidth - 100));
+        figureHeight = min(850, max(650, screenHeight - 100));
+        figureLeft = max(20, floor((screenWidth - figureWidth) / 2));
+        figureBottom = max(20, floor((screenHeight - figureHeight) / 2));
+        set(UI.fig,'WindowState','normal','Position',[figureLeft, figureBottom, figureWidth, figureHeight],'visible','on');
+        try
+            movegui(UI.fig,'onscreen');
+        catch
+        end
+        figure(UI.fig);
+        drawnow nocallbacks;
+    else
+        set(UI.fig,'WindowState','maximize','visible','on'), drawnow nocallbacks;
+    end
 else
     set(UI.fig,'visible','on')
     drawnow nocallbacks; frame_h = get(UI.fig,'JavaFrame'); set(frame_h,'Maximized',1); drawnow nocallbacks;

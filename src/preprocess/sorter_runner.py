@@ -1,9 +1,11 @@
 ﻿from __future__ import annotations
 
 import argparse
+import csv
 import signal
 import subprocess
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, asdict
 import json
 import os
 from pathlib import Path
@@ -107,6 +109,20 @@ _KILOSORT4_BOOL_PARAMS = {
     "progress_bar",
 }
 _JOB_KWARG_KEYS = set(_SI_JOB_KEYS)
+SORTER_PARTITION_MANIFEST = "sorter_partition_manifest.json"
+
+
+@dataclass(frozen=True)
+class SorterPartition:
+    name: str
+    mode: str
+    channels_0based: list[int]
+    channels_1based: list[int]
+    excluded_channels_0based: list[int]
+    probe_id: int | None = None
+    shank_id: int | None = None
+    output_folder: str | None = None
+    status: str = "pending"
 
 
 def _prepend_to_path(path_to_add: str) -> None:
@@ -990,6 +1006,7 @@ def _resolve_active_channels_0based(
     num_channels: int,
     chanmap_mat_path: Path | None,
     exclude_channels_0based: list[int] | None,
+    active_channels_0based: list[int] | None = None,
 ) -> list[int]:
     all_channels = list(range(int(num_channels)))
     active_from_chanmap: list[int] | None = None
@@ -1027,7 +1044,19 @@ def _resolve_active_channels_0based(
         except Exception:
             active_from_chanmap = None
 
-    base = active_from_chanmap if active_from_chanmap is not None else all_channels
+    if active_channels_0based is not None:
+        allowed = {
+            int(ch)
+            for ch in active_channels_0based
+            if 0 <= int(ch) < int(num_channels)
+        }
+        if not allowed:
+            raise ValueError("active_channels_0based did not contain any valid channels.")
+        base_source = active_from_chanmap if active_from_chanmap is not None else all_channels
+        base = [ch for ch in base_source if ch in allowed]
+    else:
+        base = active_from_chanmap if active_from_chanmap is not None else all_channels
+
     excluded_set = {
         int(ch)
         for ch in (exclude_channels_0based or [])
@@ -1039,6 +1068,154 @@ def _resolve_active_channels_0based(
             "No active channels remain for sorting after applying chanMap/reject channels."
         )
     return active
+
+
+def _chanmap_connected_channels_0based(chanmap_mat_path: Path, num_channels: int) -> list[int]:
+    mat = loadmat(str(chanmap_mat_path), simplify_cells=True)
+    chanmap_raw = mat.get("chanMap0ind", mat.get("chanMap", None))
+    if chanmap_raw is None:
+        raw_channels = np.arange(int(num_channels), dtype=np.int64)
+    else:
+        raw_channels = np.asarray(chanmap_raw).reshape(-1).astype(np.int64)
+        if "chanMap0ind" not in mat:
+            raw_channels = raw_channels - 1
+    valid = (raw_channels >= 0) & (raw_channels < int(num_channels))
+    channels = raw_channels[valid]
+
+    connected_raw = mat.get("connected", None)
+    if connected_raw is not None:
+        connected = np.asarray(connected_raw).reshape(-1).astype(float) > 0
+        if connected.size == raw_channels.size:
+            channels = raw_channels[valid & connected[: raw_channels.size]]
+        elif connected.size == channels.size:
+            channels = channels[connected[: channels.size]]
+
+    out: list[int] = []
+    seen: set[int] = set()
+    for ch in channels.tolist():
+        ch_i = int(ch)
+        if ch_i not in seen:
+            out.append(ch_i)
+            seen.add(ch_i)
+    return out
+
+
+def build_sorter_partitions(
+    *,
+    mode: str,
+    chanmap_mat_path: Path | None,
+    num_channels: int,
+    excluded_channels_0based: list[int] | None = None,
+) -> list[SorterPartition]:
+    mode_normalized = str(mode).strip().lower()
+    if mode_normalized not in {"all", "probe", "shank"}:
+        raise ValueError(f"Unsupported sorter partition mode: {mode}")
+
+    excluded = sorted(
+        {
+            int(ch)
+            for ch in (excluded_channels_0based or [])
+            if 0 <= int(ch) < int(num_channels)
+        }
+    )
+    excluded_set = set(excluded)
+
+    if mode_normalized == "all":
+        channels = (
+            _chanmap_connected_channels_0based(Path(chanmap_mat_path), num_channels)
+            if chanmap_mat_path is not None and Path(chanmap_mat_path).exists()
+            else list(range(int(num_channels)))
+        )
+        active = [ch for ch in channels if ch not in excluded_set]
+        return [
+            SorterPartition(
+                name="all_channels",
+                mode="all",
+                channels_0based=active,
+                channels_1based=[ch + 1 for ch in active],
+                excluded_channels_0based=excluded,
+            )
+        ]
+
+    if chanmap_mat_path is None or not Path(chanmap_mat_path).exists():
+        raise ValueError(f"sorter partition mode '{mode_normalized}' requires chanMap.mat")
+
+    mat = loadmat(str(chanmap_mat_path), simplify_cells=True)
+    chanmap_raw = mat.get("chanMap0ind", mat.get("chanMap", None))
+    if chanmap_raw is None:
+        raise ValueError("chanMap.mat must contain chanMap0ind or chanMap for sorter partitioning.")
+    channels = np.asarray(chanmap_raw).reshape(-1).astype(np.int64)
+    if "chanMap0ind" not in mat:
+        channels = channels - 1
+
+    probe_ids = np.asarray(mat.get("probe_ids", np.ones_like(channels))).reshape(-1).astype(np.int64)
+    shank_ids = np.asarray(mat.get("kcoords", np.ones_like(channels))).reshape(-1).astype(np.int64)
+    connected = np.asarray(mat.get("connected", np.ones_like(channels))).reshape(-1).astype(float) > 0
+    n = min(channels.size, probe_ids.size, shank_ids.size, connected.size)
+    rows: list[tuple[int, int, int]] = []
+    for ch, probe_id, shank_id, is_connected in zip(
+        channels[:n], probe_ids[:n], shank_ids[:n], connected[:n], strict=True
+    ):
+        ch_i = int(ch)
+        if not is_connected or ch_i < 0 or ch_i >= int(num_channels):
+            continue
+        rows.append((ch_i, int(probe_id), int(shank_id)))
+
+    if mode_normalized == "probe":
+        grouped: dict[int, list[int]] = {}
+        for ch, probe_id, _shank_id in rows:
+            grouped.setdefault(probe_id, []).append(ch)
+        partitions = [
+            SorterPartition(
+                name=f"probe{probe_id}",
+                mode="probe",
+                probe_id=probe_id,
+                channels_0based=[ch for ch in channels_for_probe if ch not in excluded_set],
+                channels_1based=[ch + 1 for ch in channels_for_probe if ch not in excluded_set],
+                excluded_channels_0based=excluded,
+            )
+            for probe_id, channels_for_probe in sorted(grouped.items())
+        ]
+    else:
+        grouped_shanks: dict[tuple[int, int], list[int]] = {}
+        for ch, probe_id, shank_id in rows:
+            grouped_shanks.setdefault((probe_id, shank_id), []).append(ch)
+        partitions = [
+            SorterPartition(
+                name=f"probe{probe_id}_shank{shank_id}",
+                mode="shank",
+                probe_id=probe_id,
+                shank_id=shank_id,
+                channels_0based=[ch for ch in channels_for_shank if ch not in excluded_set],
+                channels_1based=[ch + 1 for ch in channels_for_shank if ch not in excluded_set],
+                excluded_channels_0based=excluded,
+            )
+            for (probe_id, shank_id), channels_for_shank in sorted(grouped_shanks.items())
+        ]
+
+    partitions = [p for p in partitions if p.channels_0based]
+    if not partitions:
+        raise ValueError("No sorter partitions remain after applying connected and rejected channels.")
+    return partitions
+
+
+def write_sorter_partition_manifest(
+    *,
+    output_dir: Path,
+    mode: str,
+    sorter: str,
+    partitions: list[SorterPartition],
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "mode": mode,
+        "sorter": sorter,
+        "partitions": [asdict(p) for p in partitions],
+    }
+    manifest_path = output_dir / SORTER_PARTITION_MANIFEST
+    manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return manifest_path
 
 
 def _patch_params_py(
@@ -1121,6 +1298,43 @@ def _patch_channel_map_for_raw_dat(
             np.save(str(channel_map_path), mapped.astype(np.int64, copy=False))
         except Exception as exc:
             print(f"Warning: failed to patch channel_map.npy for raw dat: {exc}")
+
+
+def _patch_cluster_info_channels_for_raw_dat(
+    *,
+    output_folder: Path,
+    active_channels_0based: list[int],
+    n_channels_dat: int,
+) -> None:
+    active = np.asarray(active_channels_0based, dtype=np.int64)
+    if active.size == 0 or active.size == int(n_channels_dat):
+        return
+    for cluster_info_path in output_folder.rglob("cluster_info.tsv"):
+        try:
+            with open(cluster_info_path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f, delimiter="\t")
+                fieldnames = list(reader.fieldnames or [])
+                rows = list(reader)
+            if "ch" not in fieldnames:
+                continue
+            changed = False
+            for row in rows:
+                raw_ch = row.get("ch", "")
+                try:
+                    ch = int(float(str(raw_ch).strip()))
+                except ValueError:
+                    continue
+                if 0 <= ch < active.size:
+                    row["ch"] = str(int(active[ch]))
+                    changed = True
+            if not changed:
+                continue
+            with open(cluster_info_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t", lineterminator="\n")
+                writer.writeheader()
+                writer.writerows(rows)
+        except Exception as exc:
+            print(f"Warning: failed to patch cluster_info.tsv channel ids for raw dat: {exc}")
 
 
 def _list_process_table() -> list[dict[str, Any]]:
@@ -1474,6 +1688,7 @@ def execute_sorting_job(
     offset_to_uV: float = 0.0,
     sampling_frequency: float | None = None,
     num_channels: int | None = None,
+    active_channels_0based: list[int] | None = None,
     exclude_channels_0based: list[int] | None = None,
     job_kwargs: dict[str, Any] | None = None,
     remove_existing_folder: bool = True,
@@ -1571,13 +1786,18 @@ def execute_sorting_job(
         num_channels=nch,
         chanmap_mat_path=Path(chanmap_mat_path) if chanmap_mat_path is not None else None,
         exclude_channels_0based=exclude_channels_0based,
+        active_channels_0based=active_channels_0based,
     )
     ignored_channels_0based = sorted(set(range(int(nch))) - set(resolved_active_channels_0based))
-    # Keep channel count unchanged when the sorter input is already preprocessed.
-    active_channels_0based = (
-        list(range(int(nch))) if input_is_preprocessed else resolved_active_channels_0based
+    # Plain preprocessed full-session runs keep the channel count unchanged so
+    # bad channels remain zeroed in the full binary. Explicit partition runs
+    # still need a selected-channel recording view.
+    sorter_active_channels_0based = (
+        list(range(int(nch)))
+        if input_is_preprocessed and active_channels_0based is None
+        else resolved_active_channels_0based
     )
-    sorter_uses_channel_subset = len(active_channels_0based) != int(nch)
+    sorter_uses_channel_subset = len(sorter_active_channels_0based) != int(nch)
 
     if sorter_input == "kilosort":
         params = _normalize_kilosort_params(
@@ -1613,11 +1833,11 @@ def execute_sorting_job(
     if chanmap_mat_path is not None and Path(chanmap_mat_path).exists():
         recording = attach_probe_from_chanmap(recording, Path(chanmap_mat_path))
 
-    if len(active_channels_0based) != int(nch):
-        recording = select_recording_channels(recording, active_channels_0based)
+    if len(sorter_active_channels_0based) != int(nch):
+        recording = select_recording_channels(recording, sorter_active_channels_0based)
         print(
             "Sorting with active channels only: "
-            f"{len(active_channels_0based)}/{int(nch)}"
+            f"{len(sorter_active_channels_0based)}/{int(nch)}"
         )
     effective_preprocess_for_sorting = bool(preprocess_for_sorting) and not bool(input_is_preprocessed)
     if effective_preprocess_for_sorting:
@@ -1774,7 +1994,12 @@ def execute_sorting_job(
     if sorter_uses_channel_subset:
         _patch_channel_map_for_raw_dat(
             output_folder=output_folder,
-            active_channels_0based=active_channels_0based,
+            active_channels_0based=sorter_active_channels_0based,
+            n_channels_dat=int(nch),
+        )
+        _patch_cluster_info_channels_for_raw_dat(
+            output_folder=output_folder,
+            active_channels_0based=sorter_active_channels_0based,
             n_channels_dat=int(nch),
         )
     if sorter_input in _MATLAB_SORTER_INPUTS and cleanup_temp_wh:
@@ -1814,7 +2039,8 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
         offset_to_uV=args.offset_to_uV,
         sampling_frequency=args.sampling_frequency,
         num_channels=args.num_channels,
-        exclude_channels_0based=None,
+        active_channels_0based=_parse_cli_int_list(args.active_channels),
+        exclude_channels_0based=_parse_cli_int_list(args.exclude_channels),
         job_kwargs=None,
         remove_existing_folder=args.remove_existing_folder,
         docker_image=args.docker_image,
@@ -1822,6 +2048,21 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
         sorter_verbose=bool(args.sorter_verbose),
         cleanup_temp_wh=not bool(args.keep_temp_wh_dat),
     )
+
+
+def _parse_cli_int_list(text: str | None) -> list[int] | None:
+    if text is None:
+        return None
+    stripped = str(text).strip()
+    if not stripped:
+        return None
+    values: list[int] = []
+    for part in stripped.replace(";", ",").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        values.append(int(item))
+    return values
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1865,6 +2106,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chanmap", default=None, help="Optional chanMap.mat path to attach probe geometry")
     p.add_argument("--sampling-frequency", type=float, default=None, help="Sampling frequency (Hz)")
     p.add_argument("--num-channels", type=int, default=None, help="Number of channels")
+    p.add_argument(
+        "--active-channels",
+        default=None,
+        help="Comma-separated 0-based channel IDs to sort. Keeps Phy metadata patched to full dat channel IDs.",
+    )
+    p.add_argument(
+        "--exclude-channels",
+        default=None,
+        help="Comma-separated 0-based channel IDs to exclude from sorting.",
+    )
 
     p.add_argument("--dtype", default="int16", help="Binary dtype")
     p.add_argument("--gain-to-uV", type=float, default=0.195, help="gain_to_uV")
