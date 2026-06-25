@@ -182,6 +182,7 @@ class PreprocessGuiSettings:
 class PostprocessGuiSettings:
     sorting_phy_folder: str = ""
     sorting_search_root: str = ""
+    cell_explorer_sorting_folders: list[str] = field(default_factory=list)
     apply_preprocess: bool = False
     exclude_cluster_groups: list[str] = field(default_factory=lambda: ["noise"])
     duplicate_censored_period_ms: float = 0.5
@@ -223,7 +224,11 @@ class BehaviorGuiSettings:
 class PipelineGuiSettings:
     basepath: str = ""
     local_root: str = ""
+    xml_path: str = ""
     chanmap_path: str = ""
+    multi_day_enabled: bool = False
+    multi_day_session_paths: list[str] = field(default_factory=list)
+    multi_day_name: str = ""
     preprocess: PreprocessGuiSettings = field(default_factory=PreprocessGuiSettings)
     behavior: BehaviorGuiSettings = field(default_factory=BehaviorGuiSettings)
     postprocess: PostprocessGuiSettings = field(default_factory=PostprocessGuiSettings)
@@ -238,6 +243,8 @@ class PipelineGuiSettings:
 
     @property
     def basename(self) -> str:
+        if self.multi_day_enabled and self.multi_day_name.strip():
+            return self.multi_day_name.strip()
         basepath = self.basepath_path
         return basepath.name if basepath is not None else ""
 
@@ -288,6 +295,17 @@ class PipelineGuiSettings:
                 return basepath_chanmap
 
         return local_chanmap
+
+    def resolved_xml_path(self) -> Path | None:
+        explicit = _path_or_none(self.xml_path)
+        if explicit is not None:
+            return explicit
+        basepath = self.basepath_path
+        basename = self.basename
+        if basepath is None or not basename:
+            return None
+        candidate = basepath / f"{basename}.xml"
+        return candidate if candidate.exists() else None
 
     def to_preprocess_config(self) -> PreprocessConfig:
         basepath = self.basepath_path
@@ -341,6 +359,7 @@ class PipelineGuiSettings:
             emg_th_alpha=p.emg_th_alpha,
             useEMG_NREM=p.useEMG_NREM,
             chanmap_mat_path=self.resolved_chanmap_path(),
+            xml_path=self.resolved_xml_path(),
             reject_channels=list(p.reject_channels),
             matlab_path=_path_or_none(p.matlab_path),
             matlab_max_workers=normalize_worker_count(p.sorter_worker_count),
@@ -366,10 +385,18 @@ class PipelineGuiSettings:
         chanmap_path = self.resolved_chanmap_path()
         sampling_frequency, num_channels = _postprocess_xml_metadata(basepath, basename)
         sorting_phy_folder = self.postprocess_sorting_folder()
+        sorting_search_root = _path_or_none(pp.sorting_search_root)
+        local_output_dir = self.local_output_dir
+        if (
+            sorting_search_root is None
+            and local_output_dir is not None
+            and (local_output_dir / "sorter_partition_manifest.json").exists()
+        ):
+            sorting_search_root = local_output_dir
 
         return PostprocessConfig(
             sorting_phy_folder=sorting_phy_folder,
-            sorting_search_root=_path_or_none(pp.sorting_search_root),
+            sorting_search_root=sorting_search_root,
             dat_path=dat_path if dat_path is not None and dat_path.exists() else None,
             sampling_frequency=sampling_frequency,
             num_channels=num_channels,

@@ -70,6 +70,7 @@ class PreprocessConfig:
     digital_inputs: bool = False
 
     chanmap_mat_path: Path | None = None
+    xml_path: Path | None = None
     reject_channels: list[int] = field(default_factory=list)
 
     export_intermediate_dat: bool = True

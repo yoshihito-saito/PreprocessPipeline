@@ -20,6 +20,7 @@ from PySide6.QtCore import QPointF, QProcess, QRectF, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPen, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -44,6 +46,8 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -1420,6 +1424,222 @@ class TrackerJumpDialog(QDialog):
         self._render()
 
 
+class MultiDaySessionOrderTable(QTableWidget):
+    def __init__(self, paths: list[str], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._paths = list(paths)
+        self._populating = False
+        self.setColumnCount(3)
+        self.setHorizontalHeaderLabels(["Order", "Session", "Path"])
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setDragEnabled(False)
+        self.setAcceptDrops(False)
+        self.viewport().setAcceptDrops(False)
+        self.setDropIndicatorShown(False)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+        self.verticalHeader().setVisible(False)
+        self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.setColumnWidth(0, 78)
+        self.setColumnWidth(1, 320)
+        self.itemChanged.connect(self._handle_item_changed)
+        self.refresh()
+
+    def paths(self) -> list[str]:
+        return list(self._paths)
+
+    def refresh(self, select_row: int | None = None) -> None:
+        self._populating = True
+        try:
+            self.setRowCount(len(self._paths))
+            for row, path_text in enumerate(self._paths):
+                path = Path(path_text)
+                order_item = QTableWidgetItem(str(row + 1))
+                session_item = QTableWidgetItem(path.name)
+                path_item = QTableWidgetItem(path_text)
+                self.setItem(row, 0, order_item)
+                self.setItem(row, 1, session_item)
+                self.setItem(row, 2, path_item)
+                order_item.setFlags(order_item.flags() | Qt.ItemFlag.ItemIsEditable)
+                session_item.setFlags(session_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                path_item.setFlags(path_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if select_row is not None and 0 <= select_row < self.rowCount():
+                self.selectRow(select_row)
+        finally:
+            self._populating = False
+
+    def _handle_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._populating or item.column() != 0:
+            return
+        row = item.row()
+        if row < 0:
+            return
+        try:
+            target = int(item.text().strip()) - 1
+        except ValueError:
+            self.refresh(row)
+            return
+        if not self._paths:
+            return
+        target = max(0, min(target, len(self._paths) - 1))
+        if target == row:
+            self.refresh(row)
+            return
+        path = self._paths.pop(row)
+        self._paths.insert(target, path)
+        self.refresh(target)
+
+
+class CellExploreFolderTable(QTableWidget):
+    def __init__(
+        self,
+        rows: list[dict[str, str]],
+        selected_paths: list[str],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._rows = list(rows)
+        self._selected = {str(Path(path).expanduser().resolve()) for path in selected_paths}
+        self._populating = False
+        self._prune_selected_conflicts()
+        self.setColumnCount(4)
+        self.setHorizontalHeaderLabels(["Use", "Folder", "Status", "Path"])
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setDragEnabled(False)
+        self.setAcceptDrops(False)
+        self.viewport().setAcceptDrops(False)
+        self.setDropIndicatorShown(False)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+        self.verticalHeader().setVisible(False)
+        self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.setColumnWidth(0, 58)
+        self.setColumnWidth(1, 270)
+        self.setColumnWidth(2, 170)
+        self.itemChanged.connect(self._handle_item_changed)
+        self.refresh()
+
+    def refresh(self) -> None:
+        self._populating = True
+        try:
+            self.setRowCount(len(self._rows))
+            for row, entry in enumerate(self._rows):
+                path_text = entry["path"]
+                key = str(Path(path_text).expanduser().resolve())
+                use_item = QTableWidgetItem("")
+                use_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                use_item.setCheckState(
+                    Qt.CheckState.Checked if key in self._selected else Qt.CheckState.Unchecked
+                )
+                folder_item = QTableWidgetItem(Path(path_text).name)
+                status_item = QTableWidgetItem(entry.get("status", ""))
+                path_item = QTableWidgetItem(path_text)
+                for item in (folder_item, status_item, path_item):
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.setItem(row, 0, use_item)
+                self.setItem(row, 1, folder_item)
+                self.setItem(row, 2, status_item)
+                self.setItem(row, 3, path_item)
+        finally:
+            self._populating = False
+
+    def add_folder(self, path: Path, *, checked: bool = True, source: str = "manual") -> None:
+        resolved = str(path.expanduser().resolve())
+        if resolved not in {str(Path(row["path"]).expanduser().resolve()) for row in self._rows}:
+            status = "ok" if (path / "params.py").exists() else "missing params.py"
+            self._rows.append(
+                {
+                    "path": resolved,
+                    "source": source,
+                    "status": f"{source}; {status}",
+                    "group": self._default_group_key(Path(resolved)),
+                }
+            )
+        if checked:
+            self._select_exclusive(resolved, self._default_group_key(Path(resolved)))
+        self.refresh()
+
+    @staticmethod
+    def _default_group_key(path: Path) -> str:
+        resolved = path.expanduser().resolve()
+        name = resolved.name
+        if name.endswith("_spi"):
+            return str(resolved.with_name(name[: -len("_spi")]))
+        return str(resolved)
+
+    def _select_exclusive(self, key: str, group: str) -> None:
+        for entry in self._rows:
+            other_group = entry.get("group") or self._default_group_key(Path(entry["path"]))
+            if other_group == group:
+                self._selected.discard(str(Path(entry["path"]).expanduser().resolve()))
+        self._selected.add(key)
+
+    def _prune_selected_conflicts(self) -> None:
+        selected_by_group: set[str] = set()
+        pruned: set[str] = set()
+        for entry in self._rows:
+            key = str(Path(entry["path"]).expanduser().resolve())
+            if key not in self._selected:
+                continue
+            group = entry.get("group") or self._default_group_key(Path(entry["path"]))
+            if group in selected_by_group:
+                continue
+            selected_by_group.add(group)
+            pruned.add(key)
+        self._selected = pruned
+
+    def _handle_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._populating or item.column() != 0:
+            return
+        row = item.row()
+        if row < 0 or row >= len(self._rows):
+            return
+        path_item = self.item(row, 3)
+        if path_item is None:
+            return
+        key = str(Path(path_item.text()).expanduser().resolve())
+        if item.checkState() == Qt.CheckState.Checked:
+            group = self._rows[row].get("group") or self._default_group_key(Path(key))
+            self._select_exclusive(key, group)
+            for other_row, entry in enumerate(self._rows):
+                if other_row == row:
+                    continue
+                other_group = entry.get("group") or self._default_group_key(Path(entry["path"]))
+                if other_group != group:
+                    continue
+                other_key = str(Path(entry["path"]).expanduser().resolve())
+                self._selected.discard(other_key)
+                other_item = self.item(other_row, 0)
+                if other_item is not None:
+                    self._populating = True
+                    try:
+                        other_item.setCheckState(Qt.CheckState.Unchecked)
+                    finally:
+                        self._populating = False
+        else:
+            self._selected.discard(key)
+
+    def selected_paths(self) -> list[str]:
+        selected: list[str] = []
+        for row in range(self.rowCount()):
+            use_item = self.item(row, 0)
+            path_item = self.item(row, 3)
+            if use_item is None or path_item is None:
+                continue
+            if use_item.checkState() == Qt.CheckState.Checked:
+                selected.append(path_item.text())
+        return selected
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1430,6 +1650,7 @@ class MainWindow(QMainWindow):
         self._process_result: dict[str, Any] | None = None
         self._process_error: dict[str, Any] | None = None
         self._process_tail = ""
+        self._process_stop_escalated = False
         self._phy_process: QProcess | None = None
         self._phy_working_dir: Path | None = None
         self._phy_last_counts: dict[str, int] | None = None
@@ -1448,7 +1669,10 @@ class MainWindow(QMainWindow):
         self.noise_threshold_fields: dict[str, QLineEdit] = {}
         self._refresh_suspended = False
         self._last_chanmap_preview_key: tuple[Any, ...] | None = None
+        self._last_xml_warning_key: tuple[Any, ...] | None = None
         self._chanmap_controls_dirty = False
+        self._multi_day_session_paths: list[str] = []
+        self._cell_explorer_sorting_folders: list[str] = []
         self._channel_regions: dict[int, str] = {}
         self._behavior_dlc_files: list[Any] = []
         self._behavior_frame_canvases: dict[str, BehaviorFrameCanvas] = {}
@@ -1719,6 +1943,17 @@ class MainWindow(QMainWindow):
         self.basepath.setPlaceholderText("Select session/basepath")
         browse_basepath = QPushButton("Browse basepath")
         browse_basepath.clicked.connect(self._browse_basepath)
+        browse_multiday = QPushButton("Browse for multi-days")
+        browse_multiday.clicked.connect(self._browse_multi_days)
+        self.multi_day_sessions = QLineEdit()
+        self.multi_day_sessions.setReadOnly(True)
+        self.multi_day_sessions.setPlaceholderText("No multi-day sessions selected")
+        view_multiday = QPushButton("Check order")
+        view_multiday.setMinimumWidth(110)
+        view_multiday.setMaximumWidth(125)
+        view_multiday.clicked.connect(self._view_multi_day_sessions)
+        self.multi_day_name = QLineEdit()
+        self.multi_day_name.setPlaceholderText("multi-day name")
 
         self.local_root = QLineEdit()
         self.local_root.setPlaceholderText("Local working directory")
@@ -1737,11 +1972,19 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.local_root, 0, 4)
         layout.addWidget(load_config, 0, 5)
         layout.addWidget(save_config, 0, 6)
+        layout.addWidget(browse_multiday, 1, 0)
+        layout.addWidget(self.multi_day_sessions, 1, 1, 1, 2)
+        layout.addWidget(view_multiday, 1, 3)
+        layout.addWidget(QLabel("Multi-day name"), 1, 4)
+        layout.addWidget(self.multi_day_name, 1, 5, 1, 2)
         layout.setColumnStretch(1, 4)
-        layout.setColumnStretch(4, 2)
+        layout.setColumnStretch(4, 0)
+        layout.setColumnStretch(5, 3)
+        layout.setColumnStretch(6, 1)
 
         self.basepath.textChanged.connect(self._schedule_refresh)
         self.local_root.textChanged.connect(self._schedule_refresh)
+        self.multi_day_name.textChanged.connect(self._schedule_refresh)
         self.basepath.textChanged.connect(self._reset_behavior_discovery_state)
         self.local_root.textChanged.connect(self._reset_behavior_discovery_state)
         return panel
@@ -1761,6 +2004,9 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
+        self.manual_sorting_folder = QLineEdit()
+        self.manual_sorting_folder.setPlaceholderText("selected sorting folder")
+
         self.ephys_tabs = QTabWidget()
         self.ephys_tabs.addTab(self._scroll_area(self._build_preprocess_tab()), "Preprocess")
         self.ephys_tabs.addTab(self._scroll_area(self._build_postprocess_tab()), "Postprocess")
@@ -1779,14 +2025,28 @@ class MainWindow(QMainWindow):
         run_layout.addWidget(self.run_post)
 
         manual_box = QGroupBox("Manual Curation")
-        manual_layout = QHBoxLayout(manual_box)
+        manual_layout = QGridLayout(manual_box)
         self.run_phy = QPushButton("Launch Phy")
         self.run_phy.clicked.connect(self._run_phy)
-        self.launch_cell_explorer = QPushButton("Run CellExplore postprocess")
+        browse_manual_sorting = QPushButton("Browse folder")
+        browse_manual_sorting.clicked.connect(self._browse_manual_sorting_folder)
+        self.launch_cell_explorer = QPushButton("Run CellExplore")
         self.launch_cell_explorer.clicked.connect(self._launch_cell_explorer)
-        manual_layout.addWidget(self.run_phy)
-        manual_layout.addWidget(self.launch_cell_explorer)
-        manual_layout.addStretch(1)
+        self.cell_explorer_folders_summary = QLineEdit()
+        self.cell_explorer_folders_summary.setReadOnly(True)
+        self.cell_explorer_folders_summary.setPlaceholderText("No CellExplore folders selected")
+        select_cell_explorer_folders = QPushButton("Select folders")
+        select_cell_explorer_folders.clicked.connect(self._select_cell_explorer_folders)
+        cell_explorer_hint = QLabel("CellExplore uses only checked and registered folders.")
+        cell_explorer_hint.setWordWrap(True)
+        manual_layout.addWidget(self.run_phy, 0, 0)
+        manual_layout.addWidget(self.manual_sorting_folder, 0, 1)
+        manual_layout.addWidget(browse_manual_sorting, 0, 2)
+        manual_layout.addWidget(self.launch_cell_explorer, 1, 0)
+        manual_layout.addWidget(self.cell_explorer_folders_summary, 1, 1)
+        manual_layout.addWidget(select_cell_explorer_folders, 1, 2)
+        manual_layout.addWidget(cell_explorer_hint, 2, 0, 1, 3)
+        manual_layout.setColumnStretch(1, 1)
 
         layout.addWidget(self.ephys_tabs, 1)
         layout.addWidget(run_box)
@@ -1828,6 +2088,15 @@ class MainWindow(QMainWindow):
 
         session = QGroupBox("Session and channel map")
         session_form = self._form_layout(session)
+        self.xml_path = QLineEdit()
+        self.xml_path.setPlaceholderText("Auto: basepath/basename.xml, or Load XML")
+        self.xml_path.textChanged.connect(lambda _text: setattr(self, "_last_xml_warning_key", None))
+        self.xml_path.textChanged.connect(self._schedule_refresh)
+        load_xml = QPushButton("Load XML")
+        load_xml.clicked.connect(self._load_xml)
+        xml_row = QHBoxLayout()
+        xml_row.addWidget(load_xml)
+        xml_row.addWidget(self.xml_path, 1)
         self.reject_channels = QLineEdit()
         self.reject_channels.setPlaceholderText("0, 3, 17")
         self.reject_channels.textChanged.connect(self._mark_chanmap_controls_dirty)
@@ -1837,6 +2106,7 @@ class MainWindow(QMainWindow):
         load_chanmap.clicked.connect(self._browse_chanmap)
         chanmap_buttons = QHBoxLayout()
         chanmap_buttons.addWidget(load_chanmap)
+        session_form.addRow(QLabel("XML"), xml_row)
         session_form.addRow("bad channels", self.reject_channels)
         session_form.addRow(QLabel("probe assignments"))
         session_form.addRow(self._build_probe_assignment_editor())
@@ -2640,12 +2910,25 @@ class MainWindow(QMainWindow):
                 return self._apply_chanmap_file_to_controls(candidate)
         return False
 
+    def _warn_missing_xml_for_settings(self, settings: PipelineGuiSettings, *, context: str) -> None:
+        explicit = self.xml_path.text().strip()
+        if not explicit:
+            return
+        detail = str(Path(explicit).expanduser())
+        message = f"Warning: selected XML not found: {detail}. Set XML first with Load XML.\n"
+        key = (context, "explicit", detail)
+        if key == self._last_xml_warning_key:
+            return
+        self._last_xml_warning_key = key
+        self._append_warning_log(message)
+
     def _load_settings_chanmap_preview(self, settings: PipelineGuiSettings) -> bool:
         basepath = settings.basepath_path
         if basepath is None:
             return False
-        xml_path = basepath / f"{settings.basename}.xml"
-        if not xml_path.exists():
+        xml_path = settings.resolved_xml_path()
+        if xml_path is None or not xml_path.exists():
+            self._warn_missing_xml_for_settings(settings, context="chanmap-preview")
             return False
         try:
             assignments_json = json.dumps(settings.preprocess.probe_assignments, sort_keys=True)
@@ -2665,6 +2948,8 @@ class MainWindow(QMainWindow):
                 basename=settings.basename,
                 reject_channels=settings.preprocess.reject_channels,
                 probe_assignments=settings.preprocess.probe_assignments,
+                xml_path=xml_path,
+                emit_warnings=False,
             )
             if data is None:
                 return False
@@ -2682,14 +2967,16 @@ class MainWindow(QMainWindow):
         basepath = settings.basepath_path
         if basepath is None:
             return None
-        xml_path = basepath / f"{settings.basename}.xml"
-        if not xml_path.exists():
+        xml_path = settings.resolved_xml_path()
+        if xml_path is None or not xml_path.exists():
             return None
         return build_channel_map_data(
             basepath=basepath,
             basename=settings.basename,
             reject_channels=settings.preprocess.reject_channels,
             probe_assignments=settings.preprocess.probe_assignments,
+            xml_path=xml_path,
+            emit_warnings=False,
         )
 
     def _current_anatomical_channel_groups(self) -> list[AnatomicalChannelGroup]:
@@ -2783,6 +3070,15 @@ class MainWindow(QMainWindow):
         dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
         return dialog.selectedFiles()[0] if dialog.exec() else ""
 
+    def _select_directories(self, title: str, start: str) -> list[str]:
+        dialog = QFileDialog(self, title, start or str(Path.cwd()))
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        for view in dialog.findChildren(QAbstractItemView):
+            view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        return dialog.selectedFiles() if dialog.exec() else []
+
     def _select_open_file(self, title: str, start: str, file_filter: str) -> str:
         dialog = QFileDialog(self, title, start or str(Path.cwd()), file_filter)
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
@@ -2800,8 +3096,293 @@ class MainWindow(QMainWindow):
         path = self._select_directory("Select basepath", self.basepath.text() or str(Path.cwd()))
         if path:
             self.basepath.setText(path)
+            self._auto_load_existing_xml()
             self._auto_load_existing_chanmap()
             self._schedule_refresh()
+
+    def _auto_load_existing_xml(self) -> None:
+        basepath_text = self.basepath.text().strip()
+        if not basepath_text:
+            self.xml_path.clear()
+            return
+        basepath = Path(basepath_text).expanduser()
+        candidate = basepath / f"{basepath.name}.xml"
+        self.xml_path.setText(str(candidate) if candidate.exists() else "")
+
+    def _load_xml(self) -> None:
+        path = self._select_open_file(
+            "Select XML metadata",
+            self.xml_path.text() or self.basepath.text() or str(Path.cwd()),
+            "XML files (*.xml);;All files (*)",
+        )
+        if path:
+            self.xml_path.setText(path)
+            self._schedule_refresh()
+
+    def _set_multi_day_session_paths(self, paths: list[str]) -> None:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in paths:
+            text = str(item).strip()
+            if not text:
+                continue
+            key = str(Path(text).expanduser())
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(key)
+        self._multi_day_session_paths = cleaned
+        if not cleaned:
+            self.multi_day_sessions.clear()
+        elif len(cleaned) == 1:
+            self.multi_day_sessions.setText(f"1 session: {Path(cleaned[0]).name}")
+        else:
+            self.multi_day_sessions.setText(
+                f"{len(cleaned)} sessions: {Path(cleaned[0]).name} -> {Path(cleaned[-1]).name}"
+            )
+
+    def _set_cell_explorer_sorting_folders(self, paths: list[str]) -> None:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in paths:
+            text = str(item).strip()
+            if not text:
+                continue
+            key = str(Path(text).expanduser().resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(key)
+        self._cell_explorer_sorting_folders = cleaned
+        if not hasattr(self, "cell_explorer_folders_summary"):
+            return
+        if not cleaned:
+            self.cell_explorer_folders_summary.clear()
+        elif len(cleaned) == 1:
+            self.cell_explorer_folders_summary.setText(f"1 folder: {Path(cleaned[0]).name}")
+        else:
+            self.cell_explorer_folders_summary.setText(f"{len(cleaned)} folders selected")
+
+    def _cell_explorer_candidate_rows(self, settings: PipelineGuiSettings) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        seen: set[str] = set()
+
+        def _add(path: Path, source: str, status_note: str = "", group: str | None = None) -> None:
+            resolved = path.expanduser().resolve()
+            key = str(resolved)
+            if key in seen:
+                return
+            seen.add(key)
+            if status_note:
+                status = f"{source}; {status_note}"
+            else:
+                status = f"{source}; {'ok' if (resolved / 'params.py').exists() else 'missing params.py'}"
+            rows.append(
+                {
+                    "path": key,
+                    "source": source,
+                    "status": status,
+                    "group": group or CellExploreFolderTable._default_group_key(resolved),
+                }
+            )
+
+        for path_text in self._cell_explorer_sorting_folders:
+            _add(Path(path_text), "registered")
+
+        roots = [
+            _path
+            for _path in (
+                settings.local_output_dir,
+                Path(settings.postprocess.sorting_search_root).expanduser()
+                if settings.postprocess.sorting_search_root.strip()
+                else None,
+            )
+            if _path is not None and _path.exists()
+        ]
+        for root in roots:
+            manifest_path = root / "sorter_partition_manifest.json"
+            if not manifest_path.exists():
+                continue
+            try:
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                self._append_warning_log(f"[WARN] Failed to read sorter partition manifest {manifest_path}: {exc}\n")
+                continue
+            for partition in payload.get("partitions", []):
+                folder_text = str(partition.get("output_folder") or "").strip()
+                if not folder_text:
+                    continue
+                raw_folder = Path(folder_text).expanduser()
+                raw_group = str(raw_folder.expanduser().resolve())
+                spi_folder = postprocess_output_folder_for_sorting(raw_folder)
+                if raw_folder.exists():
+                    raw_status = "_spi available" if spi_folder.exists() else "raw folder"
+                    _add(raw_folder, "manifest", raw_status, raw_group)
+                if spi_folder.exists():
+                    _add(spi_folder, "manifest", "postprocess _spi", raw_group)
+        return rows
+
+    def _select_cell_explorer_folders(self) -> None:
+        settings = self._collect_settings()
+        rows = self._cell_explorer_candidate_rows(settings)
+        if not rows:
+            QMessageBox.information(
+                self,
+                "CellExplore folders",
+                "No candidate folders found. Run postprocess first or add folders manually.",
+            )
+        dialog = QDialog(self)
+        dialog.setWindowTitle("CellExplore folders")
+        dialog.resize(1100, 520)
+        dialog.setStyleSheet(
+            """
+            QDialog {
+                background: #252525;
+                color: #e5e5e5;
+            }
+            QTableWidget {
+                background: #1f1f1f;
+                color: #eeeeee;
+                gridline-color: #555555;
+                selection-background-color: #327aa8;
+            }
+            QHeaderView::section {
+                background: #333333;
+                color: #eeeeee;
+                border: 1px solid #555555;
+                padding: 4px;
+            }
+            """
+        )
+        layout = QVBoxLayout(dialog)
+        table = CellExploreFolderTable(rows, self._cell_explorer_sorting_folders, dialog)
+        layout.addWidget(table, 1)
+        buttons = QHBoxLayout()
+        add_button = QPushButton("Add folder")
+        register_button = QPushButton("Register checked")
+        close_button = QPushButton("Close")
+        buttons.addStretch(1)
+        buttons.addWidget(add_button)
+        buttons.addWidget(register_button)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+        def _add_folder() -> None:
+            path = self._select_directory(
+                "Add CellExplore sorting folder",
+                self.local_root.text() or str(Path.cwd()),
+            )
+            if path:
+                table.add_folder(Path(path), checked=True)
+
+        def _register() -> None:
+            self._set_cell_explorer_sorting_folders(table.selected_paths())
+            self._append_log(
+                "Registered CellExplore folders:\n"
+                + "".join(f"  - {path}\n" for path in self._cell_explorer_sorting_folders)
+            )
+            dialog.accept()
+
+        add_button.clicked.connect(_add_folder)
+        register_button.clicked.connect(_register)
+        close_button.clicked.connect(dialog.reject)
+        dialog.exec()
+
+    def _view_multi_day_sessions(self) -> None:
+        if not self._multi_day_session_paths:
+            QMessageBox.information(
+                self,
+                "Multi-day sessions",
+                "No multi-day sessions selected. Use Browse for multi-days first.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Multi-day session order")
+        dialog.resize(1100, 480)
+        dialog.setStyleSheet(
+            """
+            QDialog {
+                background: #252525;
+                color: #e5e5e5;
+            }
+            QTableWidget {
+                background: #1f1f1f;
+                alternate-background-color: #272727;
+                color: #e5e5e5;
+                gridline-color: #565656;
+                selection-background-color: #2d6f9f;
+                selection-color: #ffffff;
+            }
+            QTableWidget::item {
+                padding: 4px;
+            }
+            QHeaderView::section {
+                background: #303030;
+                color: #f0f0f0;
+                border: 1px solid #555555;
+                padding: 5px;
+            }
+            QPushButton {
+                background: #3a3a3a;
+                color: #f0f0f0;
+                border: 1px solid #5f5f5f;
+                border-radius: 5px;
+                padding: 7px 14px;
+            }
+            QPushButton:hover {
+                background: #464646;
+                border-color: #777777;
+            }
+            """
+        )
+        layout = QVBoxLayout(dialog)
+        table = MultiDaySessionOrderTable(self._multi_day_session_paths, dialog)
+        table.setAlternatingRowColors(True)
+        layout.addWidget(table)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        update_button = buttons.addButton("Update order", QDialogButtonBox.ButtonRole.AcceptRole)
+
+        def apply_order() -> None:
+            paths = table.paths()
+            if len(paths) != len(self._multi_day_session_paths):
+                QMessageBox.warning(dialog, "Update order", "Session table is incomplete.")
+                return
+            self._set_multi_day_session_paths(paths)
+            if len(paths) >= 2:
+                self.basepath.setText(paths[0])
+            self._auto_load_existing_chanmap()
+            self._schedule_refresh()
+            self._append_log("Updated multi-day session order.\n")
+            dialog.accept()
+
+        update_button.clicked.connect(apply_order)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def _browse_multi_days(self) -> None:
+        paths = self._select_directories(
+            "Select multi-day session folders",
+            self.basepath.text() or str(Path.cwd()),
+        )
+        if not paths:
+            return
+        cleaned = [str(Path(path).expanduser()) for path in paths]
+        self._set_multi_day_session_paths(cleaned)
+        if not self.multi_day_name.text().strip() and len(cleaned) >= 2:
+            first = Path(cleaned[0]).name
+            last = Path(cleaned[-1]).name
+            self.multi_day_name.setText(f"multiday_{first}_to_{last}")
+        self.basepath.setText(cleaned[0])
+        existing_multiday_xml = Path(cleaned[0]).parent / self.multi_day_name.text().strip() / f"{self.multi_day_name.text().strip()}.xml"
+        if existing_multiday_xml.exists():
+            self.xml_path.setText(str(existing_multiday_xml))
+        else:
+            self._auto_load_existing_xml()
+        self._auto_load_existing_chanmap()
+        self._schedule_refresh()
 
     def _browse_local_root(self) -> None:
         path = self._select_directory("Select local output root", self.local_root.text() or str(Path.cwd()))
@@ -2827,6 +3408,14 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.sorting_phy_folder.setText(path)
+
+    def _browse_manual_sorting_folder(self) -> None:
+        path = self._select_directory(
+            "Select sorting folder",
+            self.manual_sorting_folder.text() or self.local_root.text() or str(Path.cwd()),
+        )
+        if path:
+            self.manual_sorting_folder.setText(path)
 
     def _browse_sorting_search_root(self) -> None:
         path = self._select_directory(
@@ -3390,9 +3979,16 @@ class MainWindow(QMainWindow):
             loaded = _load_default_settings()
             loaded.basepath = current.basepath
             loaded.local_root = current.local_root
+            loaded.xml_path = current.xml_path
+            loaded.multi_day_enabled = current.multi_day_enabled
+            loaded.multi_day_session_paths = list(current.multi_day_session_paths)
+            loaded.multi_day_name = current.multi_day_name
             loaded.chanmap_path = current.chanmap_path
             loaded.postprocess.sorting_phy_folder = current.postprocess.sorting_phy_folder
             loaded.postprocess.sorting_search_root = current.postprocess.sorting_search_root
+            loaded.postprocess.cell_explorer_sorting_folders = list(
+                current.postprocess.cell_explorer_sorting_folders
+            )
             self._apply_settings(loaded)
             self._append_log(f"Loaded default config: {DEFAULT_CONFIG_PATH}\n")
         except Exception as exc:
@@ -3528,6 +4124,7 @@ class MainWindow(QMainWindow):
         postprocess = PostprocessGuiSettings(
             sorting_phy_folder=self.sorting_phy_folder.text().strip(),
             sorting_search_root=self.sorting_search_root.text().strip(),
+            cell_explorer_sorting_folders=list(self._cell_explorer_sorting_folders),
             apply_preprocess=self.post_apply_preprocess.isChecked(),
             exclude_cluster_groups=[g.strip() for g in self.exclude_groups.text().split(",") if g.strip()],
             duplicate_censored_period_ms=self.duplicate_censored.value(),
@@ -3549,7 +4146,11 @@ class MainWindow(QMainWindow):
         return PipelineGuiSettings(
             basepath=self.basepath.text().strip(),
             local_root=self.local_root.text().strip(),
+            xml_path=self.xml_path.text().strip(),
             chanmap_path=self.chanmap_path.text().strip(),
+            multi_day_enabled=bool(self._multi_day_session_paths),
+            multi_day_session_paths=list(self._multi_day_session_paths),
+            multi_day_name=self.multi_day_name.text().strip(),
             preprocess=preprocess,
             behavior=behavior,
             postprocess=postprocess,
@@ -3560,6 +4161,12 @@ class MainWindow(QMainWindow):
         try:
             self.basepath.setText(settings.basepath)
             self.local_root.setText(settings.local_root or str(settings.local_root_path))
+            xml_text = settings.xml_path.strip()
+            if xml_text and not Path(xml_text).expanduser().exists():
+                xml_text = ""
+            self.xml_path.setText(xml_text)
+            self._set_multi_day_session_paths(list(settings.multi_day_session_paths))
+            self.multi_day_name.setText(settings.multi_day_name)
             self.chanmap_path.setText(settings.chanmap_path)
             p = settings.preprocess
             self.analog_inputs.setChecked(p.analog_inputs)
@@ -3640,6 +4247,7 @@ class MainWindow(QMainWindow):
             pp = settings.postprocess
             self.sorting_phy_folder.setText(pp.sorting_phy_folder)
             self.sorting_search_root.setText(pp.sorting_search_root)
+            self._set_cell_explorer_sorting_folders(list(pp.cell_explorer_sorting_folders))
             self.post_apply_preprocess.setChecked(pp.apply_preprocess)
             self.exclude_groups.setText(", ".join(pp.exclude_cluster_groups))
             self.duplicate_censored.setValue(pp.duplicate_censored_period_ms)
@@ -3739,10 +4347,15 @@ class MainWindow(QMainWindow):
             settings = self._collect_settings()
             if settings.basepath_path is None:
                 raise ValueError("basepath is required.")
+            xml_path = settings.resolved_xml_path()
+            if xml_path is None or not xml_path.exists():
+                self._warn_missing_xml_for_settings(settings, context="generate-chanmap")
+                return
             basepath, basename, local_output_dir, _xml_path = select_paths_with_gui(
                 use_gui=False,
                 manual_basepath=settings.basepath_path,
                 local_root=settings.local_root_path,
+                manual_xml_path=xml_path,
             )
             chanmap_path, bad_channels = prepare_chanmap(
                 basepath=basepath,
@@ -3750,6 +4363,7 @@ class MainWindow(QMainWindow):
                 local_output_dir=local_output_dir,
                 probe_assignments=settings.preprocess.probe_assignments,
                 reject_channels=settings.preprocess.reject_channels,
+                xml_path=_xml_path,
             )
             self.chanmap_path.setText(str(chanmap_path))
             self._load_chanmap_preview(chanmap_path)
@@ -3872,7 +4486,8 @@ class MainWindow(QMainWindow):
         return matlab_cmd
 
     def _resolve_cell_explorer_sorting_dir(self, settings: PipelineGuiSettings) -> Path:
-        sorting_folder = settings.postprocess_sorting_folder()
+        manual_text = self.manual_sorting_folder.text().strip()
+        sorting_folder = Path(manual_text).expanduser() if manual_text else settings.postprocess_sorting_folder()
         if sorting_folder is None:
             raise FileNotFoundError(
                 "No sorting folder could be resolved. Run sorting/postprocess first or set Postprocess target > sorting folder."
@@ -3880,56 +4495,21 @@ class MainWindow(QMainWindow):
         return self._resolve_phy_params_path(sorting_folder).parent
 
     def _resolve_cell_explorer_sorting_dirs(self, settings: PipelineGuiSettings) -> list[Path]:
-        explicit = settings.postprocess.sorting_phy_folder.strip()
-        if explicit:
-            return [self._resolve_cell_explorer_sorting_dir(settings)]
-
-        roots = [
-            _path
-            for _path in (
-                settings.local_output_dir,
-                Path(settings.postprocess.sorting_search_root).expanduser()
-                if settings.postprocess.sorting_search_root.strip()
-                else None,
+        if not self._cell_explorer_sorting_folders:
+            raise ValueError(
+                "No CellExplore folders registered. Use Select folders and check at least one folder first."
             )
-            if _path is not None and _path.exists()
-        ]
-        for root in roots:
-            manifest_path = root / "sorter_partition_manifest.json"
-            if not manifest_path.exists():
+        folders: list[Path] = []
+        seen: set[str] = set()
+        for folder_text in self._cell_explorer_sorting_folders:
+            folder = Path(folder_text).expanduser()
+            resolved = self._resolve_phy_params_path(folder).parent
+            key = str(resolved.resolve())
+            if key in seen:
                 continue
-            try:
-                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-                folders = []
-                for partition in payload.get("partitions", []):
-                    folder_text = str(partition.get("output_folder") or "").strip()
-                    if not folder_text:
-                        continue
-                    folder = Path(folder_text).expanduser()
-                    if folder.exists():
-                        folders.append(self._resolve_phy_params_path(folder).parent)
-                unique = []
-                seen = set()
-                for folder in folders:
-                    key = str(folder.resolve())
-                    if key not in seen:
-                        unique.append(folder)
-                        seen.add(key)
-                if unique:
-                    return unique
-            except Exception as exc:
-                self._append_warning_log(f"[WARN] Failed to read sorter partition manifest {manifest_path}: {exc}\n")
-
-        candidates: list[Path] = []
-        for root in roots:
-            for pattern in ("Kilosort_*", "Kilosort2_5_*", "Kilosort2.5_*", "Kilosort4_*"):
-                for candidate in root.glob(pattern):
-                    if candidate.is_dir() and not candidate.name.endswith("_spi"):
-                        candidates.append(candidate)
-        if candidates:
-            ordered = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
-            return [self._resolve_phy_params_path(path).parent for path in ordered]
-        return [self._resolve_cell_explorer_sorting_dir(settings)]
+            folders.append(resolved)
+            seen.add(key)
+        return folders
 
     @staticmethod
     def _matlab_string(value: Path | str) -> str:
@@ -4052,6 +4632,9 @@ class MainWindow(QMainWindow):
             self._append_log(f"MATLAB: {matlab_program}\n")
             self._append_log(f"Working directory: {basepath}\n")
             self._append_log(f"CellExplorer root: {VENDORED_CELLEXPLORER_ROOT}\n")
+            self._append_log(
+                f"CellExplore sorter mode: {'multi-sorter' if len(sorting_dirs) > 1 else 'single-sorter'}\n"
+            )
             self._append_log(
                 "Sorting folders:\n" + "".join(f"  - {path}\n" for path in sorting_dirs)
             )
@@ -4213,10 +4796,11 @@ class MainWindow(QMainWindow):
             return
         try:
             settings = self._collect_settings()
-            sorting_folder = settings.postprocess_sorting_folder()
+            manual_text = self.manual_sorting_folder.text().strip()
+            sorting_folder = Path(manual_text).expanduser() if manual_text else settings.postprocess_sorting_folder()
             if sorting_folder is None:
                 raise FileNotFoundError(
-                    "No sorting folder could be resolved. Run sorting first or set Postprocess target > sorting folder."
+                    "No sorting folder could be resolved. Run postprocess first or choose a Manual Curation folder."
                 )
             params_path = self._resolve_phy_params_path(sorting_folder)
             phy_program = self._resolve_phy_program()
@@ -4259,8 +4843,11 @@ class MainWindow(QMainWindow):
         if dialog.clickedButton() is not stop_button:
             return
         self._force_stop_requested = True
+        self._process_stop_escalated = False
         self._append_log("\n=== Force stop requested ===\n")
+        self._set_running(False)
         self._kill_process_tree()
+        QTimer.singleShot(2500, self._escalate_force_stop)
 
     def _start_run(self, mode: RunMode) -> None:
         if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
@@ -4288,6 +4875,7 @@ class MainWindow(QMainWindow):
                 return
 
         self._force_stop_requested = False
+        self._process_stop_escalated = False
         self._set_running(True)
         self._append_log(f"\n=== Running {mode} ===\n")
         fd, config_name = tempfile.mkstemp(prefix="preprocess_gui_", suffix=".json")
@@ -4363,6 +4951,7 @@ class MainWindow(QMainWindow):
         self._flush_log_buffer()
         stopped = self._force_stop_requested
         self._force_stop_requested = False
+        self._process_stop_escalated = False
         self._set_running(False)
         if self._process_config_path is not None:
             self._process_config_path.unlink(missing_ok=True)
@@ -4374,6 +4963,11 @@ class MainWindow(QMainWindow):
         if exit_code == 0:
             self._append_log("\n=== Run finished ===\n")
             if self._process_result:
+                multi_day_result = self._process_result.get("multi_day_result") or {}
+                server_basepath = multi_day_result.get("server_basepath")
+                if server_basepath:
+                    self.basepath.setText(server_basepath)
+                    self.multi_day_name.setText(str(multi_day_result.get("name") or self.multi_day_name.text()))
                 pre_result = self._process_result.get("preprocess_result") or {}
                 sorter_output = pre_result.get("sorter_output_dir")
                 sorter_outputs = pre_result.get("sorter_output_dirs") or []
@@ -4428,25 +5022,100 @@ class MainWindow(QMainWindow):
                     raise
                 time.sleep(delay)
 
-    def _kill_process_tree(self) -> None:
+    def _descendant_pids(self, root_pid: int) -> list[int]:
+        proc_root = Path("/proc")
+        if os.name == "nt" or not proc_root.exists() or root_pid <= 0:
+            return []
+        children: dict[int, list[int]] = {}
+        for stat_path in proc_root.glob("[0-9]*/stat"):
+            try:
+                text = stat_path.read_text(encoding="utf-8", errors="replace")
+                rparen = text.rfind(")")
+                if rparen < 0:
+                    continue
+                pid = int(stat_path.parent.name)
+                fields = text[rparen + 2 :].split()
+                if len(fields) < 2:
+                    continue
+                ppid = int(fields[1])
+            except Exception:
+                continue
+            children.setdefault(ppid, []).append(pid)
+
+        descendants: list[int] = []
+        stack = list(children.get(root_pid, []))
+        while stack:
+            pid = stack.pop()
+            descendants.append(pid)
+            stack.extend(children.get(pid, []))
+        return descendants
+
+    def _send_signal_to_process_tree(self, sig: signal.Signals) -> None:
         process = self._process
         if process is None:
             return
         pid = int(process.processId())
         if os.name == "nt" and pid > 0:
             QProcess.startDetached("taskkill", ["/PID", str(pid), "/T", "/F"])
-        elif pid > 0:
+            return
+        if pid > 0:
+            descendants = self._descendant_pids(pid)
             try:
-                os.killpg(pid, signal.SIGTERM)
+                os.killpg(pid, sig)
             except ProcessLookupError:
-                return
+                pass
             except OSError:
-                process.kill()
+                pass
+            for child_pid in reversed(descendants):
+                try:
+                    os.kill(child_pid, sig)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    pass
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
         else:
-            process.kill()
+            if sig == signal.SIGKILL:
+                process.kill()
+            else:
+                process.terminate()
+
+    def _kill_process_tree(self) -> None:
+        self._send_signal_to_process_tree(signal.SIGTERM)
+
+    def _escalate_force_stop(self) -> None:
+        process = self._process
+        if not self._force_stop_requested or process is None:
+            return
+        if process.state() == QProcess.ProcessState.NotRunning:
+            return
+        if self._process_stop_escalated:
+            return
+        self._process_stop_escalated = True
+        self._append_log("=== Force stop escalation: killing remaining worker processes ===\n")
+        self._send_signal_to_process_tree(signal.SIGKILL)
+        process.kill()
+        QTimer.singleShot(1500, self._detach_stuck_process_after_force_stop)
+
+    def _detach_stuck_process_after_force_stop(self) -> None:
+        process = self._process
+        if not self._force_stop_requested or process is None:
+            return
+        if process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self._append_warning_log(
+            "[WARN] Pipeline process did not report exit after SIGKILL; detaching GUI state.\n"
+        )
+        self._set_running(False)
 
     def _process_error_occurred(self, error: QProcess.ProcessError) -> None:
         self._force_stop_requested = False
+        self._process_stop_escalated = False
         self._set_running(False)
         if self._process_config_path is not None:
             self._process_config_path.unlink(missing_ok=True)
@@ -4456,6 +5125,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: Any) -> None:
         if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
+            if self._force_stop_requested:
+                self._send_signal_to_process_tree(signal.SIGKILL)
+                self._process.kill()
+                self._append_log("\n=== Closing GUI after force stop request ===\n")
+                super().closeEvent(event)
+                return
             QMessageBox.warning(
                 self,
                 "Run active",

@@ -105,6 +105,7 @@ def select_paths_with_gui(
     local_root: Path | None = None,
     use_gui: bool = True,
     manual_basepath: str | Path | None = None,
+    manual_xml_path: str | Path | None = None,
 ) -> tuple[Path, str, Path, Path]:
     basepath = select_basepath(
         use_gui=use_gui,
@@ -118,7 +119,12 @@ def select_paths_with_gui(
     local_output_dir = (local_root / basename).resolve()
     local_output_dir.mkdir(parents=True, exist_ok=True)
 
-    xml_path = ensure_xml(basepath=basepath, local_output_dir=local_output_dir, basename=basename)
+    xml_path = ensure_xml(
+        basepath=basepath,
+        local_output_dir=local_output_dir,
+        basename=basename,
+        explicit_xml_path=Path(manual_xml_path) if manual_xml_path else None,
+    )
     return basepath, basename, local_output_dir, xml_path
 
 
@@ -391,6 +397,8 @@ def build_channel_map_data(
     electrode_type: str | None = None,
     reject_channels: list[int] | None = None,
     probe_assignments: list[dict] | None = None,
+    xml_path: Path | str | None = None,
+    emit_warnings: bool = False,
 ) -> dict[str, np.ndarray | str] | None:
     reject_channels = reject_channels or []
 
@@ -400,12 +408,13 @@ def build_channel_map_data(
         if basename.endswith(".xml"):
             basename = os.path.splitext(basename)[0]
 
-    xml_path = base_path / f"{basename}.xml"
-    if not xml_path.exists():
-        print(f"Error: XML file {xml_path} not found.")
+    resolved_xml_path = Path(xml_path).expanduser() if xml_path is not None else base_path / f"{basename}.xml"
+    if not resolved_xml_path.exists():
+        if emit_warnings:
+            print(f"Warning: XML file {resolved_xml_path} not found. Set XML first.")
         return None
 
-    anat_grps, spk_channels, has_spk_groups, skipped_channels, root = _load_xml_groups_for_chanmap(xml_path)
+    anat_grps, spk_channels, has_spk_groups, skipped_channels, root = _load_xml_groups_for_chanmap(resolved_xml_path)
 
     ngroups = len(anat_grps)
     if ngroups == 0:
@@ -552,6 +561,7 @@ def create_channel_map(
     electrode_type: str | None = None,
     reject_channels: list[int] | None = None,
     probe_assignments: list[dict] | None = None,
+    xml_path: Path | str | None = None,
 ) -> Path | None:
     save_dict = build_channel_map_data(
         basepath=basepath,
@@ -559,6 +569,7 @@ def create_channel_map(
         electrode_type=electrode_type,
         reject_channels=reject_channels,
         probe_assignments=probe_assignments,
+        xml_path=xml_path,
     )
     if save_dict is None:
         return None
@@ -612,6 +623,7 @@ def prepare_chanmap(
     local_output_dir: Path,
     probe_assignments: list[dict],
     reject_channels: list[int] | None = None,
+    xml_path: Path | None = None,
 ) -> tuple[Path, list[int]]:
     chanmap_path = create_channel_map(
         basepath=basepath,
@@ -619,6 +631,7 @@ def prepare_chanmap(
         outputDir=local_output_dir,
         probe_assignments=probe_assignments,
         reject_channels=reject_channels or [],
+        xml_path=xml_path,
     )
     if chanmap_path is None:
         raise RuntimeError("Failed to create chanMap.mat")
@@ -807,29 +820,29 @@ def _resolve_openephys_stream_info(recording_root: Path) -> tuple[Path, str, Pat
     return continuous_dat, stream_name, ttl_path, num_channels, sampling_frequency
 
 
-def ensure_xml(basepath: Path, local_output_dir: Path, basename: str) -> Path:
+def ensure_xml(
+    basepath: Path,
+    local_output_dir: Path,
+    basename: str,
+    *,
+    explicit_xml_path: Path | None = None,
+) -> Path:
     target = local_output_dir / f"{basename}.xml"
+    if explicit_xml_path is not None:
+        explicit = Path(explicit_xml_path).expanduser().resolve()
+        if not explicit.exists() or not explicit.is_file():
+            raise FileNotFoundError(f"Selected XML file does not exist: {explicit}")
+        copy2(explicit, target)
+        return target
+
     base_xml = basepath / f"{basename}.xml"
     if base_xml.exists():
         copy2(base_xml, target)
         return target
 
-    parent_xml = sorted(basepath.parent.glob("*.xml"))
-    if len(parent_xml) == 1:
-        copy2(parent_xml[0], target)
-        return target
-    if len(parent_xml) > 1:
-        names = ", ".join(p.name for p in parent_xml)
-        raise FileNotFoundError(
-            f"Multiple xml files found in parent directory ({basepath.parent}): {names}. "
-            f"Place {basename}.xml in {basepath} or keep exactly one parent xml."
-        )
-
-    if target.exists():
-        return target
-
     raise FileNotFoundError(
-        f"No xml file found. Expected {base_xml} or exactly one xml in parent directory ({basepath.parent})."
+        f"No XML file selected and no basename XML found. Expected {base_xml}; "
+        "use Load XML to select one before running."
     )
 
 
@@ -1232,6 +1245,19 @@ def save_params_and_manifest(
     output_dir: Path,
     script_path: Path | None = None,
 ) -> None:
+    def _sanitize_for_json(value):
+        if isinstance(value, os.PathLike):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(k): _sanitize_for_json(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_sanitize_for_json(v) for v in value]
+        if isinstance(value, set):
+            return [_sanitize_for_json(v) for v in sorted(value, key=str)]
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
     def _sanitize_for_mat(value):
         if isinstance(value, dict):
             return {k: _sanitize_for_mat(v) for k, v in value.items()}
@@ -1239,15 +1265,18 @@ def save_params_and_manifest(
             return [_sanitize_for_mat(v) for v in value]
         if isinstance(value, tuple):
             return [_sanitize_for_mat(v) for v in value]
+        if isinstance(value, os.PathLike):
+            return str(value)
         if value is None:
             return ""
         return value
 
-    cfg = asdict(config)
+    cfg = _sanitize_for_json(asdict(config))
     cfg["basepath"] = str(config.basepath)
     cfg["localpath"] = str(config.localpath) if config.localpath else None
     cfg["output_dir"] = str(config.output_dir) if config.output_dir else None
     cfg["chanmap_mat_path"] = str(config.chanmap_mat_path) if config.chanmap_mat_path else None
+    cfg["xml_path"] = str(config.xml_path) if config.xml_path else None
     cfg["sorter_path"] = str(config.sorter_path) if config.sorter_path else None
     cfg["sorter_config_path"] = str(config.sorter_config_path) if config.sorter_config_path else None
     cfg["matlab_path"] = str(config.matlab_path) if config.matlab_path else None
@@ -1276,6 +1305,10 @@ def save_params_and_manifest(
         "subsession_sample_counts": result.subsession_sample_counts,
         "sorter": result.sorter,
         "sorter_output_dir": str(result.sorter_output_dir) if result.sorter_output_dir else None,
+        "sorter_output_dirs": [str(p) for p in result.sorter_output_dirs],
+        "sorter_partition_manifest_path": (
+            str(result.sorter_partition_manifest_path) if result.sorter_partition_manifest_path else None
+        ),
         "state_score_paths": [str(p) for p in result.state_score_paths],
         "state_score_figure_paths": [str(p) for p in result.state_score_figure_paths],
     }

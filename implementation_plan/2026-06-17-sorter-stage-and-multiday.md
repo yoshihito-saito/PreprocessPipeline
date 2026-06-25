@@ -183,6 +183,188 @@ debugging can trace a time range back to a source session/subepoch. The common
 epoch label can be analysis-facing metadata, while the manifest stores the
 full session/day/subepoch ownership.
 
+### 2026-06-24 Multi-Day First Implementation
+
+Implement multi-day as a staging layer in front of the existing single-session
+pipeline:
+
+1. GUI `Browse for multi-days` selects multiple session folders.
+2. A server-side multi-day basepath is created under the common parent of the
+   selected sessions, using a stable name such as `multiday_<first>_to_<last>`.
+3. The local multi-day basepath is the existing local root plus the same
+   multi-day basename.
+4. The server-side multi-day basepath contains symlinks to each source
+   session/subepoch directory, ordered by the existing subsession sort key and
+   prefixed with session order so names remain unique.
+5. The first session's XML and RHD metadata are copied into the multi-day
+   basepath under the multi-day basename. The first pass requires compatible
+   channel count and sampling metadata across sessions.
+6. A `multi_day_manifest.json` records selected sessions, source subepochs,
+   staged subepoch folders, and ordering/provenance.
+7. The regular `run_preprocess_session` then runs on the staged multi-day
+   basepath. `MergePoints` rows naturally stay at the staged subepoch level.
+
+This first pass avoids copying large binary files. It is intended for standard
+Intan-style subepoch folders and Open Ephys datetime folders that can be
+represented as direct children of the staged multi-day basepath.
+
+### 2026-06-24 XML Selection Update
+
+Remove implicit parent-directory XML discovery. XML resolution should be
+explicit and predictable:
+
+1. If a GUI/user-selected XML path is provided, copy that XML to the local
+   output as `<basename>.xml` and use it.
+2. Otherwise, if `basepath/<basename>.xml` exists, use it automatically.
+3. Otherwise, leave the GUI XML field empty and raise an error when the user
+   runs preprocessing.
+
+### 2026-06-24 CellExplorer X11 Visibility Update
+
+When running from Windows through SSH/X11 forwarding, the CellExplorer manual
+curation GUI can appear only as a MATLAB taskbar icon even though earlier
+ProcessCellMetrics figures are visible. CellExplorer creates its main figure as
+hidden and then shows it by setting `WindowState` to `maximize`; that maximize
+step is less reliable under forwarded X11 window managers than ordinary MATLAB
+figures.
+
+The local vendored CellExplorer launch should keep the existing behavior on
+native desktop environments but, on Linux/X11, show the main CellExplorer figure
+as a normal on-screen window with an explicit size and bring it to the front.
+This is a GUI visibility workaround only and must not change CellExplorer
+metrics generation or sorter folder selection.
+
+The GUI wrapper should request waveform extraction from dat for the normal
+CellExplorer curation workflow. This is slower than using Kilosort templates,
+but it matches the expected manual-curation waveform source and avoids relying
+on template array ordering when raw data are available.
+
+Waveform extraction should happen once in the wrapper's explicit `loadSpikes`
+step. After the merged `spikes` struct is passed into `ProcessCellMetrics`, the
+metrics step should not call `loadSpikes` or `getWaveformsFromDat` again.
+MonoSynaptic connection metrics should be recomputed for the explicitly selected
+single- or multi-sorter folder set only when no compatible mono_res file exists.
+Because CellExplorer loads an existing mono_res file before recomputing it, the
+wrapper should keep a compatible mono_res file so it is loaded directly. To
+avoid stale cell-pair indices from a previous sorter selection, the wrapper
+should validate the existing mono_res against the current merged cell count and
+remove it only when its connection indices or CCG dimensions are incompatible.
+
+Before launching the CellExplorer GUI, the wrapper should also ensure GUI
+classification fields that CellExplorer assumes are present. In particular,
+`deepSuperficial_num` may be absent when deep-superficial ripple classification
+is skipped, even though CellExplorer's `updateUI` indexes it directly. The
+wrapper should preserve the metric as `Unknown` and write
+`deepSuperficial_num = 1` for all cells when no explicit classification exists.
+
+Do not add wrapper-side or vendored CellExplorer logic that rewrites or
+implicitly remaps Kilosort/Phy cluster ids or template indices. Preserving the
+original Phy identifiers is more important than supporting the unused template
+waveform fallback path. If template waveform loading is needed later, it should
+be designed explicitly and tested against Phy/Kilosort outputs.
+
+### 2026-06-24 GUI Result Serialization Fix
+
+Multi-day probe-partitioned sorting can complete the preprocess stage and save
+the sorter partition manifest, then fail while the GUI helper prints the final
+JSON result. The run payload may still contain `pathlib.Path` values from
+downstream return objects, and `json.dumps()` cannot serialize those objects.
+
+The GUI runner should sanitize its final result payload recursively before
+printing it with the `__PREPROCESS_GUI_RESULT__` prefix. The preprocess
+`save_params_and_manifest()` path should also serialize newly introduced
+`Path`-typed fields such as explicit `xml_path`, multi-sorter output folders,
+and the sorter partition manifest path. These fixes should not change sorting
+outputs or postprocess behavior.
+
+### 2026-06-24 Multi-Sorter Postprocess Target Resolution
+
+Manual curation needs a single selected sorting folder for Phy, but multi-sorter
+postprocess should process every partition generated by a multi-sorter run. If
+the postprocess search root contains `sorter_partition_manifest.json`, target
+resolution should prefer the manifest partition `output_folder` list. This
+prevents the Manual Curation selected folder, for example `probe3`, from
+causing `Run postprocess` to create only `probe3_spi`.
+
+The Manual Curation folder is for Phy only and should not update the
+Postprocess target. `Run all` and `Run postprocess` should use the multi-sorter
+manifest when present, including cases where sorting is skipped because
+existing Kilosort folders are being reused. Single-folder explicit postprocess
+remains valid when no matching multi-sorter manifest is available.
+
+CellExplore folder selection should be explicit. The GUI should show
+CellExplore candidate folders in a table with checkboxes, seeded from the
+multi-sorter manifest when available. All newly discovered candidates should be
+unchecked by default; `Run CellExplore` should error until the user registers at
+least one checked folder. One registered folder runs the single-sorter path,
+while two or more registered folders run the wrapper's multi-sorter merge path.
+The selected Phy folder is not an implicit CellExplore input.
+Raw Kilosort folders and their corresponding `_spi` postprocess folders may
+both be displayed, but they should share one selection group so only one of the
+pair can be checked at a time.
+
+For multi-day staging, an explicitly loaded XML should update the staged
+`<multi_day_name>.xml` even if one already exists. If no explicit XML is
+provided, an existing staged XML is used; otherwise the first selected session's
+basename XML is copied as the first-pass default. Parent-directory XML files and
+arbitrary one-off XML files inside a folder are not implicit candidates. When a
+loaded or staged XML is available, it is treated as the authoritative XML; when
+none is available, each selected session must have its own basename XML so the
+staging step can validate channel count and sampling rate compatibility.
+
+### 2026-06-24 Open Ephys Multi-Day Sample Counts
+
+Align multi-day staging with the existing single-session Open Ephys path. The
+single-session pipeline resolves Open Ephys frame size from `structure.oebin`,
+not from the XML `nChannels`, because `continuous.dat` can include non-sorting
+channels such as ADC channels. Multi-day staging should use the same rule when
+it computes per-subepoch sample counts for the manifest:
+
+1. If a discovered subepoch is an Open Ephys recording root, read
+   `structure.oebin` with the existing stream resolver and use that stream's
+   `num_channels` and `sample_rate` for binary frame-size checks.
+2. Keep XML `nChannels` as the sorting/chanMap metadata, not as the Open Ephys
+   raw binary frame size.
+3. Match single-session behavior by rejecting Open Ephys subepochs whose stream
+   channel count or sampling frequency differ within the staged multi-day run.
+
+### 2026-06-24 Multi-Day GUI Usability Update
+
+Improve GUI feedback for XML and multi-day session ordering:
+
+1. Move `Load XML` into the top of the `Session and channel map` section so XML
+   selection is visually tied to channel-map generation and preview.
+2. Do not print missing-XML channel-map preview failures to the terminal from
+   GUI refresh paths. If the XML field is empty, passive preview should stay
+   quiet. If the user entered a non-existent XML path, the GUI should log a
+   warning such as "set XML first" once per missing XML state instead of
+   showing an `Error:` line on stdout. Run preflight is stricter: explicit
+   loaded XML paths satisfy the XML check, while no resolved XML is an error
+   before preprocessing starts.
+3. Keep selected multi-day session folders as an internal ordered list and show
+   only a concise summary in the top bar.
+4. Add a session-order viewer dialog with a table containing order, session
+   name, and full path. The table should support direct order-number editing and
+   an `Update order` action that writes the edited order back into the run
+   settings. Drag/drop row movement is intentionally disabled because the Qt
+   item move behavior can remove row contents when combined with immediate
+   redraws.
+5. Keep the session-order dialog readable under the dark GUI theme, make the
+   session-name column wide enough to scan, and allow direct editing of the
+   order number. Editing an order number should immediately reorder and redraw
+   the table so the displayed order always matches the pending order.
+6. Skip Intan `info.rhd` preflight checks when the selected basepath is detected
+   as Open Ephys, because Open Ephys sessions do not need Intan header metadata.
+7. Force stop should terminate the whole preprocessing process tree, including
+   SpikeInterface/joblib workers used by binary writing and artifact detection.
+   The GUI should re-enable run and manual-curation controls immediately after
+   the stop request while still escalating termination in the background.
+8. Manual curation should expose the active sorting folder next to `Launch Phy`
+   so multi-Kilosort runs can launch each sorter folder explicitly. The field
+   should stay synchronized with the existing Postprocess target sorting folder.
+   `Run CellExplore postprocess` can sit below and use the same folder field;
+   leaving it blank keeps the existing multi-folder CellExplorer behavior.
+
 ## Affected Modules and Files
 
 Expected source modules:

@@ -88,40 +88,51 @@ session = apply_anatomical_map_csv(session, fullfile(basepath, 'anatomical_map.c
 save(sessionFile, 'session');
 
 if prePhy
+    cellMetricsSaveAs = 'unsorted.cell_metrics';
     spikes = load_spikes_from_sorting_folders( ...
         'session', session, ...
         'sortingFolders', sortingFolders, ...
         'basepath', basepath, ...
         'labelsToRead', spikeLabels, ...
-        'getWaveformsFromDat', false, ...
+        'showWaveforms', true, ...
+        'getWaveformsFromDat', true, ...
         'forceReload', true, ...
         'saveMat', false);
     save(fullfile(basepath, [basename, '.unsorted.spikes.cellinfo.mat']), 'spikes');
+    keep_or_remove_existing_mono_res(basepath, basename, cellMetricsSaveAs, numel(spikes.times));
     cell_metrics = ProcessCellMetrics( ...
         'session', session, ...
         'spikes', spikes, ...
         'getWaveformsFromDat', false, ...
         'forceReload', true, ...
-        'forceReloadSpikes', true, ...
+        'forceReloadSpikes', false, ...
         'manualAdjustMonoSyn', false, ...
-        'excludeMetrics', {'deepSuperficial', 'monoSynaptic_connections'}, ...
-        'saveAs', 'unsorted.cell_metrics');
+        'excludeMetrics', {'deepSuperficial'}, ...
+        'saveAs', cellMetricsSaveAs);
 else
+    cellMetricsSaveAs = 'cell_metrics';
     spikes = load_spikes_from_sorting_folders( ...
         'session', session, ...
         'sortingFolders', sortingFolders, ...
         'basepath', basepath, ...
         'labelsToRead', spikeLabels, ...
+        'showWaveforms', true, ...
+        'getWaveformsFromDat', true, ...
         'forceReload', true, ...
         'saveMat', false);
     save(fullfile(basepath, [basename, '.spikes.cellinfo.mat']), 'spikes');
+    keep_or_remove_existing_mono_res(basepath, basename, cellMetricsSaveAs, numel(spikes.times));
     cell_metrics = ProcessCellMetrics( ...
         'session', session, ...
         'spikes', spikes, ...
         'getWaveformsFromDat', false, ...
-        'manualAdjustMonoSyn', false);
+        'forceReloadSpikes', false, ...
+        'manualAdjustMonoSyn', false, ...
+        'excludeMetrics', {'deepSuperficial'});
 end
 
+cell_metrics = ensure_cell_explorer_gui_fields(cell_metrics);
+save_cell_metrics_for_gui(basepath, basename, cellMetricsSaveAs, cell_metrics);
 save(sessionFile, 'session');
 launch_cell_explorer_gui(basepath, basename, cell_metrics);
 end
@@ -200,6 +211,72 @@ drawnow;
 cell_metrics = CellExplorer('basepath', basepath); %#ok<NASGU>
 end
 
+function keep_or_remove_existing_mono_res(basepath, basename, saveAs, cellCount)
+monoFile = fullfile(basepath, [basename, '.mono_res', erase(saveAs, 'cell_metrics'), '.cellinfo.mat']);
+if exist(monoFile, 'file') ~= 2
+    return
+end
+try
+    loaded = load(monoFile, 'mono_res');
+    if isfield(loaded, 'mono_res') && mono_res_is_compatible(loaded.mono_res, cellCount)
+        disp(['Using existing compatible MonoSynaptic file: ', monoFile]);
+        return
+    end
+catch ME
+    warning('PreprocessPipeline:MonoResReadFailed', ...
+        'Could not validate existing MonoSynaptic file %s: %s', monoFile, ME.message);
+end
+delete(monoFile);
+disp(['Removed incompatible MonoSynaptic file before recomputing: ', monoFile]);
+end
+
+function ok = mono_res_is_compatible(mono_res, cellCount)
+ok = true;
+connectionFields = {'sig_con', 'sig_con_excitatory', 'sig_con_inhibitory'};
+for i = 1:numel(connectionFields)
+    fieldName = connectionFields{i};
+    if isfield(mono_res, fieldName) && ~isempty(mono_res.(fieldName))
+        connections = mono_res.(fieldName);
+        if size(connections, 2) < 2 || any(connections(:, 1:2) < 1, 'all') || any(connections(:, 1:2) > cellCount, 'all')
+            ok = false;
+            return
+        end
+    end
+end
+if isfield(mono_res, 'ccgR') && ~isempty(mono_res.ccgR)
+    ccgSize = size(mono_res.ccgR);
+    if numel(ccgSize) < 3 || ccgSize(2) < cellCount || ccgSize(3) < cellCount
+        ok = false;
+        return
+    end
+end
+end
+
+function cell_metrics = ensure_cell_explorer_gui_fields(cell_metrics)
+if ~isfield(cell_metrics, 'general') || ~isfield(cell_metrics.general, 'cellCount')
+    return
+end
+cellCount = cell_metrics.general.cellCount;
+if ~isfield(cell_metrics, 'deepSuperficial') || numel(cell_metrics.deepSuperficial) ~= cellCount
+    cell_metrics.deepSuperficial = repmat({'Unknown'}, 1, cellCount);
+end
+if ~isfield(cell_metrics, 'deepSuperficialDistance') || numel(cell_metrics.deepSuperficialDistance) ~= cellCount
+    cell_metrics.deepSuperficialDistance = nan(1, cellCount);
+end
+if ~isfield(cell_metrics, 'deepSuperficial_num') || numel(cell_metrics.deepSuperficial_num) ~= cellCount
+    cell_metrics.deepSuperficial_num = ones(1, cellCount);
+end
+end
+
+function save_cell_metrics_for_gui(basepath, basename, saveAs, cell_metrics)
+metricsFile = fullfile(basepath, [basename, '.', saveAs, '.cellinfo.mat']);
+if exist(metricsFile, 'file') == 2
+    save(metricsFile, 'cell_metrics', '-append');
+else
+    save(metricsFile, 'cell_metrics');
+end
+end
+
 function spikes = load_spikes_from_sorting_folders(varargin)
 p = inputParser;
 addParameter(p, 'session', struct(), @isstruct);
@@ -207,6 +284,7 @@ addParameter(p, 'sortingFolders', {}, @iscell);
 addParameter(p, 'basepath', '', @ischar);
 addParameter(p, 'labelsToRead', {'good'}, @iscell);
 addParameter(p, 'getWaveformsFromDat', [], @(x) isempty(x) || islogical(x));
+addParameter(p, 'showWaveforms', false, @islogical);
 addParameter(p, 'forceReload', true, @islogical);
 addParameter(p, 'saveMat', false, @islogical);
 parse(p, varargin{:});
@@ -216,6 +294,7 @@ sortingFolders = p.Results.sortingFolders;
 basepath = p.Results.basepath;
 labelsToRead = p.Results.labelsToRead;
 getWaveformsFromDat = p.Results.getWaveformsFromDat;
+showWaveforms = p.Results.showWaveforms;
 forceReload = p.Results.forceReload;
 saveMat = p.Results.saveMat;
 
@@ -226,6 +305,7 @@ for i = 1:numel(sortingFolders)
         'clusteringpath', clusteringPath, ...
         'labelsToRead', labelsToRead, ...
         'forceReload', forceReload, ...
+        'showWaveforms', showWaveforms, ...
         'saveMat', saveMat ...
     };
     if ~isempty(getWaveformsFromDat)

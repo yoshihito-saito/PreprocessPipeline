@@ -77,6 +77,18 @@ def _repo_relative_path(text: str) -> Path | None:
     return path.resolve()
 
 
+def _has_openephys_recording(basepath: Path) -> bool:
+    for child in sorted(basepath.iterdir()):
+        if not child.is_dir():
+            continue
+        recording_root = child / "Record Node 101" / "experiment1" / "recording1"
+        if (recording_root / "structure.oebin").exists():
+            return True
+    if (basepath / "structure.oebin").exists():
+        return True
+    return False
+
+
 def _local_cmr_check(settings: PipelineGuiSettings) -> CheckResult | None:
     p = settings.preprocess
     if not p.do_preprocess or str(p.reference).strip().lower() != "local":
@@ -91,6 +103,8 @@ def _local_cmr_check(settings: PipelineGuiSettings) -> CheckResult | None:
             basename=settings.basename,
             probe_assignments=p.probe_assignments,
             reject_channels=p.reject_channels,
+            xml_path=settings.resolved_xml_path(),
+            emit_warnings=False,
         )
     except Exception as exc:
         chanmap_path = settings.resolved_chanmap_path()
@@ -158,7 +172,6 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
     basepath = settings.basepath_path
     output_dir = settings.local_output_dir
     chanmap_path = settings.resolved_chanmap_path()
-    full_postprocess = mode == "postprocess" and not settings.postprocess.noise_label_only
 
     checks.append(_check_path("Basepath", basepath, must_be_dir=True))
     if output_dir is None:
@@ -167,26 +180,27 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
         checks.append(CheckResult("Local output", "ok" if output_dir.parent.exists() else "warn", str(output_dir)))
 
     if basepath is not None:
-        xml = basepath / f"{basepath.name}.xml"
-        rhd = find_rhd_source(basepath, basepath.name)
-        if rhd is None and output_dir is not None:
-            local_rhd = output_dir / f"{basepath.name}.rhd"
-            if local_rhd.exists():
-                rhd = local_rhd
+        xml = settings.resolved_xml_path()
         checks.append(
             CheckResult(
                 "Session XML",
-                "ok" if xml.exists() else ("error" if full_postprocess else "warn"),
-                str(xml) if xml.exists() else f"not found at expected path: {xml}",
+                "ok" if xml is not None and xml.exists() else "error",
+                str(xml) if xml is not None and xml.exists() else "not set. Load XML before running.",
             )
         )
-        checks.append(
-            CheckResult(
-                "Intan info.rhd",
-                "ok" if rhd is not None and rhd.exists() else "warn",
-                str(rhd) if rhd is not None and rhd.exists() else "not found in basepath or direct child folders",
+        if not _has_openephys_recording(basepath):
+            rhd = find_rhd_source(basepath, basepath.name)
+            if rhd is None and output_dir is not None:
+                local_rhd = output_dir / f"{basepath.name}.rhd"
+                if local_rhd.exists():
+                    rhd = local_rhd
+            checks.append(
+                CheckResult(
+                    "Intan info.rhd",
+                    "ok" if rhd is not None and rhd.exists() else "warn",
+                    str(rhd) if rhd is not None and rhd.exists() else "not found in basepath or direct child folders",
+                )
             )
-        )
 
     if mode in ("all", "preprocess"):
         if chanmap_path is None:

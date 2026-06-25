@@ -217,7 +217,12 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     basepath, basename = resolve_basepath_and_basename(config.basepath)
     output_dir = resolve_local_output_dir(basepath, basename, config)
 
-    xml_path = ensure_xml(basepath, output_dir, basename)
+    xml_path = ensure_xml(
+        basepath,
+        output_dir,
+        basename,
+        explicit_xml_path=config.xml_path,
+    )
     rhd_path = ensure_rhd(
         basepath,
         output_dir,
