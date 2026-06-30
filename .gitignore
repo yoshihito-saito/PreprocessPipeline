@@ -50,3 +50,4 @@ config/preprocess_gui_default_config.json
 AGENTS.md
 implementation_plan/
 change_log/
+paperflow/
