@@ -11,3 +11,5 @@
 - [2026-06-23 vendored CellExplorer](2026-06-23-vendored-cellexplorer.md)
 - [2026-06-24 multi-Kilosort partitions](2026-06-24-multi-kilosort-partitions.md)
 - [2026-06-24 multi-day staging](2026-06-24-multiday-staging.md)
+- [2026-06-29 flex probe geometry](2026-06-29-flex-probe-geometry.md)
+- [2026-07-05 GUI Launch Phy selected folder](2026-07-05-gui-launch-phy-selected-folder.md)

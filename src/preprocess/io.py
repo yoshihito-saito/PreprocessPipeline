@@ -237,6 +237,8 @@ def _normalize_chanmap_layout(layout: str | None) -> str:
         return "NeuroPixel"
     if key in {"middle_finger", "middlefinger"}:
         return "middle_finger"
+    if key in {"flex", "flexg5", "flex_g5", "flexprobe", "flex_probe"}:
+        return "flex-G5"
     if key in {"poly2", "poly3", "poly5"}:
         return key
     if key in {"linear", "edge", "staggered", "neurogrid", "twohundred"}:
@@ -391,6 +393,109 @@ def _middle_finger_layout_coords(
     return x, y
 
 
+def _flex_g5_layout_coords(
+    n_channels: int,
+    group_index: int,
+    *,
+    lateral_spacing: float = 21.5,
+    row_spacing: float = 15.0,
+    side_spacing: float = 80.0,
+    block_spacing: float = 1000.0,
+    top_anchor_spacing: float = 800.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return coordinates for the 64-channel flex-G5 layout."""
+    left = [
+        (15, 0.0, 0),
+        (49, 0.0, 1),
+        (14, -1.0, 2),
+        (48, 1.0, 2),
+        (13, 0.0, 3),
+        (12, -1.0, 4),
+        (51, 1.0, 4),
+        (50, 0.0, 5),
+        (11, -1.0, 6),
+        (53, 1.0, 6),
+        (10, 0.0, 7),
+        (9, -1.0, 8),
+        (52, 1.0, 8),
+        (55, 0.0, 9),
+        (8, -1.0, 10),
+        (54, 1.0, 10),
+        (7, 0.0, 11),
+        (6, -1.0, 12),
+        (57, 1.0, 12),
+        (56, 0.0, 13),
+        (5, -1.0, 14),
+        (59, 1.0, 14),
+        (4, 0.0, 15),
+        (3, -1.0, 16),
+        (58, 1.0, 16),
+        (61, 0.0, 17),
+        (2, -1.0, 18),
+        (60, 1.0, 18),
+        (1, 0.0, 19),
+        (0, -1.0, 20),
+        (63, 1.0, 20),
+        (62, 0.0, 21),
+    ]
+    right = [
+        (16, 0.0, 0),
+        (46, 0.0, 1),
+        (47, -1.0, 2),
+        (17, 1.0, 2),
+        (18, 0.0, 3),
+        (44, -1.0, 4),
+        (19, 1.0, 4),
+        (45, 0.0, 5),
+        (42, -1.0, 6),
+        (20, 1.0, 6),
+        (21, 0.0, 7),
+        (43, -1.0, 8),
+        (22, 1.0, 8),
+        (40, 0.0, 9),
+        (41, -1.0, 10),
+        (23, 1.0, 10),
+        (24, 0.0, 11),
+        (38, -1.0, 12),
+        (25, 1.0, 12),
+        (39, 0.0, 13),
+        (36, -1.0, 14),
+        (26, 1.0, 14),
+        (27, 0.0, 15),
+        (37, -1.0, 16),
+        (28, 1.0, 16),
+        (34, 0.0, 17),
+        (35, -1.0, 18),
+        (29, 1.0, 18),
+        (32, 0.0, 19),
+        (33, -1.0, 20),
+        (30, 1.0, 20),
+        (31, 0.0, 21),
+    ]
+
+    template_x = np.empty(64, dtype=float)
+    template_y = np.empty(64, dtype=float)
+    for channel, x_multiplier, row in left:
+        template_x[channel] = x_multiplier * lateral_spacing
+        template_y[channel] = top_anchor_spacing if row == 0 else -float(row - 1) * row_spacing
+    for channel, x_multiplier, row in right:
+        template_x[channel] = side_spacing + x_multiplier * lateral_spacing
+        template_y[channel] = top_anchor_spacing if row == 0 else -float(row - 1) * row_spacing
+
+    contact_idx = np.arange(n_channels, dtype=int)
+    block_idx = contact_idx // 64
+    template_idx = contact_idx % 64
+
+    x = template_x[template_idx] + (group_index + block_idx) * block_spacing
+    y = template_y[template_idx]
+    return x, y
+
+
+def _flex_probe_layout_coords(n_channels: int, group_index: int) -> tuple[np.ndarray, np.ndarray]:
+    """Backward-compatible alias for the flex-G5 geometry helper."""
+    return _flex_g5_layout_coords(n_channels, group_index)
+
+
 def build_channel_map_data(
     basepath: Path | str,
     basename: str | None = None,
@@ -430,6 +535,15 @@ def build_channel_map_data(
                 electrode_type = "NeuroPixel"
             elif "middle_finger" in val or "middle finger" in val or "middlefinger" in val:
                 electrode_type = "middle_finger"
+            elif (
+                "flex-g5" in val
+                or "flex_g5" in val
+                or "flex g5" in val
+                or "flex_probe" in val
+                or "flex probe" in val
+                or "flexprobe" in val
+            ):
+                electrode_type = "flex-G5"
             elif "staggered" in val:
                 electrode_type = "staggered"
             elif "neurogrid" in val or "grid" in val:
@@ -458,6 +572,43 @@ def build_channel_map_data(
             if local_group_idx != center_group_index and 0 <= group_idx < ngroups
         ]
         side_n_channels = side_group_lengths[0] if side_group_lengths else None
+
+        if p_type == "flex-G5":
+            valid_groups = [int(g_idx) for g_idx in p_groups if 0 <= int(g_idx) < ngroups]
+            local_block_idx = 0
+            group_pos = 0
+            while group_pos < len(valid_groups):
+                first_group = valid_groups[group_pos]
+                block_groups = [first_group]
+                first_size = len(anat_grps[first_group])
+                if (
+                    first_size == 32
+                    and group_pos + 1 < len(valid_groups)
+                    and len(anat_grps[valid_groups[group_pos + 1]]) == 32
+                ):
+                    block_groups.append(valid_groups[group_pos + 1])
+                    group_pos += 2
+                else:
+                    group_pos += 1
+
+                tchannels = [ch for group_idx in block_groups for ch in anat_grps[group_idx]]
+                n_ch = len(tchannels)
+                template_x, template_y = _flex_g5_layout_coords(64, local_block_idx)
+                k_val = local_block_idx + 1
+
+                for ch in tchannels:
+                    template_idx = int(ch) % 64
+                    channel_coords.append(
+                        {
+                            "id": ch,
+                            "x": template_x[template_idx] + p_x_offset,
+                            "y": template_y[template_idx],
+                            "k": k_val,
+                            "p": probe_idx + 1,
+                        }
+                    )
+                local_block_idx += max(1, int(np.ceil(n_ch / 64.0)))
+            continue
 
         for local_idx, g_idx in enumerate(p_groups):
             if g_idx < 0 or g_idx >= ngroups:

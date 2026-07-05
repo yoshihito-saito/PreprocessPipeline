@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -111,6 +112,7 @@ DEFAULT_CONFIG_PATH = _default_config_path()
 
 PROBE_TYPES = (
     "middle_finger",
+    "flex-G5",
     "staggered",
     "poly2",
     "poly3",
@@ -256,10 +258,14 @@ class NoWheelDoubleSpinBox(QDoubleSpinBox):
 class ChanMapCanvas(QWidget):
     def __init__(self) -> None:
         super().__init__()
+        self.setMinimumSize(920, 420)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.figure = Figure(figsize=(5.5, 4.0), facecolor="#2f2f2f")
+        self.figure = Figure(figsize=(10.0, 4.8), facecolor="#2f2f2f")
         self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumSize(900, 340)
+        self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.summary = QLabel("No chanMap loaded")
         self.summary.setWordWrap(True)
         self._ax: Any | None = None
@@ -278,7 +284,7 @@ class ChanMapCanvas(QWidget):
     def show_empty(self) -> None:
         self.figure.clear()
         ax = self.figure.add_subplot(111)
-        self.figure.subplots_adjust(left=0.11, right=0.98, bottom=0.14, top=0.90)
+        self.figure.subplots_adjust(left=0.07, right=0.995, bottom=0.16, top=0.90)
         self._ax = ax
         self._full_xlim = None
         self._full_ylim = None
@@ -324,7 +330,7 @@ class ChanMapCanvas(QWidget):
 
         self.figure.clear()
         ax = self.figure.add_subplot(111)
-        self.figure.subplots_adjust(left=0.11, right=0.98, bottom=0.14, top=0.90)
+        self.figure.subplots_adjust(left=0.07, right=0.995, bottom=0.16, top=0.90)
         self._ax = ax
         self._drag_start = None
         self._selection_patch = None
@@ -390,7 +396,7 @@ class ChanMapCanvas(QWidget):
                     ha="center",
                     va="bottom",
                     color=color,
-                    clip_on=True,
+                    clip_on=False,
                     zorder=4,
                 )
 
@@ -404,6 +410,19 @@ class ChanMapCanvas(QWidget):
             spine.set_color("#404040")
         ax.set_aspect("equal", adjustable="box", anchor="C")
         ax.grid(True, alpha=0.25, color="#737373")
+        finite_x = x[np.isfinite(x)]
+        finite_y = y[np.isfinite(y)]
+        if finite_x.size > 0 and finite_y.size > 0:
+            x_min = float(np.min(finite_x))
+            x_max = float(np.max(finite_x))
+            y_min = float(np.min(finite_y))
+            y_max = float(np.max(finite_y))
+            x_range = max(1.0, x_max - x_min)
+            y_range = max(1.0, y_max - y_min)
+            x_pad = max(180.0, x_range * 0.20)
+            y_pad = max(180.0, y_range * 0.20)
+            ax.set_xlim(x_min - x_pad, x_max + x_pad)
+            ax.set_ylim(y_min - y_pad, y_max + y_pad)
         self._full_xlim = tuple(float(v) for v in ax.get_xlim())
         self._full_ylim = tuple(float(v) for v in ax.get_ylim())
         self.canvas.draw_idle()
@@ -2613,8 +2632,8 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(log_head)
         log_layout.addWidget(self.log, 1)
 
-        monitor_layout.addWidget(self.monitor_stack, 3)
-        monitor_layout.addWidget(log_panel, 2)
+        monitor_layout.addWidget(self.monitor_stack, 5)
+        monitor_layout.addWidget(log_panel, 1)
 
         preview_panel = QFrame()
         preview_panel.setObjectName("miniPanel")
@@ -2629,8 +2648,8 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(preview_head)
         preview_layout.addWidget(self.run_preview, 1)
 
-        layout.addWidget(monitor, 3)
-        layout.addWidget(preview_panel, 2)
+        layout.addWidget(monitor, 5)
+        layout.addWidget(preview_panel, 1)
         return panel
 
     def _build_run_bar(self) -> QWidget:
@@ -4366,11 +4385,50 @@ class MainWindow(QMainWindow):
                 xml_path=_xml_path,
             )
             self.chanmap_path.setText(str(chanmap_path))
+            self._refresh_suspended = True
+            try:
+                self.reject_channels.setText(", ".join(str(v) for v in bad_channels))
+            finally:
+                self._refresh_suspended = False
             self._load_chanmap_preview(chanmap_path)
             self._append_log(f"Generated chanMap: {chanmap_path}\nBad channels: {bad_channels}\n")
             self._refresh_preview()
         except Exception as exc:
             QMessageBox.critical(self, "Generate chanMap failed", str(exc))
+
+    def _ensure_current_chanmap_for_run(self, settings: PipelineGuiSettings) -> PipelineGuiSettings:
+        if settings.basepath_path is None:
+            return settings
+        xml_path = settings.resolved_xml_path()
+        if xml_path is None or not xml_path.exists():
+            return settings
+        basepath, basename, local_output_dir, _xml_path = select_paths_with_gui(
+            use_gui=False,
+            manual_basepath=settings.basepath_path,
+            local_root=settings.local_root_path,
+            manual_xml_path=xml_path,
+        )
+        chanmap_path, bad_channels = prepare_chanmap(
+            basepath=basepath,
+            basename=basename,
+            local_output_dir=local_output_dir,
+            probe_assignments=settings.preprocess.probe_assignments,
+            reject_channels=settings.preprocess.reject_channels,
+            xml_path=_xml_path,
+        )
+        settings.chanmap_path = str(chanmap_path)
+        settings.preprocess.reject_channels = list(bad_channels)
+        self._refresh_suspended = True
+        try:
+            self.reject_channels.setText(", ".join(str(v) for v in bad_channels))
+        finally:
+            self._refresh_suspended = False
+        self.chanmap_path.setText(str(chanmap_path))
+        self._chanmap_controls_dirty = False
+        self._last_chanmap_preview_key = None
+        self._load_chanmap_preview(chanmap_path)
+        self._append_log(f"Prepared chanMap for run: {chanmap_path}\nBad channels: {bad_channels}\n")
+        return settings
 
     def _move_outputs_to_basepath(self) -> None:
         if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
@@ -4424,7 +4482,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Move outputs failed", str(exc))
 
-    def _resolve_phy_params_path(self, sorting_folder: Path) -> Path:
+    def _resolve_phy_params_path(self, sorting_folder: Path, *, prefer_postprocessed: bool = False) -> Path:
         sorting_folder = sorting_folder.expanduser().resolve()
         run_root = sorting_folder.parent if sorting_folder.name == "sorter_output" else sorting_folder
         candidate_folders: list[Path] = []
@@ -4436,11 +4494,16 @@ class MainWindow(QMainWindow):
 
         if sorting_folder.name.endswith("_spi"):
             _add_candidate(sorting_folder)
-        else:
+        elif prefer_postprocessed:
             _add_candidate(postprocess_output_folder_for_sorting(sorting_folder))
             _add_candidate(sorting_folder)
             _add_candidate(run_root)
             _add_candidate(run_root / "sorter_output")
+        else:
+            _add_candidate(sorting_folder)
+            _add_candidate(run_root)
+            _add_candidate(run_root / "sorter_output")
+            _add_candidate(postprocess_output_folder_for_sorting(sorting_folder))
 
         candidates = [folder / "params.py" for folder in candidate_folders]
         for params_path in candidates:
@@ -4492,7 +4555,7 @@ class MainWindow(QMainWindow):
             raise FileNotFoundError(
                 "No sorting folder could be resolved. Run sorting/postprocess first or set Postprocess target > sorting folder."
             )
-        return self._resolve_phy_params_path(sorting_folder).parent
+        return self._resolve_phy_params_path(sorting_folder, prefer_postprocessed=True).parent
 
     def _resolve_cell_explorer_sorting_dirs(self, settings: PipelineGuiSettings) -> list[Path]:
         if not self._cell_explorer_sorting_folders:
@@ -4503,7 +4566,7 @@ class MainWindow(QMainWindow):
         seen: set[str] = set()
         for folder_text in self._cell_explorer_sorting_folders:
             folder = Path(folder_text).expanduser()
-            resolved = self._resolve_phy_params_path(folder).parent
+            resolved = self._resolve_phy_params_path(folder, prefer_postprocessed=True).parent
             key = str(resolved.resolve())
             if key in seen:
                 continue
@@ -4876,6 +4939,12 @@ class MainWindow(QMainWindow):
 
         self._force_stop_requested = False
         self._process_stop_escalated = False
+        if mode in {"all", "preprocess"}:
+            try:
+                settings = self._ensure_current_chanmap_for_run(settings)
+            except Exception as exc:
+                QMessageBox.critical(self, "Generate chanMap failed", str(exc))
+                return
         self._set_running(True)
         self._append_log(f"\n=== Running {mode} ===\n")
         fd, config_name = tempfile.mkstemp(prefix="preprocess_gui_", suffix=".json")

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 
+from src.preprocess.gui.app import MainWindow
 from src.preprocess.gui.config_model import PipelineGuiSettings
 from src.preprocess.gui.run_pipeline import _json_safe
 
@@ -171,3 +172,58 @@ def test_gui_run_pipeline_result_json_safe_converts_paths(tmp_path: Path) -> Non
     assert str(tmp_path / "Kilosort_probe1") in encoded
     assert str(tmp_path / "Kilosort_probe2") in encoded
     assert str(tmp_path / "Kilosort_probe3") in encoded
+
+
+def _write_phy_params(folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    params_path = folder / "params.py"
+    params_path.write_text("# test params\n", encoding="utf-8")
+    return params_path
+
+
+def test_launch_phy_respects_selected_non_spi_folder_when_params_exists(tmp_path: Path) -> None:
+    sorting_folder = tmp_path / "Kilosort_2026-07-05_120000"
+    spi_folder = tmp_path / "Kilosort_2026-07-05_120000_spi"
+    selected_params = _write_phy_params(sorting_folder)
+    _write_phy_params(spi_folder)
+
+    resolved = MainWindow._resolve_phy_params_path(object(), sorting_folder)
+
+    assert resolved == selected_params.resolve()
+
+
+def test_launch_phy_respects_selected_spi_folder(tmp_path: Path) -> None:
+    sorting_folder = tmp_path / "Kilosort_2026-07-05_120000"
+    spi_folder = tmp_path / "Kilosort_2026-07-05_120000_spi"
+    _write_phy_params(sorting_folder)
+    selected_params = _write_phy_params(spi_folder)
+
+    resolved = MainWindow._resolve_phy_params_path(object(), spi_folder)
+
+    assert resolved == selected_params.resolve()
+
+
+def test_launch_phy_falls_back_to_spi_when_selected_folder_has_no_params(tmp_path: Path) -> None:
+    sorting_folder = tmp_path / "Kilosort_2026-07-05_120000"
+    spi_folder = tmp_path / "Kilosort_2026-07-05_120000_spi"
+    sorting_folder.mkdir()
+    spi_params = _write_phy_params(spi_folder)
+
+    resolved = MainWindow._resolve_phy_params_path(object(), sorting_folder)
+
+    assert resolved == spi_params.resolve()
+
+
+def test_postprocessed_preference_still_resolves_spi_first(tmp_path: Path) -> None:
+    sorting_folder = tmp_path / "Kilosort_2026-07-05_120000"
+    spi_folder = tmp_path / "Kilosort_2026-07-05_120000_spi"
+    _write_phy_params(sorting_folder)
+    spi_params = _write_phy_params(spi_folder)
+
+    resolved = MainWindow._resolve_phy_params_path(
+        object(),
+        sorting_folder,
+        prefer_postprocessed=True,
+    )
+
+    assert resolved == spi_params.resolve()
