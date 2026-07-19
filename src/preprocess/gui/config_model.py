@@ -228,6 +228,7 @@ class PipelineGuiSettings:
     chanmap_path: str = ""
     multi_day_enabled: bool = False
     multi_day_session_paths: list[str] = field(default_factory=list)
+    multi_day_selected_subepoch_paths: list[str] = field(default_factory=list)
     multi_day_name: str = ""
     preprocess: PreprocessGuiSettings = field(default_factory=PreprocessGuiSettings)
     behavior: BehaviorGuiSettings = field(default_factory=BehaviorGuiSettings)

@@ -67,6 +67,7 @@ from src.preprocess.behavior import (
 )
 from src.preprocess import prepare_chanmap, select_paths_with_gui
 from src.preprocess.io import build_channel_map_data, save_cell_explorer_chan_coords, set_tree_world_rw
+from src.preprocess.multiday import discover_multi_day_subepochs
 from src.preprocess.paths import find_project_root, resolve_project_path
 from src.worker_defaults import default_worker_count, normalize_worker_count
 
@@ -1444,12 +1445,22 @@ class TrackerJumpDialog(QDialog):
 
 
 class MultiDaySessionOrderTable(QTableWidget):
-    def __init__(self, paths: list[str], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        paths: list[str],
+        selected_subepoch_paths: list[str] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._paths = list(paths)
+        self._selected_subepoch_paths = {
+            self._path_key(path) for path in (selected_subepoch_paths or []) if str(path).strip()
+        }
+        self._has_explicit_subepoch_selection = bool(self._selected_subepoch_paths)
         self._populating = False
-        self.setColumnCount(3)
-        self.setHorizontalHeaderLabels(["Order", "Session", "Path"])
+        self._rows: list[dict[str, str]] = []
+        self.setColumnCount(4)
+        self.setHorizontalHeaderLabels(["Use", "Order", "Session", "Subepoch"])
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setDragEnabled(False)
@@ -1460,41 +1471,137 @@ class MultiDaySessionOrderTable(QTableWidget):
         self.verticalHeader().setVisible(False)
         self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.setColumnWidth(0, 78)
-        self.setColumnWidth(1, 320)
+        self.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.setColumnWidth(0, 58)
+        self.setColumnWidth(1, 70)
+        self.setColumnWidth(2, 240)
         self.itemChanged.connect(self._handle_item_changed)
         self.refresh()
+
+    @staticmethod
+    def _path_key(path: str | Path) -> str:
+        return str(Path(path).expanduser().resolve())
 
     def paths(self) -> list[str]:
         return list(self._paths)
 
+    def discovered_subepoch_count(self) -> int:
+        return len(self._all_subepoch_keys_in_order())
+
+    def selected_subepoch_paths(self) -> list[str]:
+        keys = self._all_subepoch_keys_in_order()
+        if not self._has_explicit_subepoch_selection:
+            return keys
+        return [key for key in keys if key in self._selected_subepoch_paths]
+
+    def _all_subepoch_keys_in_order(self) -> list[str]:
+        keys: list[str] = []
+        seen: set[str] = set()
+        for row in self._rows:
+            key = row.get("subepoch_key", "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+        return keys
+
+    def _discover_rows(self) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for order, path_text in enumerate(self._paths, start=1):
+            session_path = Path(path_text).expanduser()
+            base_row = {
+                "order": str(order),
+                "session": session_path.name,
+                "session_path": path_text,
+            }
+            try:
+                subepochs = discover_multi_day_subepochs([session_path], require_subepochs=False)
+            except Exception as exc:
+                rows.append(
+                    {
+                        **base_row,
+                        "subepoch": f"Discovery error: {exc}",
+                        "path": "",
+                        "subepoch_key": "",
+                    }
+                )
+                continue
+            if not subepochs:
+                rows.append(
+                    {
+                        **base_row,
+                        "subepoch": "No subepochs found",
+                        "path": "",
+                        "subepoch_key": "",
+                    }
+                )
+                continue
+            for subepoch in subepochs:
+                source_path = self._path_key(subepoch.source_subepoch_path)
+                rows.append(
+                    {
+                        **base_row,
+                        "subepoch": f"{subepoch.subepoch_index}: {Path(source_path).name}",
+                        "path": source_path,
+                        "subepoch_key": source_path,
+                    }
+                )
+        return rows
+
     def refresh(self, select_row: int | None = None) -> None:
         self._populating = True
         try:
-            self.setRowCount(len(self._paths))
-            for row, path_text in enumerate(self._paths):
-                path = Path(path_text)
+            self._rows = self._discover_rows()
+            self.setRowCount(len(self._rows))
+            for row, entry in enumerate(self._rows):
+                subepoch_key = entry.get("subepoch_key", "")
+                use_item = QTableWidgetItem("")
+                if subepoch_key:
+                    use_item.setFlags(
+                        Qt.ItemFlag.ItemIsEnabled
+                        | Qt.ItemFlag.ItemIsSelectable
+                        | Qt.ItemFlag.ItemIsUserCheckable
+                    )
+                    checked = (
+                        not self._has_explicit_subepoch_selection
+                        or subepoch_key in self._selected_subepoch_paths
+                    )
+                    use_item.setCheckState(
+                        Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+                    )
+                else:
+                    use_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 order_item = QTableWidgetItem(str(row + 1))
-                session_item = QTableWidgetItem(path.name)
-                path_item = QTableWidgetItem(path_text)
-                self.setItem(row, 0, order_item)
-                self.setItem(row, 1, session_item)
-                self.setItem(row, 2, path_item)
+                order_item.setText(entry["order"])
+                session_item = QTableWidgetItem(entry["session"])
+                subepoch_item = QTableWidgetItem(entry["subepoch"])
+                if entry.get("path"):
+                    subepoch_item.setToolTip(entry["path"])
+                self.setItem(row, 0, use_item)
+                self.setItem(row, 1, order_item)
+                self.setItem(row, 2, session_item)
+                self.setItem(row, 3, subepoch_item)
                 order_item.setFlags(order_item.flags() | Qt.ItemFlag.ItemIsEditable)
-                session_item.setFlags(session_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                path_item.setFlags(path_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                for item in (session_item, subepoch_item):
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             if select_row is not None and 0 <= select_row < self.rowCount():
                 self.selectRow(select_row)
         finally:
             self._populating = False
 
     def _handle_item_changed(self, item: QTableWidgetItem) -> None:
-        if self._populating or item.column() != 0:
+        if self._populating:
+            return
+        if item.column() == 0:
+            self._handle_subepoch_check_changed(item)
+            return
+        if item.column() != 1:
             return
         row = item.row()
-        if row < 0:
+        if row < 0 or row >= len(self._rows):
             return
+        session_path = self._rows[row]["session_path"]
         try:
             target = int(item.text().strip()) - 1
         except ValueError:
@@ -1502,13 +1609,33 @@ class MultiDaySessionOrderTable(QTableWidget):
             return
         if not self._paths:
             return
-        target = max(0, min(target, len(self._paths) - 1))
-        if target == row:
+        try:
+            source_index = self._paths.index(session_path)
+        except ValueError:
             self.refresh(row)
             return
-        path = self._paths.pop(row)
+        target = max(0, min(target, len(self._paths) - 1))
+        if target == source_index:
+            self.refresh(row)
+            return
+        path = self._paths.pop(source_index)
         self._paths.insert(target, path)
-        self.refresh(target)
+        self.refresh()
+
+    def _handle_subepoch_check_changed(self, item: QTableWidgetItem) -> None:
+        row = item.row()
+        if row < 0 or row >= len(self._rows):
+            return
+        key = self._rows[row].get("subepoch_key", "")
+        if not key:
+            return
+        if not self._has_explicit_subepoch_selection:
+            self._selected_subepoch_paths = set(self._all_subepoch_keys_in_order())
+            self._has_explicit_subepoch_selection = True
+        if item.checkState() == Qt.CheckState.Checked:
+            self._selected_subepoch_paths.add(key)
+        else:
+            self._selected_subepoch_paths.discard(key)
 
 
 class CellExploreFolderTable(QTableWidget):
@@ -1691,6 +1818,7 @@ class MainWindow(QMainWindow):
         self._last_xml_warning_key: tuple[Any, ...] | None = None
         self._chanmap_controls_dirty = False
         self._multi_day_session_paths: list[str] = []
+        self._multi_day_selected_subepoch_paths: list[str] = []
         self._cell_explorer_sorting_folders: list[str] = []
         self._channel_regions: dict[int, str] = {}
         self._behavior_dlc_files: list[Any] = []
@@ -3138,7 +3266,12 @@ class MainWindow(QMainWindow):
             self.xml_path.setText(path)
             self._schedule_refresh()
 
-    def _set_multi_day_session_paths(self, paths: list[str]) -> None:
+    def _set_multi_day_session_paths(
+        self,
+        paths: list[str],
+        *,
+        selected_subepoch_paths: list[str] | None = None,
+    ) -> None:
         cleaned: list[str] = []
         seen: set[str] = set()
         for item in paths:
@@ -3150,14 +3283,38 @@ class MainWindow(QMainWindow):
                 continue
             seen.add(key)
             cleaned.append(key)
+        previous = list(self._multi_day_session_paths)
         self._multi_day_session_paths = cleaned
+        if selected_subepoch_paths is not None:
+            selected: list[str] = []
+            selected_seen: set[str] = set()
+            for item in selected_subepoch_paths:
+                text = str(item).strip()
+                if not text:
+                    continue
+                key = str(Path(text).expanduser().resolve())
+                if key in selected_seen:
+                    continue
+                selected_seen.add(key)
+                selected.append(key)
+            self._multi_day_selected_subepoch_paths = selected
+        elif cleaned != previous:
+            self._multi_day_selected_subepoch_paths = []
+        if not cleaned:
+            self._multi_day_selected_subepoch_paths = []
+        selection_label = (
+            f"{len(self._multi_day_selected_subepoch_paths)} subepochs"
+            if self._multi_day_selected_subepoch_paths
+            else "all subepochs"
+        )
         if not cleaned:
             self.multi_day_sessions.clear()
         elif len(cleaned) == 1:
-            self.multi_day_sessions.setText(f"1 session: {Path(cleaned[0]).name}")
+            self.multi_day_sessions.setText(f"1 session: {Path(cleaned[0]).name}; {selection_label}")
         else:
             self.multi_day_sessions.setText(
-                f"{len(cleaned)} sessions: {Path(cleaned[0]).name} -> {Path(cleaned[-1]).name}"
+                f"{len(cleaned)} sessions: {Path(cleaned[0]).name} -> {Path(cleaned[-1]).name}; "
+                f"{selection_label}"
             )
 
     def _set_cell_explorer_sorting_folders(self, paths: list[str]) -> None:
@@ -3317,8 +3474,8 @@ class MainWindow(QMainWindow):
             return
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Multi-day session order")
-        dialog.resize(1100, 480)
+        dialog.setWindowTitle("Multi-day session order and subepochs")
+        dialog.resize(1200, 540)
         dialog.setStyleSheet(
             """
             QDialog {
@@ -3356,24 +3513,40 @@ class MainWindow(QMainWindow):
             """
         )
         layout = QVBoxLayout(dialog)
-        table = MultiDaySessionOrderTable(self._multi_day_session_paths, dialog)
+        table = MultiDaySessionOrderTable(
+            self._multi_day_session_paths,
+            self._multi_day_selected_subepoch_paths,
+            dialog,
+        )
         table.setAlternatingRowColors(True)
         layout.addWidget(table)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        update_button = buttons.addButton("Update order", QDialogButtonBox.ButtonRole.AcceptRole)
+        update_button = buttons.addButton("Update selection", QDialogButtonBox.ButtonRole.AcceptRole)
 
         def apply_order() -> None:
             paths = table.paths()
             if len(paths) != len(self._multi_day_session_paths):
                 QMessageBox.warning(dialog, "Update order", "Session table is incomplete.")
                 return
-            self._set_multi_day_session_paths(paths)
+            if table.discovered_subepoch_count() == 0:
+                QMessageBox.warning(dialog, "Update selection", "No subepochs were discovered.")
+                return
+            selected_subepochs = table.selected_subepoch_paths()
+            if not selected_subepochs:
+                QMessageBox.warning(dialog, "Update selection", "Select at least one subepoch.")
+                return
+            self._set_multi_day_session_paths(
+                paths,
+                selected_subepoch_paths=selected_subepochs,
+            )
             if len(paths) >= 2:
                 self.basepath.setText(paths[0])
             self._auto_load_existing_chanmap()
             self._schedule_refresh()
-            self._append_log("Updated multi-day session order.\n")
+            self._append_log(
+                f"Updated multi-day session order and selected {len(selected_subepochs)} subepochs.\n"
+            )
             dialog.accept()
 
         update_button.clicked.connect(apply_order)
@@ -3389,7 +3562,7 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         cleaned = [str(Path(path).expanduser()) for path in paths]
-        self._set_multi_day_session_paths(cleaned)
+        self._set_multi_day_session_paths(cleaned, selected_subepoch_paths=[])
         if not self.multi_day_name.text().strip() and len(cleaned) >= 2:
             first = Path(cleaned[0]).name
             last = Path(cleaned[-1]).name
@@ -4001,6 +4174,7 @@ class MainWindow(QMainWindow):
             loaded.xml_path = current.xml_path
             loaded.multi_day_enabled = current.multi_day_enabled
             loaded.multi_day_session_paths = list(current.multi_day_session_paths)
+            loaded.multi_day_selected_subepoch_paths = list(current.multi_day_selected_subepoch_paths)
             loaded.multi_day_name = current.multi_day_name
             loaded.chanmap_path = current.chanmap_path
             loaded.postprocess.sorting_phy_folder = current.postprocess.sorting_phy_folder
@@ -4169,6 +4343,7 @@ class MainWindow(QMainWindow):
             chanmap_path=self.chanmap_path.text().strip(),
             multi_day_enabled=bool(self._multi_day_session_paths),
             multi_day_session_paths=list(self._multi_day_session_paths),
+            multi_day_selected_subepoch_paths=list(self._multi_day_selected_subepoch_paths),
             multi_day_name=self.multi_day_name.text().strip(),
             preprocess=preprocess,
             behavior=behavior,
@@ -4184,7 +4359,10 @@ class MainWindow(QMainWindow):
             if xml_text and not Path(xml_text).expanduser().exists():
                 xml_text = ""
             self.xml_path.setText(xml_text)
-            self._set_multi_day_session_paths(list(settings.multi_day_session_paths))
+            self._set_multi_day_session_paths(
+                list(settings.multi_day_session_paths),
+                selected_subepoch_paths=list(settings.multi_day_selected_subepoch_paths),
+            )
             self.multi_day_name.setText(settings.multi_day_name)
             self.chanmap_path.setText(settings.chanmap_path)
             p = settings.preprocess
@@ -4329,6 +4507,14 @@ class MainWindow(QMainWindow):
                 f"Behavior output: {behavior_output or '-'}",
                 f"Active workflow: {'Behavior' if current_tab == 1 else 'Ephys ' + mode}",
             ]
+            if settings.multi_day_enabled:
+                selected_count = len(settings.multi_day_selected_subepoch_paths)
+                lines.insert(
+                    2,
+                    f"Multi-day subepochs: {selected_count} selected"
+                    if selected_count
+                    else "Multi-day subepochs: all discovered",
+                )
             if current_tab == 1:
                 lines.extend(
                     [

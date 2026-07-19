@@ -70,8 +70,14 @@ def run_pipeline(settings: PipelineGuiSettings, mode: RunMode) -> dict[str, Any]
                     "Multi-day basepath name is required. "
                     "Use Browse for multi-days or enter a Multi-day name before running."
                 )
+            selected_subepoch_paths = [
+                Path(path)
+                for path in settings.multi_day_selected_subepoch_paths
+                if str(path).strip()
+            ]
             staged = prepare_multi_day_basepath(
                 session_paths=session_paths,
+                selected_subepoch_paths=selected_subepoch_paths or None,
                 local_root=settings.local_root_path,
                 name=settings.multi_day_name.strip(),
                 xml_path=settings.resolved_xml_path(),
@@ -86,10 +92,13 @@ def run_pipeline(settings: PipelineGuiSettings, mode: RunMode) -> dict[str, Any]
                 "server_basepath": str(staged.server_basepath),
                 "local_basepath": str(staged.local_basepath),
                 "manifest_path": str(staged.manifest_path),
+                "selected_subepochs_csv_path": str(staged.selected_subepochs_csv_path),
                 "subepoch_count": len(staged.subepochs),
+                "selected_subepoch_count": len(selected_subepoch_paths) or len(staged.subepochs),
             }
             print(f"Prepared multi-day basepath: {staged.server_basepath}", flush=True)
             print(f"Multi-day manifest: {staged.manifest_path}", flush=True)
+            print(f"Selected subepochs CSV: {staged.selected_subepochs_csv_path}", flush=True)
         if settings.basepath_path is None:
             raise ValueError("basepath is required.")
         chanmap = settings.resolved_chanmap_path()
