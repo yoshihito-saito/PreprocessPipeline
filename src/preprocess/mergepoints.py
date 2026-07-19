@@ -15,20 +15,29 @@ def compute_mergepoints(
     dtype: str,
     sampling_frequency: float,
     foldernames: list[str],
+    sample_counts: list[int] | None = None,
 ) -> MergePointsData:
-    itemsize = np.dtype(dtype).itemsize
-    frame_bytes = int(n_channels) * int(itemsize)
-    if frame_bytes <= 0:
-        raise ValueError(f"Invalid frame size for mergepoints: n_channels={n_channels}, dtype={dtype}")
-    n_samp = []
-    for p in dat_paths:
-        bytes_ = int(p.stat().st_size)
-        if bytes_ % frame_bytes != 0:
+    if sample_counts is not None:
+        if len(sample_counts) != len(dat_paths):
             raise ValueError(
-                f"Dat size is not divisible by frame size for mergepoints: "
-                f"{p} size={bytes_}, frame_bytes={frame_bytes}"
+                "sample_counts must align with dat_paths for mergepoints: "
+                f"{len(sample_counts)} != {len(dat_paths)}"
             )
-        n_samp.append(int(bytes_ // frame_bytes))
+        n_samp = [int(n) for n in sample_counts]
+    else:
+        itemsize = np.dtype(dtype).itemsize
+        frame_bytes = int(n_channels) * int(itemsize)
+        if frame_bytes <= 0:
+            raise ValueError(f"Invalid frame size for mergepoints: n_channels={n_channels}, dtype={dtype}")
+        n_samp = []
+        for p in dat_paths:
+            bytes_ = int(p.stat().st_size)
+            if bytes_ % frame_bytes != 0:
+                raise ValueError(
+                    f"Dat size is not divisible by frame size for mergepoints: "
+                    f"{p} size={bytes_}, frame_bytes={frame_bytes}"
+                )
+            n_samp.append(int(bytes_ // frame_bytes))
 
     n_samp_arr = np.asarray(n_samp, dtype=np.int64)
     cumsum = np.cumsum(n_samp_arr)

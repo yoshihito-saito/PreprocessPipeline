@@ -246,17 +246,28 @@ def load_subsession_recordings(
     offset_to_uV: float,
     recording_paths: list[Path] | None = None,
     recording_stream_names: list[str | None] | None = None,
+    ephys_channel_indices_by_subsession: list[list[int] | None] | None = None,
 ) -> list[Any]:
     recordings = []
     recording_paths = recording_paths or dat_paths
     recording_stream_names = recording_stream_names or [None for _ in dat_paths]
-    for p, recording_root, stream_name in zip(dat_paths, recording_paths, recording_stream_names, strict=True):
+    ephys_channel_indices_by_subsession = ephys_channel_indices_by_subsession or [None for _ in dat_paths]
+    for p, recording_root, stream_name, ephys_channel_indices in zip(
+        dat_paths,
+        recording_paths,
+        recording_stream_names,
+        ephys_channel_indices_by_subsession,
+        strict=True,
+    ):
         if recording_root.is_dir() and stream_name:
             rec = se.read_openephys(
                 folder_path=str(recording_root),
                 stream_name=stream_name,
             )
             rec = rec.rename_channels(list(range(rec.get_num_channels())))
+            if ephys_channel_indices is not None:
+                rec = select_recording_channels(rec, [int(ch) for ch in ephys_channel_indices])
+                rec = rec.rename_channels(list(range(rec.get_num_channels())))
         else:
             rec = se.read_binary(
                 str(p),
@@ -374,7 +385,11 @@ def _write_concatenated_sidecar_dat(
     overwrite: bool,
     job_kwargs: dict[str, Any],
     sample_counts: list[int] | None = None,
+    source_num_channels: list[int | None] | None = None,
+    source_channel_indices: list[list[int] | None] | None = None,
+    source_dtype: str = "int16",
 ) -> Path | None:
+    del sampling_frequency, job_kwargs
     if not dat_paths:
         return None
     if not any(p is not None and Path(p).exists() for p in dat_paths):
@@ -398,11 +413,22 @@ def _write_concatenated_sidecar_dat(
             "sample_counts must have the same length as sidecar dat_paths: "
             f"{len(sample_counts)} != {len(dat_paths)}"
         )
+    if source_num_channels is not None and len(source_num_channels) != len(dat_paths):
+        raise ValueError(
+            "source_num_channels must have the same length as sidecar dat_paths: "
+            f"{len(source_num_channels)} != {len(dat_paths)}"
+        )
+    if source_channel_indices is not None and len(source_channel_indices) != len(dat_paths):
+        raise ValueError(
+            "source_channel_indices must have the same length as sidecar dat_paths: "
+            f"{len(source_channel_indices)} != {len(dat_paths)}"
+        )
 
     dtype_np = np.dtype(dtype)
     frame_bytes = int(dtype_np.itemsize) * int(num_channels)
     if frame_bytes <= 0:
         raise ValueError(f"Invalid sidecar frame size: dtype={dtype}, num_channels={num_channels}")
+    source_dtype_np = np.dtype(source_dtype)
 
     # Direct binary concatenation preserves exact uint16 sidecar words and lets us
     # fill missing epochs with zeros so sidecar timestamps stay on the merged timebase.
@@ -410,6 +436,8 @@ def _write_concatenated_sidecar_dat(
     with open(output_dat_path, "wb") as fout:
         for idx, path in enumerate(dat_paths):
             expected_samples = None if sample_counts is None else int(sample_counts[idx])
+            src_channels = None if source_num_channels is None else source_num_channels[idx]
+            selected_channels = None if source_channel_indices is None else source_channel_indices[idx]
             if path is None or not Path(path).exists():
                 if expected_samples is None:
                     continue
@@ -422,6 +450,28 @@ def _write_concatenated_sidecar_dat(
                 continue
 
             p = Path(path)
+            if selected_channels is not None or (
+                src_channels is not None and int(src_channels) != int(num_channels)
+            ):
+                if src_channels is None:
+                    raise ValueError(f"source_num_channels is required for selected sidecar extraction: {p}")
+                channels_to_copy = (
+                    [int(ch) for ch in selected_channels]
+                    if selected_channels is not None
+                    else list(range(int(src_channels)))
+                )
+                _write_selected_sidecar_frames(
+                    fout,
+                    path=p,
+                    source_num_channels=int(src_channels),
+                    selected_channel_indices=channels_to_copy,
+                    output_num_channels=int(num_channels),
+                    source_dtype=source_dtype_np,
+                    output_dtype=dtype_np,
+                    expected_samples=expected_samples,
+                )
+                continue
+
             size = p.stat().st_size
             if size % frame_bytes != 0:
                 raise ValueError(
@@ -441,6 +491,67 @@ def _write_concatenated_sidecar_dat(
                         break
                     fout.write(chunk)
     return output_dat_path
+
+
+def _write_selected_sidecar_frames(
+    fout: Any,
+    *,
+    path: Path,
+    source_num_channels: int,
+    selected_channel_indices: list[int],
+    output_num_channels: int,
+    source_dtype: np.dtype,
+    output_dtype: np.dtype,
+    expected_samples: int | None,
+) -> None:
+    if source_num_channels <= 0:
+        raise ValueError(f"source_num_channels must be > 0 for sidecar extraction: {source_num_channels}")
+    if output_num_channels <= 0:
+        raise ValueError(f"output_num_channels must be > 0 for sidecar extraction: {output_num_channels}")
+    if len(selected_channel_indices) > output_num_channels:
+        raise ValueError(
+            "Selected sidecar channel count exceeds output channel count: "
+            f"{len(selected_channel_indices)} > {output_num_channels}"
+        )
+    invalid = [ch for ch in selected_channel_indices if ch < 0 or ch >= source_num_channels]
+    if invalid:
+        raise ValueError(
+            f"Selected sidecar channels are outside source range [0, {source_num_channels - 1}]: "
+            f"{sorted(set(invalid))}"
+        )
+
+    source_frame_bytes = int(source_dtype.itemsize) * int(source_num_channels)
+    size = path.stat().st_size
+    if source_frame_bytes <= 0 or size % source_frame_bytes != 0:
+        raise ValueError(
+            f"{path} size is not divisible by source sidecar frame size: "
+            f"size={size}, frame_bytes={source_frame_bytes}"
+        )
+    actual_samples = size // source_frame_bytes
+    if expected_samples is not None and int(actual_samples) != int(expected_samples):
+        raise ValueError(
+            f"{path} sample count does not match amplifier epoch length: "
+            f"{actual_samples} != {expected_samples}"
+        )
+
+    frames_per_chunk = max(1, (1024 * 1024) // source_frame_bytes)
+    with open(path, "rb") as fin:
+        while True:
+            chunk = fin.read(frames_per_chunk * source_frame_bytes)
+            if not chunk:
+                break
+            raw = np.frombuffer(chunk, dtype=source_dtype)
+            if raw.size % source_num_channels != 0:
+                raise ValueError(f"Partial sidecar frame encountered while reading {path}")
+            source = raw.reshape(-1, source_num_channels)
+            selected = source[:, selected_channel_indices]
+            if selected.shape[1] == output_num_channels:
+                output = selected.astype(output_dtype, copy=False)
+            else:
+                output = np.zeros((selected.shape[0], output_num_channels), dtype=output_dtype)
+                if selected.shape[1] > 0:
+                    output[:, : selected.shape[1]] = selected.astype(output_dtype, copy=False)
+            fout.write(output.tobytes(order="C"))
 
 
 def _write_zero_sidecar_frames(
@@ -493,6 +604,8 @@ def write_concatenated_dat_analogin(
     overwrite: bool,
     job_kwargs: dict[str, Any],
     sample_counts: list[int] | None = None,
+    source_num_channels: list[int | None] | None = None,
+    source_channel_indices: list[list[int] | None] | None = None,
 ) -> Path | None:
     return _write_concatenated_sidecar_dat(
         dat_paths=dat_paths,
@@ -503,6 +616,9 @@ def write_concatenated_dat_analogin(
         overwrite=overwrite,
         job_kwargs=job_kwargs,
         sample_counts=sample_counts,
+        source_num_channels=source_num_channels,
+        source_channel_indices=source_channel_indices,
+        source_dtype="int16",
     )
 
 

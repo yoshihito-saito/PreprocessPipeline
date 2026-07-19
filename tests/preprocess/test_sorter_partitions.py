@@ -3,9 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from scipy.io import savemat
+import pytest
+from scipy.io import loadmat, savemat
 
+import src.preprocess.pipeline as pipeline
 import src.preprocess.sorter_runner as sr
+from src.preprocess.recording import _load_bad_channels_from_chanmap
 from src.preprocess.sorter_runner import build_sorter_partitions, write_sorter_partition_manifest
 
 
@@ -146,3 +149,109 @@ def test_run_sorter_cli_defaults_channel_lists_to_none(tmp_path: Path, monkeypat
 
     assert captured["active_channels_0based"] is None
     assert captured["exclude_channels_0based"] is None
+
+
+@pytest.mark.parametrize("ephys_indices", [None, [None], [[0, 1, 2, 3]]])
+def test_prepare_effective_chanmap_preserves_identity_bad_channels(
+    tmp_path: Path,
+    ephys_indices,
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_chanmap = source_dir / "chanMap.mat"
+    savemat(
+        source_chanmap,
+        {
+            "chanMap0ind": np.asarray([0, 1, 2, 3], dtype=np.int64),
+            "chanMap": np.asarray([1, 2, 3, 4], dtype=np.int64),
+            "connected": np.asarray([1, 0, 1, 0], dtype=np.uint8),
+            "probe_ids": np.asarray([1, 1, 1, 1], dtype=np.int64),
+            "kcoords": np.asarray([1, 1, 2, 2], dtype=np.int64),
+            "xcoords": np.asarray([0.0, 10.0, 20.0, 30.0], dtype=np.float64),
+            "ycoords": np.asarray([0.0, 0.0, 50.0, 50.0], dtype=np.float64),
+        },
+    )
+
+    effective, reject_remap = pipeline._prepare_effective_chanmap_for_final_channel_space(
+        chanmap_mat_path=source_chanmap,
+        output_dir=tmp_path,
+        final_num_channels=4,
+        ephys_channel_indices_by_subsession=ephys_indices,
+    )
+
+    assert effective == tmp_path / "chanMap.mat"
+    assert reject_remap is None
+    assert _load_bad_channels_from_chanmap(effective) == [1, 3]
+    mat = loadmat(effective, simplify_cells=True)
+    assert np.array_equal(np.asarray(mat["chanMap0ind"]).reshape(-1), np.asarray([0, 1, 2, 3]))
+
+
+def test_prepare_effective_chanmap_remaps_source_oe_indices_to_final_columns(
+    tmp_path: Path,
+) -> None:
+    chanmap = tmp_path / "source_chanMap.mat"
+    savemat(
+        chanmap,
+        {
+            "chanMap0ind": np.asarray([0, 2, 4], dtype=np.int64),
+            "chanMap": np.asarray([1, 3, 5], dtype=np.int64),
+            "connected": np.asarray([1, 0, 1], dtype=np.uint8),
+            "probe_ids": np.asarray([1, 1, 2], dtype=np.int64),
+            "kcoords": np.asarray([1, 2, 1], dtype=np.int64),
+            "xcoords": np.asarray([10.0, 20.0, 30.0], dtype=np.float64),
+            "ycoords": np.asarray([0.0, 50.0, 100.0], dtype=np.float64),
+        },
+    )
+
+    effective, reject_remap = pipeline._prepare_effective_chanmap_for_final_channel_space(
+        chanmap_mat_path=chanmap,
+        output_dir=tmp_path,
+        final_num_channels=3,
+        ephys_channel_indices_by_subsession=[None, [0, 2, 4]],
+    )
+
+    assert effective == tmp_path / "chanMap.mat"
+    assert reject_remap == {0: 0, 2: 1, 4: 2}
+    assert pipeline._normalize_reject_channels_for_final_channel_space([2], reject_remap) == [1]
+    mat = loadmat(effective, simplify_cells=True)
+    assert np.array_equal(np.asarray(mat["chanMap0ind"]).reshape(-1), np.asarray([0, 1, 2]))
+    assert np.array_equal(np.asarray(mat["chanMap"]).reshape(-1), np.asarray([1, 2, 3]))
+    assert np.array_equal(np.asarray(mat["connected"]).reshape(-1), np.asarray([1, 0, 1]))
+    assert np.array_equal(np.asarray(mat["probe_ids"]).reshape(-1), np.asarray([1, 1, 2]))
+    assert np.array_equal(np.asarray(mat["kcoords"]).reshape(-1), np.asarray([1, 2, 1]))
+    assert np.array_equal(np.asarray(mat["xcoords"]).reshape(-1), np.asarray([10.0, 20.0, 30.0]))
+    assert _load_bad_channels_from_chanmap(effective) == [1]
+
+    partitions = build_sorter_partitions(
+        mode="probe",
+        chanmap_mat_path=effective,
+        num_channels=3,
+        excluded_channels_0based=[],
+    )
+    assert [partition.name for partition in partitions] == ["probe1", "probe2"]
+    assert [partition.channels_0based for partition in partitions] == [[0], [2]]
+
+    source_mat = loadmat(chanmap, simplify_cells=True)
+    assert np.array_equal(np.asarray(source_mat["chanMap0ind"]).reshape(-1), np.asarray([0, 2, 4]))
+
+
+def test_copy_chanmap_for_kilosort_preserves_final_channel_ids(tmp_path: Path) -> None:
+    chanmap = tmp_path / "compact_subset_chanMap.mat"
+    dst = tmp_path / "copied_chanMap.mat"
+    savemat(
+        chanmap,
+        {
+            "chanMap0ind": np.asarray([0, 2], dtype=np.int64),
+            "chanMap": np.asarray([1, 3], dtype=np.int64),
+            "connected": np.asarray([1, 1], dtype=np.uint8),
+            "xcoords": np.asarray([10.0, 30.0], dtype=np.float64),
+            "ycoords": np.asarray([0.0, 100.0], dtype=np.float64),
+            "kcoords": np.asarray([1, 1], dtype=np.int64),
+        },
+    )
+
+    sr._copy_chanmap_for_kilosort(chanmap, dst, n_channels_total=3)
+
+    copied = loadmat(dst, simplify_cells=True)
+    assert np.array_equal(np.asarray(copied["chanMap0ind"]).reshape(-1), np.asarray([0, 2]))
+    assert np.array_equal(np.asarray(copied["chanMap"]).reshape(-1), np.asarray([1, 3]))

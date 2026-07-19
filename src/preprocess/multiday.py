@@ -33,6 +33,9 @@ class MultiDaySubepoch:
     source_dat_path: str
     staged_subepoch_path: str
     source_type: str
+    source_total_channels: int
+    source_ephys_channels: int
+    source_adc_channels: int
     binary_n_channels: int
     binary_sampling_frequency: float | None
     sample_count: int
@@ -52,7 +55,10 @@ class MultiDayDiscoveredSubepoch:
 class SourceBinaryInfo:
     path: Path
     source_type: str
-    n_channels: int
+    binary_n_channels: int
+    source_total_channels: int
+    source_ephys_channels: int
+    source_adc_channels: int
     sampling_frequency: float | None
 
 
@@ -157,17 +163,26 @@ def _source_binary_info(
     if discovered_path.is_dir() and (discovered_path / "structure.oebin").exists():
         from .io import _resolve_openephys_stream_info
 
-        continuous_path, _stream_name, _ttl_path, n_channels, sr = _resolve_openephys_stream_info(discovered_path)
+        info = _resolve_openephys_stream_info(discovered_path)
+        source_total_channels = int(info.total_channels)
+        source_ephys_channels = len(info.ephys_channel_indices)
+        source_adc_channels = len(info.adc_channel_indices)
         return SourceBinaryInfo(
-            path=continuous_path,
+            path=info.continuous_dat,
             source_type="openephys",
-            n_channels=int(n_channels),
-            sampling_frequency=float(sr),
+            binary_n_channels=source_total_channels,
+            source_total_channels=source_total_channels,
+            source_ephys_channels=source_ephys_channels,
+            source_adc_channels=source_adc_channels,
+            sampling_frequency=float(info.sampling_frequency),
         )
     return SourceBinaryInfo(
         path=discovered_path,
         source_type="intan",
-        n_channels=int(xml_n_channels),
+        binary_n_channels=int(xml_n_channels),
+        source_total_channels=int(xml_n_channels),
+        source_ephys_channels=int(xml_n_channels),
+        source_adc_channels=0,
         sampling_frequency=float(xml_sampling_frequency),
     )
 
@@ -236,6 +251,9 @@ def _write_selected_subepochs_csv(path: Path, subepochs: list[MultiDaySubepoch])
         "source_dat_path",
         "staged_subepoch_path",
         "source_type",
+        "source_total_channels",
+        "source_ephys_channels",
+        "source_adc_channels",
         "binary_n_channels",
         "binary_sampling_frequency",
         "sample_count",
@@ -364,13 +382,16 @@ def prepare_multi_day_basepath(
             xml_n_channels=int(reference_meta.n_channels),
             xml_sampling_frequency=float(reference_meta.sr),
         )
+        # Once build_acquisition_catalog exposes per-subepoch channel metadata on
+        # this branch, this is the narrow integration point for replacing the
+        # local structure.oebin fallback with catalog source_* fields.
         if source_binary.source_type == "openephys":
             if openephys_stream_channels is None:
-                openephys_stream_channels = source_binary.n_channels
-            elif openephys_stream_channels != source_binary.n_channels:
+                openephys_stream_channels = source_binary.source_ephys_channels
+            elif openephys_stream_channels != source_binary.source_ephys_channels:
                 raise ValueError(
-                    "Open Ephys recordings with mismatched channel counts are unsupported: "
-                    f"{openephys_stream_channels} vs {source_binary.n_channels} ({discovered_path})"
+                    "Open Ephys recordings with mismatched channel counts (ephys) are unsupported: "
+                    f"{openephys_stream_channels} vs {source_binary.source_ephys_channels} ({discovered_path})"
                 )
             if openephys_sampling_frequency is None:
                 openephys_sampling_frequency = source_binary.sampling_frequency
@@ -387,7 +408,7 @@ def prepare_multi_day_basepath(
         _replace_symlink(staged_folder, source_folder, overwrite=overwrite)
         sample_count = _infer_sample_count_from_binary(
             source_binary.path,
-            n_channels=source_binary.n_channels,
+            n_channels=source_binary.binary_n_channels,
             dtype=dtype,
         )
         subepochs.append(
@@ -400,7 +421,10 @@ def prepare_multi_day_basepath(
                 source_dat_path=str(source_binary.path),
                 staged_subepoch_path=str(staged_folder),
                 source_type=source_binary.source_type,
-                binary_n_channels=source_binary.n_channels,
+                source_total_channels=source_binary.source_total_channels,
+                source_ephys_channels=source_binary.source_ephys_channels,
+                source_adc_channels=source_binary.source_adc_channels,
+                binary_n_channels=source_binary.binary_n_channels,
                 binary_sampling_frequency=source_binary.sampling_frequency,
                 sample_count=sample_count,
             )
