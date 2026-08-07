@@ -134,7 +134,7 @@ class AcquisitionCatalog:
     subsession_names: list[str]
     recording_paths: list[Path]
     recording_stream_names: list[str | None]
-    ttl_event_paths: list[Path]
+    ttl_event_paths: list[Path | None]
     amplifier_paths: list[Path]
     analogin_paths: list[Path]
     digitalin_paths: list[Path]
@@ -154,6 +154,14 @@ class AcquisitionCatalog:
     temperature_sensor_channels: int
     board_adc_native_orders: list[int]
     board_digital_input_native_orders: list[int]
+    source_types: list[str] = field(default_factory=list)
+    source_total_channels: list[int] = field(default_factory=list)
+    source_ephys_channels: list[int] = field(default_factory=list)
+    source_adc_channels: list[int] = field(default_factory=list)
+    ephys_channel_indices_by_subsession: list[list[int] | None] = field(default_factory=list)
+    adc_channel_indices_by_subsession: list[list[int]] = field(default_factory=list)
+    adc_channel_names_by_subsession: list[list[str]] = field(default_factory=list)
+    analogin_source_paths: list[Path | None] = field(default_factory=list)
 
 
 @dataclass

@@ -11,7 +11,7 @@ nt: 41 # 41 samples @ 20kHz = ~2.05ms
 
 # Drift-correction blocks. 0 disables drift correction.
 # KS4 default: 1
-nblocks: 0
+nblocks: 1
 
 # Samples per processing batch.
 # Larger values reduce batch boundaries but use more memory.
@@ -120,7 +120,7 @@ auto_geom_max_xcenters_cap: 12
 
 # Worker count for binary export / preprocessing tasks.
 # SpikeInterface default: 1
-n_jobs: 384
+n_jobs: 128
 
 # Show progress bars during export / sorting.
 # SpikeInterface default: false

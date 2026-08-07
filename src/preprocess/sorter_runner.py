@@ -1521,18 +1521,46 @@ def _apply_kilosort_ops_overrides(*, sorter_output_folder: Path, ops_overrides: 
         print(f"Warning: failed to apply Kilosort ops overrides: {exc}")
 
 
-def _copy_chanmap_for_kilosort(chanmap_mat_path: Path, dst: Path) -> None:
-    loaded = loadmat(str(chanmap_mat_path))
+def _copy_chanmap_for_kilosort(
+    chanmap_mat_path: Path,
+    dst: Path,
+    *,
+    n_channels_total: int | None = None,
+) -> None:
+    try:
+        loaded = loadmat(str(chanmap_mat_path))
+    except Exception:
+        shutil.copy2(str(chanmap_mat_path.resolve()), str(dst))
+        return
     payload = {k: v for k, v in loaded.items() if not k.startswith("__")}
     chanmap0ind = payload.get("chanMap0ind")
-    if chanmap0ind is None:
+    chanmap_raw = chanmap0ind
+    if chanmap_raw is None:
+        chanmap = payload.get("chanMap")
+        if chanmap is not None:
+            chanmap_raw = np.asarray(chanmap).reshape(-1).astype(np.int64) - 1
+    if chanmap_raw is None:
         shutil.copy2(str(chanmap_mat_path.resolve()), str(dst))
         return
 
+    raw_0based = np.asarray(chanmap_raw).reshape(-1).astype(np.int64)
+    if n_channels_total is not None and int(n_channels_total) > 0:
+        n_final = int(n_channels_total)
+        if raw_0based.size > n_final:
+            valid = (raw_0based >= 0) & (raw_0based < n_final)
+            for key, value in list(payload.items()):
+                arr = np.asarray(value)
+                if arr.size != raw_0based.size:
+                    continue
+                filtered = arr.reshape(-1)[valid]
+                payload[key] = filtered.reshape(-1, 1)
+            raw_0based = raw_0based[valid]
+
     # Kilosort reads `chanMap` directly. Older pipeline outputs could have
-    # chanMap=1..N while chanMap0ind held the real .dat channel ids; normalize
-    # the copied file so existing chanMaps are safe for non-contiguous groups.
-    payload["chanMap"] = np.asarray(chanmap0ind).astype(np.float64) + 1.0
+    # chanMap=1..N while chanMap0ind held the real .dat channel ids. Keep both
+    # fields synchronized with the final recording channel ids.
+    payload["chanMap0ind"] = raw_0based.reshape(-1, 1)
+    payload["chanMap"] = raw_0based.astype(np.float64).reshape(-1, 1) + 1.0
     savemat(str(dst), payload)
 
 
@@ -1552,7 +1580,16 @@ def _kilosort_chanmap_override(
 
     def _copy_channel_map(_recording, sorter_output_folder):
         dst = Path(sorter_output_folder) / "chanMap.mat"
-        _copy_chanmap_for_kilosort(Path(chanmap_mat_path), dst)
+        n_channels_total = (
+            int(_recording.get_num_channels())
+            if hasattr(_recording, "get_num_channels")
+            else None
+        )
+        _copy_chanmap_for_kilosort(
+            Path(chanmap_mat_path),
+            dst,
+            n_channels_total=n_channels_total,
+        )
 
     def _patched_generate_ops_file(_cls, recording, params, sorter_output_folder, binary_file_path):
         original_ops(recording, params, sorter_output_folder, binary_file_path)

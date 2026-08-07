@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 
@@ -46,10 +47,30 @@ def _write_openephys_epoch(
     n_channels: int,
     n_samples: int,
     sample_rate: float = 20000.0,
+    n_ephys_channels: int | None = None,
+    n_adc_channels: int = 0,
 ) -> Path:
     recording_root = session / name / "Record Node 101" / "experiment1" / "recording1"
     continuous_dir = recording_root / "continuous" / "Acquisition_Board-100.acquisition_board"
     continuous_dir.mkdir(parents=True)
+    if n_ephys_channels is None:
+        n_ephys_channels = n_channels - n_adc_channels
+    channels = [
+        {
+            "channel_name": f"CH{channel + 1}",
+            "identifier": "acq-board.rhythm.continuous.ephys",
+            "units": "uV",
+        }
+        for channel in range(n_ephys_channels)
+    ]
+    channels.extend(
+        {
+            "channel_name": f"ADC{channel + 1}",
+            "identifier": "acq-board.rhythm.continuous.adc",
+            "units": "V",
+        }
+        for channel in range(n_adc_channels)
+    )
     structure = {
         "continuous": [
             {
@@ -58,6 +79,7 @@ def _write_openephys_epoch(
                 "recorded_processor": "Record Node",
                 "recorded_processor_id": 101,
                 "num_channels": n_channels,
+                "channels": channels,
             }
         ]
     }
@@ -112,6 +134,119 @@ def test_prepare_multi_day_basepath_stages_sessions_and_manifest(tmp_path: Path)
     ]
 
 
+def test_prepare_multi_day_basepath_filters_selected_subepochs_and_removes_stale_links(
+    tmp_path: Path,
+) -> None:
+    day1 = tmp_path / "animal_day1"
+    day2 = tmp_path / "animal_day2"
+    day1.mkdir()
+    day2.mkdir()
+    _write_xml(day1)
+    _write_xml(day2)
+    ep1 = _write_epoch(day1, "ep_240101_120000", n_samples=3)
+    ep2 = _write_epoch(day1, "ep_240101_130000", n_samples=4)
+    ep3 = _write_epoch(day2, "ep_240102_120000", n_samples=5)
+
+    first = prepare_multi_day_basepath(
+        session_paths=[day1, day2],
+        local_root=tmp_path / "local",
+        name="animal_multiday",
+        overwrite=True,
+    )
+    assert len(first.subepochs) == 3
+    old_staged_paths = [Path(item.staged_subepoch_path) for item in first.subepochs]
+
+    staged = prepare_multi_day_basepath(
+        session_paths=[day1, day2],
+        selected_subepoch_paths=[ep2, ep3],
+        local_root=tmp_path / "local",
+        name="animal_multiday",
+        overwrite=True,
+    )
+
+    assert [item.sample_count for item in staged.subepochs] == [4, 5]
+    assert [Path(item.source_subepoch_path).resolve() for item in staged.subepochs] == [
+        ep2.resolve(),
+        ep3.resolve(),
+    ]
+    assert [Path(item.staged_subepoch_path).name for item in staged.subepochs] == [
+        "001_animal_day1_ep_240101_130000",
+        "002_animal_day2_ep_240102_120000",
+    ]
+    assert not old_staged_paths[0].exists()
+    assert not old_staged_paths[1].exists()
+    assert not old_staged_paths[2].exists()
+
+    discovered = discover_subsessions(
+        basepath=staged.server_basepath,
+        sort_files=True,
+        alt_sort=None,
+        ignore_folders=[],
+    )
+    assert [path.resolve() for path in discovered] == [
+        (ep2 / "amplifier.dat").resolve(),
+        (ep3 / "amplifier.dat").resolve(),
+    ]
+
+    manifest = json.loads(staged.manifest_path.read_text(encoding="utf-8"))
+    assert [Path(entry["source_subepoch_path"]).resolve() for entry in manifest["subepochs"]] == [
+        ep2.resolve(),
+        ep3.resolve(),
+    ]
+    with staged.selected_subepochs_csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["staged_order"] for row in rows] == ["1", "2"]
+    assert [Path(row["source_subepoch_path"]).resolve() for row in rows] == [
+        ep2.resolve(),
+        ep3.resolve(),
+    ]
+    assert [int(row["sample_count"]) for row in rows] == [4, 5]
+    assert [row["source_type"] for row in rows] == ["intan", "intan"]
+    assert [int(row["source_total_channels"]) for row in rows] == [4, 4]
+    assert [int(row["source_ephys_channels"]) for row in rows] == [4, 4]
+    assert [int(row["source_adc_channels"]) for row in rows] == [0, 0]
+    assert [int(row["binary_n_channels"]) for row in rows] == [4, 4]
+    assert (staged.local_basepath / "multi_day_selected_subepochs.csv").exists()
+
+
+def test_prepare_multi_day_basepath_rejects_unknown_selected_subepoch(tmp_path: Path) -> None:
+    day1 = tmp_path / "animal_day1"
+    day2 = tmp_path / "animal_day2"
+    day1.mkdir()
+    day2.mkdir()
+    _write_xml(day1)
+    _write_xml(day2)
+    _write_epoch(day1, "ep_240101_120000")
+    _write_epoch(day2, "ep_240102_120000")
+
+    with pytest.raises(ValueError, match="Selected multi-day subepoch paths were not found"):
+        prepare_multi_day_basepath(
+            session_paths=[day1, day2],
+            selected_subepoch_paths=[tmp_path / "missing_epoch"],
+            local_root=tmp_path / "local",
+            name="animal_multiday",
+            overwrite=True,
+        )
+
+
+def test_pipeline_gui_settings_round_trips_multi_day_selected_subepochs(tmp_path: Path) -> None:
+    settings = PipelineGuiSettings(
+        basepath=str(tmp_path / "day1"),
+        local_root=str(tmp_path / "local"),
+        multi_day_enabled=True,
+        multi_day_session_paths=[str(tmp_path / "day1"), str(tmp_path / "day2")],
+        multi_day_selected_subepoch_paths=[
+            str(tmp_path / "day1" / "ep1"),
+            str(tmp_path / "day2" / "ep2"),
+        ],
+        multi_day_name="animal_multiday",
+    )
+
+    loaded = PipelineGuiSettings.from_json(settings.to_json())
+
+    assert loaded.multi_day_selected_subepoch_paths == settings.multi_day_selected_subepoch_paths
+
+
 def test_prepare_multi_day_basepath_uses_openephys_stream_channels_for_sample_counts(tmp_path: Path) -> None:
     day1 = tmp_path / "animal_day1"
     day2 = tmp_path / "animal_day2"
@@ -148,6 +283,75 @@ def test_prepare_multi_day_basepath_uses_openephys_stream_channels_for_sample_co
     manifest = json.loads(staged.manifest_path.read_text(encoding="utf-8"))
     assert manifest["n_channels"] == 192
     assert [entry["binary_n_channels"] for entry in manifest["subepochs"]] == [200, 200]
+    assert [entry["source_total_channels"] for entry in manifest["subepochs"]] == [200, 200]
+    assert [entry["source_ephys_channels"] for entry in manifest["subepochs"]] == [200, 200]
+    assert [entry["source_adc_channels"] for entry in manifest["subepochs"]] == [0, 0]
+
+
+def test_prepare_multi_day_basepath_records_openephys_embedded_adc_metadata(tmp_path: Path) -> None:
+    day1 = tmp_path / "animal_day1"
+    day2 = tmp_path / "animal_day2"
+    selected_xml_dir = tmp_path / "metadata"
+    day1.mkdir()
+    day2.mkdir()
+    selected_xml_dir.mkdir()
+    selected_xml = selected_xml_dir / "selected.xml"
+    selected_xml.write_text(
+        ("""
+<session>
+  <acquisitionSystem>
+    <nChannels>192</nChannels>
+    <sampleRate>20000</sampleRate>
+  </acquisitionSystem>
+</session>
+""").strip(),
+        encoding="utf-8",
+    )
+    _write_openephys_epoch(
+        day1,
+        "animal_2026-06-24_16-38-56",
+        n_channels=200,
+        n_ephys_channels=192,
+        n_adc_channels=8,
+        n_samples=11,
+    )
+    _write_openephys_epoch(
+        day2,
+        "animal_2026-06-25_16-38-56",
+        n_channels=200,
+        n_ephys_channels=192,
+        n_adc_channels=8,
+        n_samples=13,
+    )
+
+    staged = prepare_multi_day_basepath(
+        session_paths=[day1, day2],
+        local_root=tmp_path / "local",
+        name="animal_multiday",
+        xml_path=selected_xml,
+        overwrite=True,
+    )
+
+    assert [item.sample_count for item in staged.subepochs] == [11, 13]
+    assert [item.binary_n_channels for item in staged.subepochs] == [200, 200]
+    assert [item.source_total_channels for item in staged.subepochs] == [200, 200]
+    assert [item.source_ephys_channels for item in staged.subepochs] == [192, 192]
+    assert [item.source_adc_channels for item in staged.subepochs] == [8, 8]
+
+    manifest = json.loads(staged.manifest_path.read_text(encoding="utf-8"))
+    assert [entry["source_type"] for entry in manifest["subepochs"]] == ["openephys", "openephys"]
+    assert [entry["source_total_channels"] for entry in manifest["subepochs"]] == [200, 200]
+    assert [entry["source_ephys_channels"] for entry in manifest["subepochs"]] == [192, 192]
+    assert [entry["source_adc_channels"] for entry in manifest["subepochs"]] == [8, 8]
+    assert [entry["binary_n_channels"] for entry in manifest["subepochs"]] == [200, 200]
+
+    with staged.selected_subepochs_csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["source_type"] for row in rows] == ["openephys", "openephys"]
+    assert [int(row["source_total_channels"]) for row in rows] == [200, 200]
+    assert [int(row["source_ephys_channels"]) for row in rows] == [192, 192]
+    assert [int(row["source_adc_channels"]) for row in rows] == [8, 8]
+    assert [int(row["binary_n_channels"]) for row in rows] == [200, 200]
 
 
 def test_prepare_multi_day_basepath_rejects_mismatched_openephys_stream_channels(tmp_path: Path) -> None:

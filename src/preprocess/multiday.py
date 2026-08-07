@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
@@ -19,6 +20,7 @@ from .io import (
 
 
 MULTI_DAY_MANIFEST = "multi_day_manifest.json"
+MULTI_DAY_SELECTED_SUBEPOCHS_CSV = "multi_day_selected_subepochs.csv"
 
 
 @dataclass(frozen=True)
@@ -31,16 +33,32 @@ class MultiDaySubepoch:
     source_dat_path: str
     staged_subepoch_path: str
     source_type: str
+    source_total_channels: int
+    source_ephys_channels: int
+    source_adc_channels: int
     binary_n_channels: int
     binary_sampling_frequency: float | None
     sample_count: int
 
 
 @dataclass(frozen=True)
+class MultiDayDiscoveredSubepoch:
+    session_index: int
+    subepoch_index: int
+    session_name: str
+    source_session_path: str
+    discovered_path: str
+    source_subepoch_path: str
+
+
+@dataclass(frozen=True)
 class SourceBinaryInfo:
     path: Path
     source_type: str
-    n_channels: int
+    binary_n_channels: int
+    source_total_channels: int
+    source_ephys_channels: int
+    source_adc_channels: int
     sampling_frequency: float | None
 
 
@@ -50,6 +68,7 @@ class MultiDayStagingResult:
     server_basepath: Path
     local_basepath: Path
     manifest_path: Path
+    selected_subepochs_csv_path: Path
     subepochs: list[MultiDaySubepoch]
 
 
@@ -99,6 +118,42 @@ def _source_subepoch_folder(discovered_path: Path) -> Path:
     return discovered_path.parent
 
 
+def discover_multi_day_subepochs(
+    session_paths: list[Path],
+    *,
+    require_subepochs: bool = False,
+) -> list[MultiDayDiscoveredSubepoch]:
+    rows: list[MultiDayDiscoveredSubepoch] = []
+    sessions = [Path(path).expanduser().resolve() for path in session_paths]
+    for session_index, session in enumerate(sessions, start=1):
+        if not session.exists() or not session.is_dir():
+            raise NotADirectoryError(f"Invalid multi-day session folder: {session}")
+        discovered = discover_subsessions(
+            basepath=session,
+            sort_files=True,
+            alt_sort=None,
+            ignore_folders=[],
+        )
+        if not discovered:
+            if require_subepochs:
+                raise FileNotFoundError(f"No subepochs found for multi-day session: {session}")
+            continue
+        discovered = sorted(discovered, key=_subsession_sort_key)
+        for subepoch_index, discovered_path in enumerate(discovered, start=1):
+            source_folder = _source_subepoch_folder(discovered_path)
+            rows.append(
+                MultiDayDiscoveredSubepoch(
+                    session_index=session_index,
+                    subepoch_index=subepoch_index,
+                    session_name=session.name,
+                    source_session_path=str(session),
+                    discovered_path=str(discovered_path),
+                    source_subepoch_path=str(source_folder),
+                )
+            )
+    return rows
+
+
 def _source_binary_info(
     discovered_path: Path,
     *,
@@ -108,17 +163,26 @@ def _source_binary_info(
     if discovered_path.is_dir() and (discovered_path / "structure.oebin").exists():
         from .io import _resolve_openephys_stream_info
 
-        continuous_path, _stream_name, _ttl_path, n_channels, sr = _resolve_openephys_stream_info(discovered_path)
+        info = _resolve_openephys_stream_info(discovered_path)
+        source_total_channels = int(info.total_channels)
+        source_ephys_channels = len(info.ephys_channel_indices)
+        source_adc_channels = len(info.adc_channel_indices)
         return SourceBinaryInfo(
-            path=continuous_path,
+            path=info.continuous_dat,
             source_type="openephys",
-            n_channels=int(n_channels),
-            sampling_frequency=float(sr),
+            binary_n_channels=source_total_channels,
+            source_total_channels=source_total_channels,
+            source_ephys_channels=source_ephys_channels,
+            source_adc_channels=source_adc_channels,
+            sampling_frequency=float(info.sampling_frequency),
         )
     return SourceBinaryInfo(
         path=discovered_path,
         source_type="intan",
-        n_channels=int(xml_n_channels),
+        binary_n_channels=int(xml_n_channels),
+        source_total_channels=int(xml_n_channels),
+        source_ephys_channels=int(xml_n_channels),
+        source_adc_channels=0,
         sampling_frequency=float(xml_sampling_frequency),
     )
 
@@ -139,9 +203,74 @@ def _replace_symlink(target: Path, source: Path, *, overwrite: bool) -> None:
     target.symlink_to(source.resolve(), target_is_directory=source.is_dir())
 
 
+def _resolve_path_set(paths: list[Path] | None) -> set[str]:
+    if not paths:
+        return set()
+    return {str(Path(path).expanduser().resolve()) for path in paths}
+
+
+def _cleanup_stale_staged_subepochs(
+    *,
+    manifest_path: Path,
+    active_staged_folders: set[Path],
+    overwrite: bool,
+) -> None:
+    if not manifest_path.exists():
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    active = {path.expanduser().absolute() for path in active_staged_folders}
+    for entry in manifest.get("subepochs", []):
+        staged_text = entry.get("staged_subepoch_path")
+        if not staged_text:
+            continue
+        staged_path = Path(staged_text).expanduser().absolute()
+        if staged_path in active or not (staged_path.exists() or staged_path.is_symlink()):
+            continue
+        if not overwrite:
+            raise FileExistsError(
+                f"Stale staged multi-day subepoch exists: {staged_path}. "
+                "Enable overwrite to remove subepochs excluded from the current selection."
+            )
+        if staged_path.is_dir() and not staged_path.is_symlink():
+            shutil.rmtree(staged_path)
+        else:
+            staged_path.unlink()
+
+
+def _write_selected_subepochs_csv(path: Path, subepochs: list[MultiDaySubepoch]) -> None:
+    fieldnames = [
+        "staged_order",
+        "session_index",
+        "subepoch_index",
+        "session_name",
+        "source_session_path",
+        "source_subepoch_path",
+        "source_dat_path",
+        "staged_subepoch_path",
+        "source_type",
+        "source_total_channels",
+        "source_ephys_channels",
+        "source_adc_channels",
+        "binary_n_channels",
+        "binary_sampling_frequency",
+        "sample_count",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for staged_order, subepoch in enumerate(subepochs, start=1):
+            row = asdict(subepoch)
+            row["staged_order"] = staged_order
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
+
+
 def prepare_multi_day_basepath(
     *,
     session_paths: list[Path],
+    selected_subepoch_paths: list[Path] | None = None,
     local_root: Path,
     name: str | None = None,
     server_root: Path | None = None,
@@ -200,70 +329,106 @@ def prepare_multi_day_basepath(
     subepochs: list[MultiDaySubepoch] = []
     openephys_stream_channels: int | None = None
     openephys_sampling_frequency: float | None = None
-    for session_index, session in enumerate(sessions, start=1):
-        discovered = discover_subsessions(
-            basepath=session,
-            sort_files=True,
-            alt_sort=None,
-            ignore_folders=[],
+    selected_paths = _resolve_path_set(selected_subepoch_paths)
+    discovered_rows = discover_multi_day_subepochs(sessions, require_subepochs=True)
+    discovered_source_paths = {
+        str(Path(row.source_subepoch_path).expanduser().resolve()) for row in discovered_rows
+    }
+    if selected_paths:
+        unmatched = sorted(selected_paths - discovered_source_paths)
+        if unmatched:
+            preview = ", ".join(unmatched[:5])
+            suffix = "" if len(unmatched) <= 5 else f", ... ({len(unmatched)} total)"
+            raise ValueError(
+                "Selected multi-day subepoch paths were not found under the selected sessions: "
+                f"{preview}{suffix}"
+            )
+    stage_plan: list[tuple[MultiDayDiscoveredSubepoch, Path, Path]] = []
+    for staged_index, row in enumerate(
+        [
+            item
+            for item in discovered_rows
+            if not selected_paths
+            or str(Path(item.source_subepoch_path).expanduser().resolve()) in selected_paths
+        ],
+        start=1,
+    ):
+        source_folder = Path(row.source_subepoch_path)
+        session = Path(row.source_session_path)
+        staged_name = (
+            f"{staged_index:03d}_"
+            f"{_safe_name(session.name)}_"
+            f"{_safe_name(source_folder.name)}"
         )
-        if not discovered:
-            raise FileNotFoundError(f"No subepochs found for multi-day session: {session}")
-        discovered = sorted(discovered, key=_subsession_sort_key)
-        for subepoch_index, discovered_path in enumerate(discovered, start=1):
-            source_folder = _source_subepoch_folder(discovered_path)
-            source_binary = _source_binary_info(
-                discovered_path,
-                xml_n_channels=int(reference_meta.n_channels),
-                xml_sampling_frequency=float(reference_meta.sr),
-            )
-            if source_binary.source_type == "openephys":
-                if openephys_stream_channels is None:
-                    openephys_stream_channels = source_binary.n_channels
-                elif openephys_stream_channels != source_binary.n_channels:
-                    raise ValueError(
-                        "Open Ephys recordings with mismatched channel counts are unsupported: "
-                        f"{openephys_stream_channels} vs {source_binary.n_channels} ({discovered_path})"
-                    )
-                if openephys_sampling_frequency is None:
-                    openephys_sampling_frequency = source_binary.sampling_frequency
-                elif source_binary.sampling_frequency is not None and not isclose(
-                    openephys_sampling_frequency,
-                    source_binary.sampling_frequency,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                ):
-                    raise ValueError(
-                        "Open Ephys recordings with mismatched sampling frequencies are unsupported: "
-                        f"{openephys_sampling_frequency} vs {source_binary.sampling_frequency} ({discovered_path})"
-                    )
-            staged_name = (
-                f"{len(subepochs) + 1:03d}_"
-                f"{_safe_name(session.name)}_"
-                f"{_safe_name(source_folder.name)}"
-            )
-            staged_folder = server_basepath / staged_name
-            _replace_symlink(staged_folder, source_folder, overwrite=overwrite)
-            sample_count = _infer_sample_count_from_binary(
-                source_binary.path,
-                n_channels=source_binary.n_channels,
-                dtype=dtype,
-            )
-            subepochs.append(
-                MultiDaySubepoch(
-                    session_index=session_index,
-                    subepoch_index=subepoch_index,
-                    session_name=session.name,
-                    source_session_path=str(session),
-                    source_subepoch_path=str(source_folder),
-                    source_dat_path=str(source_binary.path),
-                    staged_subepoch_path=str(staged_folder),
-                    source_type=source_binary.source_type,
-                    binary_n_channels=source_binary.n_channels,
-                    binary_sampling_frequency=source_binary.sampling_frequency,
-                    sample_count=sample_count,
+        stage_plan.append((row, source_folder, server_basepath / staged_name))
+
+    if not stage_plan:
+        raise ValueError("No multi-day subepochs were selected for staging.")
+
+    manifest_path = server_basepath / MULTI_DAY_MANIFEST
+    _cleanup_stale_staged_subepochs(
+        manifest_path=manifest_path,
+        active_staged_folders={staged_folder for _row, _source_folder, staged_folder in stage_plan},
+        overwrite=overwrite,
+    )
+
+    for row, source_folder, staged_folder in stage_plan:
+        discovered_path = Path(row.discovered_path)
+        session = Path(row.source_session_path)
+        session_index = row.session_index
+        subepoch_index = row.subepoch_index
+        source_binary = _source_binary_info(
+            discovered_path,
+            xml_n_channels=int(reference_meta.n_channels),
+            xml_sampling_frequency=float(reference_meta.sr),
+        )
+        # Once build_acquisition_catalog exposes per-subepoch channel metadata on
+        # this branch, this is the narrow integration point for replacing the
+        # local structure.oebin fallback with catalog source_* fields.
+        if source_binary.source_type == "openephys":
+            if openephys_stream_channels is None:
+                openephys_stream_channels = source_binary.source_ephys_channels
+            elif openephys_stream_channels != source_binary.source_ephys_channels:
+                raise ValueError(
+                    "Open Ephys recordings with mismatched channel counts (ephys) are unsupported: "
+                    f"{openephys_stream_channels} vs {source_binary.source_ephys_channels} ({discovered_path})"
                 )
+            if openephys_sampling_frequency is None:
+                openephys_sampling_frequency = source_binary.sampling_frequency
+            elif source_binary.sampling_frequency is not None and not isclose(
+                openephys_sampling_frequency,
+                source_binary.sampling_frequency,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ):
+                raise ValueError(
+                    "Open Ephys recordings with mismatched sampling frequencies are unsupported: "
+                    f"{openephys_sampling_frequency} vs {source_binary.sampling_frequency} ({discovered_path})"
+                )
+        _replace_symlink(staged_folder, source_folder, overwrite=overwrite)
+        sample_count = _infer_sample_count_from_binary(
+            source_binary.path,
+            n_channels=source_binary.binary_n_channels,
+            dtype=dtype,
+        )
+        subepochs.append(
+            MultiDaySubepoch(
+                session_index=session_index,
+                subepoch_index=subepoch_index,
+                session_name=session.name,
+                source_session_path=str(session),
+                source_subepoch_path=str(source_folder),
+                source_dat_path=str(source_binary.path),
+                staged_subepoch_path=str(staged_folder),
+                source_type=source_binary.source_type,
+                source_total_channels=source_binary.source_total_channels,
+                source_ephys_channels=source_binary.source_ephys_channels,
+                source_adc_channels=source_binary.source_adc_channels,
+                binary_n_channels=source_binary.binary_n_channels,
+                binary_sampling_frequency=source_binary.sampling_frequency,
+                sample_count=sample_count,
             )
+        )
 
     manifest = {
         "schema_version": 1,
@@ -278,16 +443,19 @@ def prepare_multi_day_basepath(
         "dtype": dtype,
         "subepochs": [asdict(item) for item in subepochs],
     }
-    manifest_path = server_basepath / MULTI_DAY_MANIFEST
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     (local_basepath / MULTI_DAY_MANIFEST).write_text(
         json.dumps(manifest, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    selected_subepochs_csv_path = server_basepath / MULTI_DAY_SELECTED_SUBEPOCHS_CSV
+    _write_selected_subepochs_csv(selected_subepochs_csv_path, subepochs)
+    _write_selected_subepochs_csv(local_basepath / MULTI_DAY_SELECTED_SUBEPOCHS_CSV, subepochs)
     return MultiDayStagingResult(
         name=multiday_name,
         server_basepath=server_basepath,
         local_basepath=local_basepath,
         manifest_path=manifest_path,
+        selected_subepochs_csv_path=selected_subepochs_csv_path,
         subepochs=subepochs,
     )

@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 import os
 import shutil
@@ -29,6 +29,29 @@ from .paths import find_project_root
 _OPENEPHYS_DATETIME_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})")
 _OPENEPHYS_RECORD_NODE_NAME = "Record Node 101"
 _DAY_PREFIX_PATTERN = re.compile(r"^(?:day|d)(\d+)", re.IGNORECASE)
+_OPENEPHYS_EPHYS_CHANNEL_PATTERN = re.compile(r"^CH\d+$", re.IGNORECASE)
+_OPENEPHYS_ADC_CHANNEL_PATTERN = re.compile(r"^ADC\d+$", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class OpenEphysStreamInfo:
+    continuous_dat: Path
+    stream_name: str
+    ttl_path: Path
+    total_channels: int
+    sampling_frequency: float
+    ephys_channel_indices: list[int]
+    adc_channel_indices: list[int]
+    ephys_channel_names: list[str]
+    adc_channel_names: list[str]
+
+    def __iter__(self):
+        """Preserve the historical 5-tuple unpacking contract."""
+        yield self.continuous_dat
+        yield self.stream_name
+        yield self.ttl_path
+        yield self.total_channels
+        yield self.sampling_frequency
 
 
 def extract_datetime(path: str) -> datetime:
@@ -946,29 +969,119 @@ def _load_openephys_structure(recording_root: Path) -> dict:
         return json.load(f)
 
 
-def _resolve_openephys_stream_info(recording_root: Path) -> tuple[Path, str, Path, int, float]:
+def _openephys_channel_name(channel: dict) -> str:
+    for key in ("name", "channel_name", "label", "source_name"):
+        value = channel.get(key)
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
+def _is_openephys_ephys_channel(channel: dict) -> bool:
+    identifier = str(channel.get("identifier", "")).lower()
+    units = str(channel.get("units", "")).strip().lower()
+    name = _openephys_channel_name(channel)
+    return ".ephys" in identifier or (
+        units in {"uv", "µv", "μv"}
+        and _OPENEPHYS_EPHYS_CHANNEL_PATTERN.match(name) is not None
+    )
+
+
+def _is_openephys_adc_channel(channel: dict) -> bool:
+    identifier = str(channel.get("identifier", "")).lower()
+    units = str(channel.get("units", "")).strip().lower()
+    name = _openephys_channel_name(channel)
+    return ".adc" in identifier or (
+        units == "v"
+        and _OPENEPHYS_ADC_CHANNEL_PATTERN.match(name) is not None
+    )
+
+
+def _openephys_stream_name(entry: dict) -> str:
+    folder_name = str(entry["folder_name"]).rstrip("/\\")
+    recorded_processor = str(entry.get("recorded_processor", "Record Node")).strip()
+    recorded_processor_id = entry.get("recorded_processor_id")
+    if recorded_processor_id is not None:
+        return f"{recorded_processor} {recorded_processor_id}#{folder_name}"
+    return folder_name
+
+
+def _resolve_openephys_stream_info(recording_root: Path) -> OpenEphysStreamInfo:
     structure = _load_openephys_structure(recording_root)
     continuous_entries = structure.get("continuous", [])
     if not continuous_entries:
         raise FileNotFoundError(f"No continuous streams found in {recording_root / 'structure.oebin'}")
 
-    entry = continuous_entries[0]
+    ephys_candidates: list[tuple[dict, list[int], list[int], list[str], list[str]]] = []
+    for entry in continuous_entries:
+        folder_name = str(entry.get("folder_name", "")).rstrip("/\\")
+        if "memory_usage" in folder_name.lower():
+            continue
+
+        channels = entry.get("channels", []) or []
+        total_channels = int(entry.get("num_channels", len(channels)))
+        ephys_indices: list[int] = []
+        adc_indices: list[int] = []
+        ephys_names: list[str] = []
+        adc_names: list[str] = []
+        if channels:
+            for index, channel in enumerate(channels):
+                if not isinstance(channel, dict):
+                    continue
+                channel_name = _openephys_channel_name(channel)
+                if _is_openephys_ephys_channel(channel):
+                    ephys_indices.append(index)
+                    ephys_names.append(channel_name or f"CH{index + 1}")
+                elif _is_openephys_adc_channel(channel):
+                    adc_indices.append(index)
+                    adc_names.append(channel_name or f"ADC{len(adc_indices)}")
+        elif total_channels > 0:
+            ephys_indices = list(range(total_channels))
+            ephys_names = [f"CH{index + 1}" for index in ephys_indices]
+
+        if ephys_indices:
+            ephys_candidates.append((entry, ephys_indices, adc_indices, ephys_names, adc_names))
+
+    if not ephys_candidates:
+        raise ValueError(
+            "No Open Ephys continuous stream with ephys channels was found in "
+            f"{recording_root / 'structure.oebin'}"
+        )
+    if len(ephys_candidates) > 1:
+        stream_names = ", ".join(_openephys_stream_name(entry) for entry, *_ in ephys_candidates)
+        raise ValueError(
+            "Multiple Open Ephys continuous streams with ephys channels are unsupported: "
+            f"{stream_names}"
+        )
+
+    entry, ephys_indices, adc_indices, ephys_names, adc_names = ephys_candidates[0]
     folder_name = str(entry["folder_name"]).rstrip("/\\")
     continuous_dat = recording_root / "continuous" / folder_name / "continuous.dat"
     if not continuous_dat.exists():
         raise FileNotFoundError(f"Missing Open Ephys continuous.dat: {continuous_dat}")
 
-    recorded_processor = str(entry.get("recorded_processor", "Record Node")).strip()
-    recorded_processor_id = entry.get("recorded_processor_id")
-    if recorded_processor_id is not None:
-        stream_name = f"{recorded_processor} {recorded_processor_id}#{folder_name}"
-    else:
-        stream_name = folder_name
-
     ttl_path = recording_root / "events" / folder_name / "TTL"
-    num_channels = int(entry["num_channels"])
+    total_channels = int(entry.get("num_channels", len(entry.get("channels", []))))
     sampling_frequency = float(entry["sample_rate"])
-    return continuous_dat, stream_name, ttl_path, num_channels, sampling_frequency
+    return OpenEphysStreamInfo(
+        continuous_dat=continuous_dat,
+        stream_name=_openephys_stream_name(entry),
+        ttl_path=ttl_path,
+        total_channels=total_channels,
+        sampling_frequency=sampling_frequency,
+        ephys_channel_indices=ephys_indices,
+        adc_channel_indices=adc_indices,
+        ephys_channel_names=ephys_names,
+        adc_channel_names=adc_names,
+    )
+
+
+def _copy_if_different(source: Path, target: Path) -> Path:
+    if source.resolve() != target.resolve():
+        copy2(source, target)
+    return target
 
 
 def ensure_xml(
@@ -979,17 +1092,16 @@ def ensure_xml(
     explicit_xml_path: Path | None = None,
 ) -> Path:
     target = local_output_dir / f"{basename}.xml"
+
     if explicit_xml_path is not None:
         explicit = Path(explicit_xml_path).expanduser().resolve()
         if not explicit.exists() or not explicit.is_file():
             raise FileNotFoundError(f"Selected XML file does not exist: {explicit}")
-        copy2(explicit, target)
-        return target
+        return _copy_if_different(explicit, target)
 
     base_xml = basepath / f"{basename}.xml"
     if base_xml.exists():
-        copy2(base_xml, target)
-        return target
+        return _copy_if_different(base_xml, target)
 
     raise FileNotFoundError(
         f"No XML file selected and no basename XML found. Expected {base_xml}; "
@@ -1034,8 +1146,7 @@ def ensure_rhd(
     target = local_output_dir / f"{basename}.rhd"
     src = find_rhd_source(basepath, basename, use_first_child_match=use_first_child_match)
     if src is not None:
-        copy2(src, target)
-        return target
+        return _copy_if_different(src, target)
 
     if target.exists():
         return target
@@ -1096,9 +1207,11 @@ def discover_subsessions(
 ) -> list[Path]:
     ignore_folders = ignore_folders or []
 
-    paths = _discover_openephys_recordings(basepath, ignore_folders)
-    if not paths:
-        paths = []
+    paths: list[Path] = []
+    if (basepath / "structure.oebin").exists():
+        paths.append(basepath)
+    else:
+        paths.extend(_discover_openephys_recordings(basepath, ignore_folders))
         for child in sorted(basepath.iterdir()):
             if not child.is_dir():
                 continue
@@ -1204,99 +1317,85 @@ def build_acquisition_catalog(
     dtype: str,
     intan_header: IntanRhdHeader | None = None,
 ) -> AcquisitionCatalog:
-    if amplifier_paths and amplifier_paths[0].is_dir() and (amplifier_paths[0] / "structure.oebin").exists():
-        recording_paths = [Path(p) for p in amplifier_paths]
-        continuous_paths: list[Path] = []
-        recording_stream_names: list[str | None] = []
-        ttl_event_paths: list[Path] = []
-        sample_counts: list[int] = []
-        sampling_frequency: float | None = None
-        amplifier_channels: int | None = None
-
-        for recording_root in recording_paths:
-            continuous_path, stream_name, ttl_path, n_channels, sr = _resolve_openephys_stream_info(recording_root)
-            if sampling_frequency is None:
-                sampling_frequency = sr
-            elif not np.isclose(sampling_frequency, sr):
-                raise ValueError(
-                    "Open Ephys recordings with mismatched sampling frequencies are unsupported: "
-                    f"{sampling_frequency} vs {sr} ({recording_root})"
-                )
-            if amplifier_channels is None:
-                amplifier_channels = n_channels
-            elif amplifier_channels != n_channels:
-                raise ValueError(
-                    "Open Ephys recordings with mismatched channel counts are unsupported: "
-                    f"{amplifier_channels} vs {n_channels} ({recording_root})"
-                )
-
-            continuous_paths.append(continuous_path)
-            recording_stream_names.append(stream_name)
-            ttl_event_paths.append(ttl_path)
-            sample_counts.append(
-                _infer_sample_count_from_binary(
-                    continuous_path,
-                    n_channels=n_channels,
-                    dtype=dtype,
-                )
-            )
-
-        has_ttl = any(path.exists() for path in ttl_event_paths)
-        dig_ch = 16 if has_ttl else 0
-        dig_word_ch = 1 if has_ttl else 0
-        dig_native_orders = list(range(16)) if has_ttl else []
-
-        return AcquisitionCatalog(
-            source_type="openephys",
-            subsession_names=[_openephys_subsession_name(p) for p in recording_paths],
-            recording_paths=recording_paths,
-            recording_stream_names=recording_stream_names,
-            ttl_event_paths=ttl_event_paths,
-            amplifier_paths=continuous_paths,
-            analogin_paths=[],
-            digitalin_paths=[],
-            auxiliary_paths=[],
-            supply_paths=[],
-            time_paths=[],
-            sample_counts=sample_counts,
-            sampling_frequency=sampling_frequency,
-            amplifier_channels=int(amplifier_channels or n_amplifier_channels),
-            auxiliary_input_channels=0,
-            supply_voltage_channels=0,
-            board_adc_channels=0,
-            board_digital_input_channels=dig_ch,
-            board_digital_word_channels=dig_word_ch,
-            board_digital_output_channels=0,
-            temperature_sensor_channels=0,
-            board_adc_native_orders=[],
-            board_digital_input_native_orders=dig_native_orders,
-        )
-
-    sample_counts = [
-        _infer_sample_count_from_binary(
-            p,
-            n_channels=n_amplifier_channels,
-            dtype=dtype,
-        )
-        for p in amplifier_paths
-    ]
-
+    source_types: list[str] = []
+    subsession_names: list[str] = []
+    recording_paths: list[Path] = []
+    recording_stream_names: list[str | None] = []
+    ttl_event_paths_by_subsession: list[Path | None] = []
+    resolved_amplifier_paths: list[Path] = []
+    sample_counts: list[int] = []
+    source_total_channels: list[int] = []
+    source_ephys_channels: list[int] = []
+    source_adc_channels: list[int] = []
+    ephys_channel_indices_by_subsession: list[list[int] | None] = []
+    adc_channel_indices_by_subsession: list[list[int]] = []
+    adc_channel_names_by_subsession: list[list[str]] = []
+    analogin_source_paths: list[Path | None] = []
     analogin_paths: list[Path] = []
     digitalin_paths: list[Path] = []
     auxiliary_paths: list[Path] = []
     supply_paths: list[Path] = []
     time_paths: list[Path] = []
+    openephys_sampling_frequency: float | None = None
+    openephys_adc_channel_max = 0
 
-    for p in amplifier_paths:
-        d = p.parent
+    intan_paths: list[Path] = []
+    intan_sample_counts: list[int] = []
+
+    for raw_path in amplifier_paths:
+        path = Path(raw_path)
+        if path.is_dir() and (path / "structure.oebin").exists():
+            info = _resolve_openephys_stream_info(path)
+            ephys_channel_count = len(info.ephys_channel_indices)
+            if openephys_sampling_frequency is None:
+                openephys_sampling_frequency = info.sampling_frequency
+            elif not np.isclose(openephys_sampling_frequency, info.sampling_frequency):
+                raise ValueError(
+                    "Open Ephys recordings with mismatched sampling frequencies are unsupported: "
+                    f"{openephys_sampling_frequency} vs {info.sampling_frequency} ({path})"
+                )
+
+            source_types.append("openephys")
+            subsession_names.append(_openephys_subsession_name(path))
+            recording_paths.append(path)
+            recording_stream_names.append(info.stream_name)
+            ttl_event_paths_by_subsession.append(info.ttl_path)
+            resolved_amplifier_paths.append(info.continuous_dat)
+            sample_counts.append(
+                _infer_sample_count_from_binary(
+                    info.continuous_dat,
+                    n_channels=info.total_channels,
+                    dtype=dtype,
+                )
+            )
+            source_total_channels.append(int(info.total_channels))
+            source_ephys_channels.append(ephys_channel_count)
+            source_adc_channels.append(len(info.adc_channel_indices))
+            ephys_channel_indices_by_subsession.append(list(info.ephys_channel_indices))
+            adc_channel_indices_by_subsession.append(list(info.adc_channel_indices))
+            adc_channel_names_by_subsession.append(list(info.adc_channel_names))
+            analogin_source_paths.append(info.continuous_dat if info.adc_channel_indices else None)
+            openephys_adc_channel_max = max(openephys_adc_channel_max, len(info.adc_channel_indices))
+            continue
+
+        sample_count = _infer_sample_count_from_binary(
+            path,
+            n_channels=n_amplifier_channels,
+            dtype=dtype,
+        )
+        d = path.parent
         analog = d / "analogin.dat"
         digital = d / "digitalin.dat"
         aux = d / "auxiliary.dat"
         supply = d / "supply.dat"
         tdat = d / "time.dat"
 
+        intan_adc_channels = 0
         if analog.exists():
             analogin_paths.append(analog)
+            intan_adc_channels = _infer_channels_from_file(analog, sample_count)
+        if intan_header is not None and analog.exists() and intan_header.num_board_adc_channels > 0:
+            intan_adc_channels = int(intan_header.num_board_adc_channels)
         if digital.exists():
             digitalin_paths.append(digital)
         if aux.exists():
@@ -1306,13 +1405,30 @@ def build_acquisition_catalog(
         if tdat.exists():
             time_paths.append(tdat)
 
-    sidecar_sample_counts = {p.parent: int(n) for p, n in zip(amplifier_paths, sample_counts, strict=True)}
+        source_types.append("intan")
+        subsession_names.append(d.name)
+        recording_paths.append(d)
+        recording_stream_names.append(None)
+        ttl_event_paths_by_subsession.append(None)
+        resolved_amplifier_paths.append(path)
+        sample_counts.append(sample_count)
+        source_total_channels.append(int(n_amplifier_channels))
+        source_ephys_channels.append(int(n_amplifier_channels))
+        source_adc_channels.append(intan_adc_channels)
+        ephys_channel_indices_by_subsession.append(None)
+        adc_channel_indices_by_subsession.append(list(range(intan_adc_channels)))
+        adc_channel_names_by_subsession.append([f"ADC{i + 1}" for i in range(intan_adc_channels)])
+        analogin_source_paths.append(analog if analog.exists() else None)
+        intan_paths.append(path)
+        intan_sample_counts.append(sample_count)
+
+    sidecar_sample_counts = {p.parent: int(n) for p, n in zip(intan_paths, intan_sample_counts, strict=True)}
 
     def _infer_channels_for_sidecar(paths: list[Path]) -> int:
         if not paths:
             return 0
         p = paths[0]
-        return _infer_channels_from_file(p, sidecar_sample_counts.get(p.parent, sample_counts[0]))
+        return _infer_channels_from_file(p, sidecar_sample_counts.get(p.parent, sample_counts[0] if sample_counts else 0))
 
     aux_ch = _infer_channels_for_sidecar(auxiliary_paths)
     supply_ch = _infer_channels_for_sidecar(supply_paths)
@@ -1329,6 +1445,9 @@ def build_acquisition_catalog(
         if intan_header.board_adc_native_orders:
             adc_native_orders = [int(ch) for ch in intan_header.board_adc_native_orders]
     if not adc_native_orders and adc_ch > 0:
+        adc_native_orders = list(range(int(adc_ch)))
+    if openephys_adc_channel_max > adc_ch:
+        adc_ch = openephys_adc_channel_max
         adc_native_orders = list(range(int(adc_ch)))
 
     dig_ch = 0
@@ -1352,22 +1471,50 @@ def build_acquisition_catalog(
         temp_sensor_ch = 0
     if not dig_native_orders and dig_ch > 0:
         dig_native_orders = list(range(int(dig_ch)))
+    has_openephys_ttl = any(path is not None and path.exists() for path in ttl_event_paths_by_subsession)
+    if has_openephys_ttl:
+        dig_ch = max(dig_ch, 16)
+        dig_word_ch = max(dig_word_ch, 1)
+        if not dig_native_orders:
+            dig_native_orders = list(range(16))
+
+    unique_ephys_channels = sorted(set(int(n) for n in source_ephys_channels))
+    if len(unique_ephys_channels) > 1:
+        raise ValueError(
+            "Recordings with mismatched ephys channel counts are unsupported: "
+            f"{unique_ephys_channels}"
+        )
+
+    if source_types and all(source_type == "openephys" for source_type in source_types):
+        catalog_source_type = "openephys"
+        sampling_frequency = openephys_sampling_frequency
+        ttl_event_paths = [path for path in ttl_event_paths_by_subsession if path is not None]
+        amplifier_channels = unique_ephys_channels[0] if unique_ephys_channels else int(n_amplifier_channels)
+    else:
+        catalog_source_type = "intan"
+        sampling_frequency = openephys_sampling_frequency
+        ttl_event_paths = (
+            ttl_event_paths_by_subsession
+            if any(source_type == "openephys" for source_type in source_types)
+            else []
+        )
+        amplifier_channels = int(n_amplifier_channels)
 
     return AcquisitionCatalog(
-        source_type="intan",
-        subsession_names=[p.parent.name for p in amplifier_paths],
-        recording_paths=[p.parent for p in amplifier_paths],
-        recording_stream_names=[None for _ in amplifier_paths],
-        ttl_event_paths=[],
-        amplifier_paths=amplifier_paths,
+        source_type=catalog_source_type,
+        subsession_names=subsession_names,
+        recording_paths=recording_paths,
+        recording_stream_names=recording_stream_names,
+        ttl_event_paths=ttl_event_paths,
+        amplifier_paths=resolved_amplifier_paths,
         analogin_paths=analogin_paths,
         digitalin_paths=digitalin_paths,
         auxiliary_paths=auxiliary_paths,
         supply_paths=supply_paths,
         time_paths=time_paths,
         sample_counts=sample_counts,
-        sampling_frequency=None,
-        amplifier_channels=n_amplifier_channels,
+        sampling_frequency=sampling_frequency,
+        amplifier_channels=amplifier_channels,
         auxiliary_input_channels=aux_ch,
         supply_voltage_channels=supply_ch,
         board_adc_channels=adc_ch,
@@ -1377,6 +1524,14 @@ def build_acquisition_catalog(
         temperature_sensor_channels=temp_sensor_ch,
         board_adc_native_orders=adc_native_orders,
         board_digital_input_native_orders=dig_native_orders,
+        source_types=source_types,
+        source_total_channels=source_total_channels,
+        source_ephys_channels=source_ephys_channels,
+        source_adc_channels=source_adc_channels,
+        ephys_channel_indices_by_subsession=ephys_channel_indices_by_subsession,
+        adc_channel_indices_by_subsession=adc_channel_indices_by_subsession,
+        adc_channel_names_by_subsession=adc_channel_names_by_subsession,
+        analogin_source_paths=analogin_source_paths,
     )
 
 

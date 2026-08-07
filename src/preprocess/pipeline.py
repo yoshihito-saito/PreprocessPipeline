@@ -92,6 +92,259 @@ def _resolve_highamp_n_jobs(config: PreprocessConfig) -> int:
     return -1
 
 
+def _catalog_source_types(catalog) -> list[str]:
+    n_subsessions = len(catalog.amplifier_paths)
+    source_types = getattr(catalog, "source_types", None)
+    if not source_types:
+        return [str(catalog.source_type) for _ in range(n_subsessions)]
+    if len(source_types) != n_subsessions:
+        raise ValueError(
+            "catalog.source_types must align with catalog.amplifier_paths: "
+            f"{len(source_types)} != {n_subsessions}"
+        )
+    return [str(source_type) for source_type in source_types]
+
+
+def _catalog_analogin_source_paths(catalog) -> list[Path | None]:
+    n_subsessions = len(catalog.amplifier_paths)
+    analogin_source_paths = getattr(catalog, "analogin_source_paths", None)
+    if analogin_source_paths:
+        if len(analogin_source_paths) != n_subsessions:
+            raise ValueError(
+                "catalog.analogin_source_paths must align with catalog.amplifier_paths: "
+                f"{len(analogin_source_paths)} != {n_subsessions}"
+            )
+        return [Path(p) if p is not None else None for p in analogin_source_paths]
+
+    return [
+        (p.parent / "analogin.dat") if (p.parent / "analogin.dat").exists() else None
+        for p in catalog.amplifier_paths
+    ]
+
+
+def _catalog_analogin_source_num_channels(catalog, source_types: list[str]) -> list[int | None] | None:
+    source_adc_channels = getattr(catalog, "source_adc_channels", None)
+    source_total_channels = getattr(catalog, "source_total_channels", None)
+    if not source_adc_channels and not source_total_channels:
+        return None
+    n_subsessions = len(catalog.amplifier_paths)
+    if len(source_adc_channels) != n_subsessions or len(source_total_channels) != n_subsessions:
+        raise ValueError("catalog source channel metadata must align with catalog.amplifier_paths")
+
+    out: list[int | None] = []
+    for idx, source_type in enumerate(source_types):
+        if source_type == "openephys":
+            out.append(int(source_total_channels[idx]))
+        else:
+            adc_channels = int(source_adc_channels[idx])
+            out.append(adc_channels if adc_channels > 0 else None)
+    return out
+
+
+def _catalog_analogin_channel_indices(catalog, source_types: list[str]) -> list[list[int] | None] | None:
+    indices = getattr(catalog, "adc_channel_indices_by_subsession", None)
+    if not indices:
+        return None
+    n_subsessions = len(catalog.amplifier_paths)
+    if len(indices) != n_subsessions:
+        raise ValueError(
+            "catalog.adc_channel_indices_by_subsession must align with catalog.amplifier_paths: "
+            f"{len(indices)} != {n_subsessions}"
+        )
+    return [
+        [int(ch) for ch in indices[idx]] if source_type == "openephys" and indices[idx] else None
+        for idx, source_type in enumerate(source_types)
+    ]
+
+
+def _catalog_openephys_ttl_inputs(
+    catalog,
+    source_types: list[str],
+) -> tuple[list[Path | None] | None, list[int] | None]:
+    if not any(source_type == "openephys" for source_type in source_types):
+        return None, None
+
+    n_subsessions = len(catalog.amplifier_paths)
+    if len(catalog.sample_counts) != n_subsessions:
+        raise ValueError(
+            "catalog.sample_counts must align with catalog.amplifier_paths: "
+            f"{len(catalog.sample_counts)} != {n_subsessions}"
+        )
+
+    ttl_event_paths = getattr(catalog, "ttl_event_paths", [])
+    if len(ttl_event_paths) != n_subsessions:
+        raise ValueError(
+            "catalog.ttl_event_paths must be per-subsession when any Open Ephys source is present: "
+            f"{len(ttl_event_paths)} != {n_subsessions}"
+        )
+
+    aligned_ttl_paths = [
+        (Path(ttl_event_paths[idx]) if ttl_event_paths[idx] is not None else None)
+        if source_type == "openephys"
+        else None
+        for idx, source_type in enumerate(source_types)
+    ]
+    return aligned_ttl_paths, [int(n) for n in catalog.sample_counts]
+
+
+def _ephys_channel_selections(
+    ephys_channel_indices_by_subsession: list[list[int] | None] | None,
+    *,
+    final_num_channels: int,
+) -> list[list[int]]:
+    if not ephys_channel_indices_by_subsession:
+        return []
+    selections: list[list[int]] = []
+    n_final = int(final_num_channels)
+    for idx, selection in enumerate(ephys_channel_indices_by_subsession):
+        if selection is None:
+            continue
+        normalized = [int(ch) for ch in selection]
+        if len(normalized) != n_final:
+            raise ValueError(
+                "Open Ephys ephys channel selection must match the final ephys channel count: "
+                f"subsession={idx}, selected={len(normalized)}, final={n_final}"
+            )
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(
+                "Open Ephys ephys channel selection contains duplicate source channels: "
+                f"subsession={idx}"
+            )
+        selections.append(normalized)
+    return selections
+
+
+def _chanmap_payload_channel_indices(payload: dict[str, object]) -> np.ndarray | None:
+    if "chanMap0ind" in payload:
+        return np.asarray(payload["chanMap0ind"]).reshape(-1).astype(np.int64)
+    if "chanMap" in payload:
+        return np.asarray(payload["chanMap"]).reshape(-1).astype(np.int64) - 1
+    return None
+
+
+def _filter_chanmap_payload(
+    payload: dict[str, object],
+    *,
+    raw_channel_indices: np.ndarray,
+    keep_mask: np.ndarray,
+) -> dict[str, object]:
+    filtered_payload: dict[str, object] = {}
+    for key, value in payload.items():
+        arr = np.asarray(value)
+        if arr.size == raw_channel_indices.size:
+            filtered_payload[key] = arr.reshape(-1)[keep_mask].reshape(-1, 1)
+        else:
+            filtered_payload[key] = value
+    return filtered_payload
+
+
+def _prepare_effective_chanmap_for_final_channel_space(
+    *,
+    chanmap_mat_path: Path | None,
+    output_dir: Path,
+    final_num_channels: int,
+    ephys_channel_indices_by_subsession: list[list[int] | None] | None,
+) -> tuple[Path | None, dict[int, int] | None]:
+    if chanmap_mat_path is None:
+        return None, None
+    source_chanmap = Path(chanmap_mat_path)
+    if not source_chanmap.exists():
+        return source_chanmap, None
+    canonical_path = Path(output_dir) / "chanMap.mat"
+
+    n_final = int(final_num_channels)
+    selections = _ephys_channel_selections(
+        ephys_channel_indices_by_subsession,
+        final_num_channels=n_final,
+    )
+    identity = list(range(n_final))
+    if not selections or all(selection == identity for selection in selections):
+        if source_chanmap.resolve() != canonical_path.resolve():
+            loaded = loadmat(str(source_chanmap))
+            payload = {key: value for key, value in loaded.items() if not key.startswith("__")}
+            savemat(str(canonical_path), payload)
+            return canonical_path, None
+        return source_chanmap, None
+
+    loaded = loadmat(str(source_chanmap))
+    payload = {key: value for key, value in loaded.items() if not key.startswith("__")}
+    raw_channels = _chanmap_payload_channel_indices(payload)
+    if raw_channels is None:
+        return source_chanmap, None
+    if raw_channels.size == 0:
+        raise ValueError(f"chanMap has no channel entries: {source_chanmap}")
+
+    compact_valid = (raw_channels >= 0) & (raw_channels < n_final)
+    compact_values = set(range(n_final))
+    compact_raw_values = {int(ch) for ch in raw_channels[compact_valid].tolist()}
+    compact_covers_final = compact_values.issubset(compact_raw_values)
+
+    if compact_covers_final:
+        keep_mask = compact_valid
+        final_channels = raw_channels[keep_mask].astype(np.int64)
+        source_to_final: dict[int, int] | None = None
+    else:
+        unique_selections = {tuple(selection) for selection in selections}
+        source_selection = selections[0]
+        source_to_final = {int(ch): idx for idx, ch in enumerate(source_selection)}
+        source_valid = np.asarray([int(ch) in source_to_final for ch in raw_channels], dtype=bool)
+        compact_subset = bool(np.all(compact_valid))
+        source_subset = bool(np.all(source_valid))
+
+        if compact_subset and source_subset:
+            raise ValueError(
+                "Cannot safely interpret chanMap channel coordinates for non-prefix Open Ephys "
+                "ephys selection. The chanMap is a subset of both the final ephys channel space "
+                "and the source acquisition-board channel space. Use a full final-channel chanMap "
+                "or a full source-coordinate chanMap."
+            )
+        if not source_subset:
+            invalid_preview = ", ".join(str(int(ch)) for ch in raw_channels[~source_valid][:10])
+            raise ValueError(
+                "chanMap channel indices do not match the final ephys channel space or the "
+                "Open Ephys source channel selection. Invalid source indices: "
+                f"{invalid_preview}"
+            )
+        if len(unique_selections) != 1:
+            raise ValueError(
+                "Cannot remap source-coordinate chanMap because Open Ephys ephys channel "
+                "selections differ across subepochs."
+            )
+        keep_mask = source_valid
+        final_channels = np.asarray(
+            [source_to_final[int(ch)] for ch in raw_channels[keep_mask]],
+            dtype=np.int64,
+        )
+
+    if final_channels.size == 0:
+        raise ValueError(f"No chanMap contacts remain after Open Ephys ephys channel remapping: {source_chanmap}")
+
+    remapped_payload = _filter_chanmap_payload(
+        payload,
+        raw_channel_indices=raw_channels,
+        keep_mask=keep_mask,
+    )
+    remapped_payload["chanMap0ind"] = final_channels.reshape(-1, 1)
+    remapped_payload["chanMap"] = final_channels.astype(np.float64).reshape(-1, 1) + 1.0
+
+    savemat(str(canonical_path), remapped_payload)
+    return canonical_path, source_to_final
+
+
+def _normalize_reject_channels_for_final_channel_space(
+    reject_channels_0based: list[int],
+    source_to_final_channel: dict[int, int] | None,
+) -> list[int]:
+    if not source_to_final_channel:
+        return sorted(set(int(ch) for ch in reject_channels_0based))
+    return sorted(
+        set(
+            source_to_final_channel.get(int(ch), int(ch))
+            for ch in reject_channels_0based
+        )
+    )
+
+
 def _save_artifact_events_mat(
     *,
     output_path: Path,
@@ -262,6 +515,21 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         intan_header=intan_header,
     )
     print_catalog_summary(catalog)
+    catalog_source_types = _catalog_source_types(catalog)
+    openephys_ttl_paths, openephys_sample_counts = _catalog_openephys_ttl_inputs(
+        catalog,
+        catalog_source_types,
+    )
+    if (
+        any(source_type == "openephys" for source_type in catalog_source_types)
+        and catalog.source_type != "openephys"
+        and catalog.sampling_frequency is not None
+        and not np.isclose(float(catalog.sampling_frequency), float(xml_meta.sr))
+    ):
+        raise ValueError(
+            "Mixed Intan/Open Ephys recordings must share the XML sampling rate: "
+            f"xml={xml_meta.sr}, openephys={catalog.sampling_frequency}"
+        )
 
     # Neurocode-compatible behavior: Intan uses XML-derived amplifier metadata.
     if catalog.source_type == "openephys":
@@ -285,6 +553,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         dtype=config.dtype,
         sampling_frequency=effective_sr,
         foldernames=catalog.subsession_names,
+        sample_counts=catalog.sample_counts,
     )
     mergepoints_path = output_dir / f"{basename}.MergePoints.events.mat"
     save_mergepoints_events_mat(mergepoints_path, merge_data)
@@ -314,10 +583,9 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             else 1
         )
 
-        analog_sidecar_paths = [
-            (p.parent / "analogin.dat") if (p.parent / "analogin.dat").exists() else None
-            for p in catalog.amplifier_paths
-        ]
+        analog_sidecar_paths = _catalog_analogin_source_paths(catalog)
+        analog_source_num_channels = _catalog_analogin_source_num_channels(catalog, catalog_source_types)
+        analog_source_channel_indices = _catalog_analogin_channel_indices(catalog, catalog_source_types)
         digital_sidecar_paths = [
             (p.parent / "digitalin.dat") if (p.parent / "digitalin.dat").exists() else None
             for p in catalog.amplifier_paths
@@ -331,6 +599,8 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             overwrite=config.overwrite,
             job_kwargs=config.job_kwargs,
             sample_counts=catalog.sample_counts,
+            source_num_channels=analog_source_num_channels,
+            source_channel_indices=analog_source_channel_indices,
         )
         if analog_concat is not None:
             intermediate_dat_paths["analogin"] = analog_concat
@@ -406,11 +676,20 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         digital_dat_path=intermediate_dat_paths.get("digitalin"),
         merge_timestamps_sec=merge_data.timestamps_sec,
         overwrite=config.overwrite,
-        openephys_ttl_paths=(catalog.ttl_event_paths if catalog.source_type == "openephys" else None),
-        openephys_sample_counts=(catalog.sample_counts if catalog.source_type == "openephys" else None),
+        openephys_ttl_paths=openephys_ttl_paths,
+        openephys_sample_counts=openephys_sample_counts,
     )
 
     _step("Load and concatenate amplifier dat")
+    ephys_channel_indices_by_subsession = getattr(catalog, "ephys_channel_indices_by_subsession", None)
+    if not ephys_channel_indices_by_subsession:
+        ephys_channel_indices_by_subsession = None
+    effective_chanmap_mat_path, reject_channel_remap = _prepare_effective_chanmap_for_final_channel_space(
+        chanmap_mat_path=config.chanmap_mat_path,
+        output_dir=output_dir,
+        final_num_channels=effective_n_channels,
+        ephys_channel_indices_by_subsession=ephys_channel_indices_by_subsession,
+    )
     recordings = load_subsession_recordings(
         dat_paths=catalog.amplifier_paths,
         sampling_frequency=effective_sr,
@@ -420,6 +699,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         offset_to_uV=config.offset_to_uV,
         recording_paths=catalog.recording_paths,
         recording_stream_names=catalog.recording_stream_names,
+        ephys_channel_indices_by_subsession=ephys_channel_indices_by_subsession,
     )
     recording_concat = concatenate_recordings_si(recordings)
 
@@ -447,10 +727,14 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         )
 
     _step("Attach probe and mark bad channels")
+    manual_reject_channels_0based = _normalize_reject_channels_for_final_channel_space(
+        config.reject_channels,
+        reject_channel_remap,
+    )
     recording_raw, bad_0, bad_1 = attach_probe_and_remove_bad_channels(
         recording=recording_base,
-        chanmap_mat_path=config.chanmap_mat_path,
-        reject_channels_0based=sorted(set(config.reject_channels + xml_meta.skipped_channels_0based)),
+        chanmap_mat_path=effective_chanmap_mat_path,
+        reject_channels_0based=sorted(set(manual_reject_channels_0based + xml_meta.skipped_channels_0based)),
     )
 
     if hasattr(recording_raw, "get_channel_ids"):
@@ -505,7 +789,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
 
             recording_for_ttl = apply_artifact_group_mode(
                 recording_preprocessed,
-                chanmap_mat_path=config.chanmap_mat_path,
+                chanmap_mat_path=effective_chanmap_mat_path,
                 mode=ttl_group_mode,
             )
 
@@ -577,7 +861,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
 
             recording_for_ttl = apply_artifact_group_mode(
                 recording_preprocessed,
-                chanmap_mat_path=config.chanmap_mat_path,
+                chanmap_mat_path=effective_chanmap_mat_path,
                 mode=ttl_group_mode,
             )
 
@@ -637,7 +921,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
 
             recording_for_highamp = apply_artifact_group_mode(
                 recording_preprocessed,
-                chanmap_mat_path=config.chanmap_mat_path,
+                chanmap_mat_path=effective_chanmap_mat_path,
                 mode=highamp_group_mode,
             )
 
@@ -659,7 +943,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
 
             recording_for_highamp = apply_artifact_group_mode(
                 recording_preprocessed,
-                chanmap_mat_path=config.chanmap_mat_path,
+                chanmap_mat_path=effective_chanmap_mat_path,
                 mode=highamp_group_mode,
             )
 
@@ -843,7 +1127,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             )
         partitions = build_sorter_partitions(
             mode=partition_mode,
-            chanmap_mat_path=config.chanmap_mat_path,
+            chanmap_mat_path=effective_chanmap_mat_path,
             num_channels=output_n_channels,
             excluded_channels_0based=sorter_partition_exclude_channels_0based,
         )
@@ -887,7 +1171,12 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
                 kilosort4_path=config.sorter_path,
                 matlab_path=config.matlab_path,
                 matlab_max_workers=config.matlab_max_workers,
-                chanmap_mat_path=config.chanmap_mat_path,
+                chanmap_mat_path=effective_chanmap_mat_path,
+                dtype=config.dtype,
+                gain_to_uV=config.gain_to_uV,
+                offset_to_uV=config.offset_to_uV,
+                sampling_frequency=effective_sr,
+                num_channels=output_n_channels,
                 active_channels_0based=(
                     partition.channels_0based if partition.mode != "all" else None
                 ),

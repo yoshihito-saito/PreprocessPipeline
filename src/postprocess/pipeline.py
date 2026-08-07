@@ -36,6 +36,7 @@ _SORTING_OUTPUT_PATTERNS = (
     "Kilosort2.5_*",
     "Kilosort4_*",
 )
+_CANONICAL_CHANMAP_NAME = "chanMap.mat"
 
 
 def _is_windows() -> bool:
@@ -540,6 +541,23 @@ def _sorting_analyzer_sparsity_kwargs(config: PostprocessConfig) -> dict[str, An
     return kwargs
 
 
+def _resolve_effective_chanmap_for_postprocess(
+    chanmap_mat_path: Path | None,
+    *,
+    local_output_dir: Path | None = None,
+    dat_path: Path | None = None,
+) -> Path | None:
+    candidates: list[Path] = []
+    if local_output_dir is not None:
+        candidates.append(Path(local_output_dir) / _CANONICAL_CHANMAP_NAME)
+    if dat_path is not None:
+        candidates.append(Path(dat_path).parent / _CANONICAL_CHANMAP_NAME)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return chanmap_mat_path
+
+
 def _resolve_recording_for_postprocess(config: PostprocessConfig):
     if config.recording is None and config.dat_path is None:
         raise ValueError("Either recording or dat_path must be provided")
@@ -560,7 +578,10 @@ def _resolve_recording_for_postprocess(config: PostprocessConfig):
     )
     rec_with_probe, bad_0, _ = attach_probe_and_remove_bad_channels(
         recording=rec_raw,
-        chanmap_mat_path=config.chanmap_mat_path,
+        chanmap_mat_path=_resolve_effective_chanmap_for_postprocess(
+            config.chanmap_mat_path,
+            dat_path=Path(config.dat_path),
+        ),
         reject_channels_0based=sorted(set(config.reject_channels)),
     )
     if hasattr(rec_with_probe, "get_channel_ids"):
@@ -1168,7 +1189,11 @@ def build_preprocessed_recording_from_result(
     )
     rec_with_probe, bad_0, _ = attach_probe_and_remove_bad_channels(
         recording=rec_raw,
-        chanmap_mat_path=preprocess_config.chanmap_mat_path,
+        chanmap_mat_path=_resolve_effective_chanmap_for_postprocess(
+            preprocess_config.chanmap_mat_path,
+            local_output_dir=result.local_output_dir,
+            dat_path=result.dat_path,
+        ),
         reject_channels_0based=_resolve_bad_channels_for_postprocess(result, preprocess_config),
     )
     if hasattr(rec_with_probe, "get_channel_ids"):
