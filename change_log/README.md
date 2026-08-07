@@ -15,3 +15,4 @@
 - [2026-07-05 GUI Launch Phy selected folder](2026-07-05-gui-launch-phy-selected-folder.md)
 - [2026-07-16 multi-day subepoch selection](2026-07-16-multiday-subepoch-selection.md)
 - [2026-07-19 mixed Intan/Open Ephys ADC handling](2026-07-19-mixed-source-pipeline-bridge.md)
+- [2026-07-31 staged metadata same-file copy guard](2026-07-31-xml-samefile-guard.md)

@@ -1078,6 +1078,12 @@ def _resolve_openephys_stream_info(recording_root: Path) -> OpenEphysStreamInfo:
     )
 
 
+def _copy_if_different(source: Path, target: Path) -> Path:
+    if source.resolve() != target.resolve():
+        copy2(source, target)
+    return target
+
+
 def ensure_xml(
     basepath: Path,
     local_output_dir: Path,
@@ -1086,17 +1092,16 @@ def ensure_xml(
     explicit_xml_path: Path | None = None,
 ) -> Path:
     target = local_output_dir / f"{basename}.xml"
+
     if explicit_xml_path is not None:
         explicit = Path(explicit_xml_path).expanduser().resolve()
         if not explicit.exists() or not explicit.is_file():
             raise FileNotFoundError(f"Selected XML file does not exist: {explicit}")
-        copy2(explicit, target)
-        return target
+        return _copy_if_different(explicit, target)
 
     base_xml = basepath / f"{basename}.xml"
     if base_xml.exists():
-        copy2(base_xml, target)
-        return target
+        return _copy_if_different(base_xml, target)
 
     raise FileNotFoundError(
         f"No XML file selected and no basename XML found. Expected {base_xml}; "
@@ -1141,8 +1146,7 @@ def ensure_rhd(
     target = local_output_dir / f"{basename}.rhd"
     src = find_rhd_source(basepath, basename, use_first_child_match=use_first_child_match)
     if src is not None:
-        copy2(src, target)
-        return target
+        return _copy_if_different(src, target)
 
     if target.exists():
         return target
