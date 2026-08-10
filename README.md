@@ -53,6 +53,141 @@ The command starts the standalone Qt desktop GUI. It requires a working display
 server, for example a local desktop session, X forwarding, or a VS Code remote
 display setup.
 
+## Persistent Local and Slurm Runs
+
+Configure scientific parameters under **Ephys > Preprocess** and
+**Ephys > Postprocess**, then use **Ephys > Run** to run the standard raw-data
+workflow as persistent Stages:
+
+```text
+preprocess -> sorting -> postprocess
+```
+
+Each Run is stored under `<Local working dir>/.pipeline/<run-id>/`. The directory holds
+the immutable analysis snapshot, execution resources, provenance, per-Attempt
+specifications, logs, backend job IDs, results, failures, and a regenerable
+`state.json`. Keep this directory; it is the recovery and audit record.
+
+Local execution uses detached workers. Closing the GUI does not cancel the Run.
+When the same session is selected after reopening the GUI, its active-Run claim
+reconnects the compact **Ephys > Run** status automatically. Slurm also uses the
+same Stage worker, submitted through one `sbatch` job per Attempt with `afterok`
+dependencies. New Stage stdout/stderr and Kilosort progress are mirrored into
+the main GUI Log while the persistent files remain the complete audit record.
+
+Backend selection is strict:
+
+- With no explicitly saved backend choice, an environment with the required
+  Slurm client commands initially selects explicit **Slurm**. Other environments
+  initially select **Auto**. A saved backend choice is preserved. A temporary
+  scheduler outage therefore reports a Slurm error instead of silently changing
+  this server default into a Local run.
+- **Auto** uses Slurm only when the configured capability checks pass before any
+  submission; otherwise it resolves to Local.
+- **Local** never depends on Slurm commands.
+- **Slurm** reports an error when Slurm is unavailable. It never silently starts
+  the analysis locally.
+- An ambiguous `sbatch` outcome is recorded as `lost`, not as an ordinary
+  retryable failure, and is never retried locally.
+
+For Slurm, the Local working directory, input data, sorter installation, and
+output paths must be visible from the compute node. The **Run** page requests
+independent **CPU cores** and host **Memory (GiB)** for every Stage. Preprocess
+and postprocess request no GPU; Sorting requests exactly one untyped GPU and
+shows `1 (auto)`. The GPU device ID is intentionally not selectable: Slurm
+chooses an available device when the job starts and exposes it to the worker.
+CPU values are exact requests and are not capped by the GUI host's CPU count.
+
+GUI-created Runs always use the partition walltime default and omit the Slurm
+`--time` directive. On this cluster's `regular` partition,
+`DefaultTime=NONE`/`MaxTime=UNLIMITED`, so the effective limit is unlimited.
+The execution model and CLI retain explicit walltime support for scripted or
+backward-compatible use. Resources are released as soon as the Stage exits; a
+hung Run can be cancelled with the single bottom **Force stop** button.
+
+The persistent workspace is derived automatically from Local working dir, and
+each Slurm script checks that it is readable and writable on its assigned
+compute node before starting the worker. Paths under the system temporary
+directory still produce a preflight warning.
+
+Cancellation is explicit and preserves logs and partial outputs. The GUI's
+**Force stop** cancels every active Local/Slurm Stage in the current Run. Stage
+cancel, Attempt retry, manual reconcile, and resume remain controller/CLI
+recovery operations rather than normal GUI controls. A new GUI Run reuses
+compatible completed Stages and creates immutable Attempts from the first Stage
+that must run; it never overwrites prior Attempt records or silently changes
+scientific settings. A Stage is complete only after its expected outputs pass
+validation.
+
+The existing **Basepath** field may also point directly to a processed session,
+for example `sorting_temp/RM018_day33_260611`. The GUI keeps using that directory
+as the scientific output directory and recovers the original raw-data path from
+`preprocess_run.yaml` or legacy preprocess metadata. With overwrite disabled,
+compatible and deeply validated Stages are reused; execution restarts at the
+first incomplete, invalid, or parameter-incompatible Stage. With overwrite
+enabled, the requested Stage scope is recomputed. A partial processed folder
+whose raw-data source cannot be recovered is rejected before a preprocess rerun.
+
+The bottom **Move outputs to storage** action shows its destination before
+moving. A single-day Run defaults to Basepath. A multi-day Run defaults to a
+new sibling directory named from **Multi-day name**
+(`<Basepath parent>/<Multi-day name>`), keeping combined output out of the first
+raw day. **Browse save dir** selects an exact existing destination and updates
+the displayed Basepath; the Local source resolved before that selection remains
+the move source. The existing `.dat`, overwrite, and clean-Local options still
+control which files are moved and whether the Local session is removed.
+
+Only one persistent Run may mutate a processed session at a time, even when two
+controllers use different Run workspaces. **Run all**, **Preprocess only**, and
+**Postprocess only** are available only on the Run page and all use persistent
+Local/Slurm execution. Phy and
+CellExplorer remain interactive Local applications, do not request a Slurm job
+or GPU, and are blocked while that session has an active persistent Run.
+
+The visible successful-session record is intentionally compact:
+
+```text
+<session>/preprocess_run.yaml
+<session>/preprocess.log
+<session>/sorter_partition_manifest.json       # when partitioned sorting is used
+<session>/Kilosort_<timestamp>/kilosort.log
+<session>/Kilosort_<timestamp>/sorter_config_resolved.yaml
+```
+
+`preprocess_run.yaml` records the exact analysis parameters, execution
+resources, input/code/environment provenance, Stage timings, scheduler job IDs,
+terminal telemetry, validation, and warning/error summary. `preprocess.log` is
+the consolidated human-readable Run log. Persistent Runs do not generate
+`preprocessSession.log`; successful finalization removes Stage stdout/stderr,
+SpikeInterface helper JSON, and an exactly duplicated `matlab_run.log`. The
+exact submitted `job.sbatch` and submission intent remain in the hidden Run
+record. Failed, cancelled, ambiguous, or lost Runs retain their full
+diagnostics under `<Local working dir>/.pipeline/<run-id>/`.
+
+Large `.dat` and `.lfp` outputs are published by same-filesystem atomic replace,
+so a failed rewrite does not replace the previous valid file. Sorting reruns use
+a new timestamped Kilosort directory. Postprocess overwrite versions every prior
+`*_spi` directory before recomputation, so an interrupted replacement cannot
+destroy a valid result; `.phy` and `phy.log` remain preserved with it.
+
+On POSIX, every Kilosort Attempt uses its own immutable shim, startup file, and
+MATLAB Processes job-storage directory. The generated startup runs only in the
+parent MATLAB process, so concurrent or previously interrupted Attempts do not
+share configuration or a MATLAB job queue.
+
+An Attempt whose scheduler outcome is `lost` or ambiguous is not offered for
+normal retry: investigate the scheduler first, because submitting a replacement
+could duplicate a job that Slurm actually accepted. Both whole-Run cancellation
+and cancellation from a selected Stage (including downstream Attempts) are
+available.
+
+The controller and worker are also available directly:
+
+```bash
+preprocess-run-controller --help
+preprocess-stage-worker --help
+```
+
 
 ## Phy2
 
@@ -211,4 +346,3 @@ the default noise decision.
 - [ ] Tracking/DLC (`getPos`, `path_to_dlc_bat_file`, `general_behavior_file`)
 - [ ] Session summary (`runSummary` / `sessionSummary`)
 - [ ] Concatenation option (`fillMissingDatFiles`)
-

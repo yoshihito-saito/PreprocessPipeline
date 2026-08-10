@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 from scipy.io import loadmat
 
-from PySide6.QtCore import QPointF, QProcess, QRectF, Qt, QTimer, QUrl
+from PySide6.QtCore import QPointF, QProcess, QProcessEnvironment, QRectF, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPen, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -70,16 +70,23 @@ from src.preprocess.io import build_channel_map_data, save_cell_explorer_chan_co
 from src.preprocess.multiday import discover_multi_day_subepochs
 from src.preprocess.paths import find_project_root, resolve_project_path
 from src.worker_defaults import default_worker_count, normalize_worker_count
+from src.execution.backends import SlurmCapabilities, detect_slurm_capabilities
+from src.execution.controller import create_run, resolve_backend
+from src.execution.models import BackendName, RequestedBackend, StageName, StageStatus
+from src.execution.store import RunStore, read_json
 
 from .config_model import (
     BehaviorGuiSettings,
     PipelineGuiSettings,
     PostprocessGuiSettings,
     PreprocessGuiSettings,
+    ExecutionGuiSettings,
+    StageResourceGuiSettings,
     RunMode,
     parse_float_pair,
     parse_int_list,
     postprocess_output_folder_for_sorting,
+    resolve_existing_session_settings,
 )
 from .anatomical_map import (
     AnatomicalChannelGroup,
@@ -110,6 +117,29 @@ def _default_config_path() -> Path:
 
 
 DEFAULT_CONFIG_PATH = _default_config_path()
+
+
+def _default_config_has_backend_choice(path: Path = DEFAULT_CONFIG_PATH) -> bool:
+    if not path.exists():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    execution = payload.get("execution") if isinstance(payload, dict) else None
+    return isinstance(execution, dict) and "requested_backend" in execution
+
+
+def _has_slurm_server_commands(
+    capabilities: SlurmCapabilities, *, require_sacct: bool
+) -> bool:
+    required = (
+        capabilities.sbatch,
+        capabilities.squeue,
+        capabilities.scancel,
+        capabilities.sacct if require_sacct else True,
+    )
+    return all(required)
 
 PROBE_TYPES = (
     "middle_finger",
@@ -146,9 +176,14 @@ def _settings_as_parameter_defaults(settings: PipelineGuiSettings) -> PipelineGu
     defaults = PipelineGuiSettings.from_json(settings.to_json())
     defaults.basepath = ""
     defaults.local_root = ""
+    defaults.source_basepath = ""
+    defaults.existing_session_dir = ""
     defaults.chanmap_path = ""
     defaults.preprocess.reject_channels = []
     defaults.preprocess.matlab_path = ""
+    defaults.execution.matlab_path = ""
+    defaults.execution.workspace = ""
+    defaults.execution.shared_workspace_acknowledged = False
     defaults.postprocess.sorting_phy_folder = ""
     defaults.postprocess.sorting_search_root = ""
     return defaults
@@ -165,25 +200,45 @@ def _save_default_settings(settings: PipelineGuiSettings, path: Path = DEFAULT_C
     return path
 
 
-def _move_local_output_to_basepath(
-    settings: PipelineGuiSettings, *, move_dat: bool, overwrite: bool, clean_after_move: bool
-) -> dict[str, Any]:
+def _default_output_storage_dir(settings: PipelineGuiSettings) -> Path | None:
     basepath = settings.basepath_path
-    local_output_dir = settings.local_output_dir
-    basename = settings.basename
-    if basepath is None or not basename:
-        raise ValueError("basepath is required.")
+    if basepath is None:
+        return None
+    if settings.multi_day_enabled and settings.multi_day_name.strip():
+        return (basepath.resolve().parent / settings.multi_day_name.strip()).resolve()
+    return basepath.resolve()
+
+
+def _move_local_output_to_storage(
+    settings: PipelineGuiSettings,
+    *,
+    move_dat: bool,
+    overwrite: bool,
+    clean_after_move: bool,
+    destination_dir: Path | None = None,
+    source_dir: Path | None = None,
+    source_basename: str | None = None,
+) -> dict[str, Any]:
+    local_output_dir = source_dir or settings.local_output_dir
+    basename = source_basename or settings.basename
+    storage_dir = destination_dir or _default_output_storage_dir(settings)
+    if storage_dir is None or not basename:
+        raise ValueError("A storage destination and basename are required.")
     if local_output_dir is None:
         raise ValueError("local output directory cannot be resolved.")
 
     src_root = local_output_dir.resolve()
-    dst_root = basepath.resolve()
+    dst_root = storage_dir.expanduser().resolve()
     if not src_root.exists() or not src_root.is_dir():
         raise FileNotFoundError(f"Local output directory does not exist: {src_root}")
+    if destination_dir is None and settings.multi_day_enabled:
+        dst_root.mkdir(parents=False, exist_ok=True)
     if not dst_root.exists() or not dst_root.is_dir():
-        raise NotADirectoryError(f"Basepath does not exist or is not a directory: {dst_root}")
+        raise NotADirectoryError(
+            f"Storage destination does not exist or is not a directory: {dst_root}"
+        )
     if src_root == dst_root:
-        raise ValueError(f"Local output and basepath are identical: {src_root}")
+        raise ValueError(f"Local output and storage destination are identical: {src_root}")
 
     excluded: dict[str, str] = {
         f"{basename}.xml": "input metadata already belongs in basepath",
@@ -231,6 +286,7 @@ def _move_local_output_to_basepath(
 
     return {
         "basepath": str(dst_root),
+        "storage_dir": str(dst_root),
         "local_output_dir": str(src_root),
         "moved": moved,
         "skipped": skipped,
@@ -239,6 +295,18 @@ def _move_local_output_to_basepath(
         "clean_after_move": clean_after_move,
         "cleaned": cleaned,
     }
+
+
+def _move_local_output_to_basepath(
+    settings: PipelineGuiSettings, *, move_dat: bool, overwrite: bool, clean_after_move: bool
+) -> dict[str, Any]:
+    """Backward-compatible wrapper for the former fixed-basepath operation."""
+    return _move_local_output_to_storage(
+        settings,
+        move_dat=move_dat,
+        overwrite=overwrite,
+        clean_after_move=clean_after_move,
+    )
 
 
 class NoWheelComboBox(QComboBox):
@@ -256,16 +324,28 @@ class NoWheelDoubleSpinBox(QDoubleSpinBox):
         event.ignore()
 
 
+class HorizontalOnlyScrollArea(QScrollArea):
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        content = self.widget()
+        if content is None:
+            return
+        content.resize(
+            max(content.minimumSizeHint().width(), self.viewport().width()),
+            self.viewport().height(),
+        )
+
+
 class ChanMapCanvas(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setMinimumSize(920, 420)
+        self.setMinimumSize(300, 240)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.figure = Figure(figsize=(10.0, 4.8), facecolor="#2f2f2f")
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumSize(900, 340)
+        self.canvas.setMinimumSize(280, 180)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.summary = QLabel("No chanMap loaded")
         self.summary.setWordWrap(True)
@@ -1797,10 +1877,21 @@ class MainWindow(QMainWindow):
         self._process_error: dict[str, Any] | None = None
         self._process_tail = ""
         self._process_stop_escalated = False
+        self._move_storage_override: Path | None = None
+        self._move_source_snapshot: tuple[Path, str] | None = None
+        self._active_run_dir: Path | None = None
+        self._active_run_session_dir: Path | None = None
+        self._slurm_capabilities: SlurmCapabilities | None = None
+        self._persistent_log_offsets: dict[Path, int] = {}
+        self._persistent_log_announced: set[Path] = set()
+        self._last_persistent_status_signature = ""
+        self._persistent_monitor_ticks = 0
         self._phy_process: QProcess | None = None
+        self._phy_session_claim: tuple[Path, str] | None = None
         self._phy_working_dir: Path | None = None
         self._phy_last_counts: dict[str, int] | None = None
         self._cell_explorer_process: QProcess | None = None
+        self._cell_explorer_session_claims: list[tuple[Path, str]] = []
         self._cell_explorer_working_dir: Path | None = None
         self._phy_status_timer = QTimer(self)
         self._phy_status_timer.setInterval(30000)
@@ -1829,15 +1920,21 @@ class MainWindow(QMainWindow):
         self._behavior_outlier_canvases: dict[str, tuple[BehaviorTrackCanvas, np.ndarray]] = {}
         self._reported_behavior_warnings: set[str] = set()
         self._behavior_outlier_processed_preview = False
+        self._environment_backend_default_pending = False
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(150)
         self._refresh_timer.timeout.connect(self._refresh_preview)
+        self._run_monitor_timer = QTimer(self)
+        self._run_monitor_timer.setInterval(2000)
+        self._run_monitor_timer.timeout.connect(self._refresh_persistent_run_monitor)
         self._apply_dark_theme()
         self._build_ui()
         self._set_running(False)
-        self._apply_settings(_load_default_settings())
+        self._apply_config_settings(_load_default_settings(), DEFAULT_CONFIG_PATH)
         self._refresh_preview()
+        self._run_monitor_timer.start()
+        QTimer.singleShot(0, self._refresh_slurm_capabilities)
 
     def _apply_dark_theme(self) -> None:
         check_icon = (Path(__file__).resolve().parent / "assets" / "check-orange.svg").as_posix()
@@ -1982,6 +2079,27 @@ class MainWindow(QMainWindow):
                 background: #252525;
                 border: 0;
             }
+            QTableView, QTableWidget, QTreeView {
+                background: #2f2f2f;
+                color: #e5e5e5;
+                alternate-background-color: #292929;
+                selection-background-color: #555555;
+                selection-color: #ffffff;
+                gridline-color: #505050;
+                border: 1px solid #505050;
+            }
+            QHeaderView::section {
+                background: #3a3a3a;
+                color: #f0f0f0;
+                border: 0;
+                border-right: 1px solid #555555;
+                border-bottom: 1px solid #555555;
+                padding: 4px 6px;
+            }
+            QTableCornerButton::section {
+                background: #3a3a3a;
+                border: 1px solid #555555;
+            }
             QFrame#miniPanel {
                 background: #2f2f2f;
                 border: 0;
@@ -2071,7 +2189,13 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_settings_tabs())
-        splitter.addWidget(self._build_center_panel())
+        self.center_scroll_area = HorizontalOnlyScrollArea()
+        self.center_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.center_scroll_area.setWidget(self._build_center_panel())
+        self.center_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        splitter.addWidget(self.center_scroll_area)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([520, 780])
@@ -2080,6 +2204,19 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_run_bar())
 
         self.setCentralWidget(root)
+
+    def _fit_to_available_screen(self) -> None:
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        margin = 16
+        target_width = min(self.width(), max(1, available.width() - margin))
+        target_height = min(self.height(), max(1, available.height() - margin))
+        self.resize(target_width, target_height)
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        self.move(frame.topLeft())
 
     def _build_top_bar(self) -> QWidget:
         panel = QWidget()
@@ -2134,15 +2271,161 @@ class MainWindow(QMainWindow):
         self.multi_day_name.textChanged.connect(self._schedule_refresh)
         self.basepath.textChanged.connect(self._reset_behavior_discovery_state)
         self.local_root.textChanged.connect(self._reset_behavior_discovery_state)
+        self.basepath.textEdited.connect(self._clear_move_storage_override)
+        self.multi_day_name.textEdited.connect(self._clear_move_storage_override)
         return panel
 
     def _build_settings_tabs(self) -> QWidget:
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_ephys_tab(), "Ephys")
         self.tabs.addTab(self._scroll_area(self._build_behavior_tab()), "Behavior")
-        self.tabs.setMinimumWidth(500)
+        self.tabs.setMinimumWidth(340)
         self.tabs.currentChanged.connect(lambda _index: self._schedule_refresh())
         return self.tabs
+
+    def _build_execution_tab(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("settingsPage")
+        layout = QVBoxLayout(panel)
+        layout.setSpacing(8)
+
+        run_box = QGroupBox("Run scope")
+        run_layout = QGridLayout(run_box)
+        self.run_all = QPushButton("Run all")
+        self.run_pre = QPushButton("Preprocess only")
+        self.run_post = QPushButton("Postprocess only")
+        self.run_all.clicked.connect(lambda: self._start_run("all"))
+        self.run_pre.clicked.connect(lambda: self._start_run("preprocess"))
+        self.run_post.clicked.connect(lambda: self._start_run("postprocess"))
+        run_layout.addWidget(self.run_all, 0, 0)
+        run_layout.addWidget(self.run_pre, 0, 1)
+        run_layout.addWidget(self.run_post, 0, 2)
+        for column in range(3):
+            run_layout.setColumnStretch(column, 1)
+
+        backend_box = QGroupBox("Execution backend")
+        backend_form = self._form_layout(backend_box)
+        self.execution_backend = NoWheelComboBox()
+        self.execution_backend.addItem("Auto", RequestedBackend.AUTO.value)
+        self.execution_backend.addItem("Local", RequestedBackend.LOCAL.value)
+        self.execution_backend.addItem("Slurm", RequestedBackend.SLURM.value)
+        self.execution_backend.setToolTip(
+            "Slurm submits jobs to the server scheduler. Auto uses Slurm when "
+            "available and otherwise runs locally."
+        )
+        self.execution_resolved = QLabel("Not resolved")
+        self.execution_resolved.setWordWrap(True)
+        self.execution_resolved.setMinimumHeight(38)
+        backend_form.addRow("Run on", self.execution_backend)
+        backend_form.addRow("Availability", self.execution_resolved)
+
+        resources_title = QLabel("Stage resources")
+        resources_title_font = resources_title.font()
+        resources_title_font.setBold(True)
+        resources_title.setFont(resources_title_font)
+        resources_hint = self._hint_label(
+            "CPU cores and Memory are Slurm reservations. Sorting requests one "
+            "GPU; Slurm chooses its device ID when the job starts."
+        )
+        self._resource_widgets: dict[str, dict[str, QWidget]] = {}
+        resource_groups = [
+            self._build_stage_resource_group(StageName.PREPROCESS, gpu_count=0),
+            self._build_stage_resource_group(StageName.SORTING, gpu_count=1),
+            self._build_stage_resource_group(StageName.POSTPROCESS, gpu_count=0),
+        ]
+
+        monitor_box = QGroupBox("Run progress")
+        monitor_layout = QVBoxLayout(monitor_box)
+        self.execution_run_status = QLabel("No active Run")
+        self.execution_run_status.setWordWrap(True)
+        stage_grid = QGridLayout()
+        stage_grid.setContentsMargins(0, 0, 0, 0)
+        stage_grid.setHorizontalSpacing(12)
+        stage_grid.addWidget(QLabel("Stage"), 0, 0)
+        stage_grid.addWidget(QLabel("Status"), 0, 1)
+        stage_grid.addWidget(QLabel("Job"), 0, 2)
+        self.execution_stage_status_labels: dict[str, QLabel] = {}
+        self.execution_stage_job_labels: dict[str, QLabel] = {}
+        for row, stage in enumerate(StageName, start=1):
+            stage_name = QLabel(stage.value.capitalize())
+            stage_name_font = stage_name.font()
+            stage_name_font.setBold(True)
+            stage_name.setFont(stage_name_font)
+            status = QLabel("Not started")
+            job = QLabel("—")
+            job.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.execution_stage_status_labels[stage.value] = status
+            self.execution_stage_job_labels[stage.value] = job
+            stage_grid.addWidget(stage_name, row, 0)
+            stage_grid.addWidget(status, row, 1)
+            stage_grid.addWidget(job, row, 2)
+        stage_grid.setColumnStretch(1, 1)
+        stage_grid.setColumnStretch(2, 1)
+        progress_hint = self._hint_label(
+            "Detailed progress and warnings are shown in the main Log. "
+            "Slurm status is refreshed automatically."
+        )
+        monitor_layout.addWidget(self.execution_run_status)
+        monitor_layout.addLayout(stage_grid)
+        monitor_layout.addWidget(progress_hint)
+
+        layout.addWidget(run_box)
+        layout.addWidget(backend_box)
+        layout.addWidget(resources_title)
+        layout.addWidget(resources_hint)
+        for resource_group in resource_groups:
+            layout.addWidget(resource_group)
+        layout.addWidget(monitor_box)
+        layout.addStretch(1)
+        return panel
+
+    def _build_stage_resource_group(self, stage: StageName, *, gpu_count: int) -> QGroupBox:
+        box = QGroupBox(stage.value.capitalize())
+        grid = QGridLayout(box)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        cpus = self._spin(1, 4096, default_worker_count())
+        memory_gib = self._spin(1, 65536, 512 if stage == StageName.SORTING else 256)
+        cpus.setToolTip(
+            "Exact CPU cores requested from Slurm for this Stage. "
+            "This also limits the Stage worker count."
+        )
+        memory_gib.setToolTip(
+            "Host memory requested from Slurm in GiB. This is not GPU memory."
+        )
+        gpu = QLabel("1 (auto)" if gpu_count else "0")
+        gpu.setToolTip(
+            "Sorting requests one GPU. Slurm selects the device ID from the GPUs "
+            "available when the job starts."
+            if gpu_count
+            else "This Stage does not request a GPU."
+        )
+        stage_label = stage.value.capitalize()
+        cpu_label = QLabel("CPU cores")
+        cpu_label.setBuddy(cpus)
+        cpus.setAccessibleName(f"{stage_label} CPU cores")
+        memory_label = QLabel("Memory (GiB)")
+        memory_label.setBuddy(memory_gib)
+        memory_gib.setAccessibleName(f"{stage_label} host memory in GiB")
+        gpu.setAccessibleName(f"{stage_label} GPU request")
+        widgets: dict[str, QWidget] = {
+            "cpus": cpus,
+            "memory_gib": memory_gib,
+            "gpu_count": gpu,
+        }
+        self._resource_widgets[stage.value] = widgets
+        grid.addWidget(cpu_label, 0, 0)
+        grid.addWidget(cpus, 0, 1)
+        grid.addWidget(memory_label, 0, 2)
+        grid.addWidget(memory_gib, 0, 3)
+        grid.addWidget(QLabel("GPUs"), 0, 4)
+        grid.addWidget(gpu, 0, 5)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        grid.setColumnStretch(5, 1)
+        for widget in widgets.values():
+            self._connect_refresh(widget)
+        return box
 
     def _build_ephys_tab(self) -> QWidget:
         panel = QWidget()
@@ -2157,19 +2440,14 @@ class MainWindow(QMainWindow):
         self.ephys_tabs = QTabWidget()
         self.ephys_tabs.addTab(self._scroll_area(self._build_preprocess_tab()), "Preprocess")
         self.ephys_tabs.addTab(self._scroll_area(self._build_postprocess_tab()), "Postprocess")
+        self.execution_scroll_area = self._scroll_area(self._build_execution_tab())
+        self.execution_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._ephys_run_tab_index = self.ephys_tabs.addTab(
+            self.execution_scroll_area, "Run"
+        )
         self.ephys_tabs.currentChanged.connect(lambda _index: self._schedule_refresh())
-
-        run_box = QGroupBox("Ephys run")
-        run_layout = QHBoxLayout(run_box)
-        self.run_all = QPushButton("Run all")
-        self.run_pre = QPushButton("Run preprocess")
-        self.run_post = QPushButton("Run postprocess")
-        self.run_all.clicked.connect(lambda: self._start_run("all"))
-        self.run_pre.clicked.connect(lambda: self._start_run("preprocess"))
-        self.run_post.clicked.connect(lambda: self._start_run("postprocess"))
-        run_layout.addWidget(self.run_all)
-        run_layout.addWidget(self.run_pre)
-        run_layout.addWidget(self.run_post)
 
         manual_box = QGroupBox("Manual Curation")
         manual_layout = QGridLayout(manual_box)
@@ -2196,7 +2474,6 @@ class MainWindow(QMainWindow):
         manual_layout.setColumnStretch(1, 1)
 
         layout.addWidget(self.ephys_tabs, 1)
-        layout.addWidget(run_box)
         layout.addWidget(manual_box)
         return panel
 
@@ -2283,6 +2560,9 @@ class MainWindow(QMainWindow):
         sig.addRow("bandpass max Hz", self.bandpass_max)
         sig.addRow("common median reference", self.reference)
         sig.addRow("CMR radius min/max (um)", self.local_radius)
+        self.preprocess_worker_count.setVisible(False)
+        if sig.labelForField(self.preprocess_worker_count) is not None:
+            sig.labelForField(self.preprocess_worker_count).setVisible(False)
 
         state = QGroupBox("LFP and state scoring")
         st = self._form_layout(state)
@@ -2355,7 +2635,7 @@ class MainWindow(QMainWindow):
         high_form.addRow("High amp ms after", self.highamp_after)
         high_form.addRow("High amp interpolation mode", self.highamp_mode)
 
-        sorter = QGroupBox("Sorter and runtime")
+        sorter = QGroupBox("Sorter")
         sf = self._form_layout(sorter)
         self.run_sorter = QCheckBox("Run sorter")
         self.sorter = NoWheelComboBox()
@@ -2386,6 +2666,12 @@ class MainWindow(QMainWindow):
         sf.addRow("Sorter config", sorter_config_row)
         sf.addRow("MATLAB path", self.matlab_path)
         sf.addRow("Workers for sorter", self.sorter_worker_count)
+        self.sorter_worker_count.setVisible(False)
+        if sf.labelForField(self.sorter_worker_count) is not None:
+            sf.labelForField(self.sorter_worker_count).setVisible(False)
+        self.matlab_path.setVisible(False)
+        if sf.labelForField(self.matlab_path) is not None:
+            sf.labelForField(self.matlab_path).setVisible(False)
 
         for widget in [
             self.pre_overwrite,
@@ -2598,6 +2884,9 @@ class MainWindow(QMainWindow):
         form.addRow("Split waveform n chans", self.split_wf_n_chans)
         form.addRow("Split amp MAD scale", self.split_amp_mad_scale)
         form.addRow("Workers", self.post_worker_count)
+        self.post_worker_count.setVisible(False)
+        if form.labelForField(self.post_worker_count) is not None:
+            form.labelForField(self.post_worker_count).setVisible(False)
         form.addRow(self.skip_pc_metrics)
 
         noise = QGroupBox("Noise labeling thresholds")
@@ -2646,6 +2935,7 @@ class MainWindow(QMainWindow):
 
     def _build_center_panel(self) -> QWidget:
         panel = QWidget()
+        panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Ignored)
         layout = QHBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
@@ -2744,6 +3034,10 @@ class MainWindow(QMainWindow):
         behavior_layout.addWidget(self.behavior_mode_tabs, 1)
 
         self.monitor_stack = QStackedWidget()
+        self.monitor_stack.setMinimumHeight(200)
+        self.monitor_stack.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored
+        )
         self.monitor_stack.addWidget(chanmap_panel)
         self.monitor_stack.addWidget(behavior_panel)
 
@@ -2757,6 +3051,7 @@ class MainWindow(QMainWindow):
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(160)
+        self.log.document().setMaximumBlockCount(5000)
         log_layout.addWidget(log_head)
         log_layout.addWidget(self.log, 1)
 
@@ -2782,26 +3077,38 @@ class MainWindow(QMainWindow):
 
     def _build_run_bar(self) -> QWidget:
         panel = QWidget()
-        layout = QHBoxLayout(panel)
+        layout = QGridLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         self.move_dat_to_basepath = QCheckBox("Move basename.dat")
         self.move_overwrite = QCheckBox("Overwrite moved files")
         self.move_clean_local = QCheckBox("Clean local after move")
         self.move_clean_local.setChecked(True)
-        self.move_outputs = QPushButton("Move outputs to basepath")
+        self.move_storage_dir = QLineEdit()
+        self.move_storage_dir.setReadOnly(True)
+        self.move_storage_dir.setPlaceholderText("Default: Basepath")
+        self.browse_move_storage = QPushButton("Browse save dir")
+        self.move_outputs = QPushButton("Move outputs to storage")
         self.force_stop = QPushButton("Force stop")
         self.force_stop.setObjectName("dangerButton")
         self.clear_log = QPushButton("Clear log")
-        self.move_outputs.clicked.connect(self._move_outputs_to_basepath)
+        self.browse_move_storage.clicked.connect(self._browse_move_storage_dir)
+        self.move_outputs.clicked.connect(self._move_outputs_to_storage)
+        self.basepath.textChanged.connect(self._update_move_storage_destination)
+        self.multi_day_name.textChanged.connect(self._update_move_storage_destination)
         self.force_stop.clicked.connect(self._force_stop_process)
         self.clear_log.clicked.connect(self.log.clear)
-        layout.addStretch(1)
-        layout.addWidget(self.move_dat_to_basepath)
-        layout.addWidget(self.move_overwrite)
-        layout.addWidget(self.move_clean_local)
-        layout.addWidget(self.move_outputs)
-        layout.addWidget(self.force_stop)
-        layout.addWidget(self.clear_log)
+        layout.addWidget(self.move_dat_to_basepath, 0, 0)
+        layout.addWidget(self.move_overwrite, 0, 1)
+        layout.addWidget(self.move_clean_local, 0, 2)
+        layout.addWidget(QLabel("Storage destination"), 1, 0)
+        layout.addWidget(self.move_storage_dir, 1, 1)
+        layout.addWidget(self.browse_move_storage, 1, 2)
+        layout.addWidget(self.move_outputs, 1, 3)
+        layout.addWidget(self.force_stop, 2, 2)
+        layout.addWidget(self.clear_log, 2, 3)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+        self._update_move_storage_destination()
         return panel
 
     def _double_spin(self, minimum: float, maximum: float, value: float) -> QDoubleSpinBox:
@@ -3242,6 +3549,7 @@ class MainWindow(QMainWindow):
     def _browse_basepath(self) -> None:
         path = self._select_directory("Select basepath", self.basepath.text() or str(Path.cwd()))
         if path:
+            self._clear_move_storage_override()
             self.basepath.setText(path)
             self._auto_load_existing_xml()
             self._auto_load_existing_chanmap()
@@ -3285,6 +3593,8 @@ class MainWindow(QMainWindow):
             cleaned.append(key)
         previous = list(self._multi_day_session_paths)
         self._multi_day_session_paths = cleaned
+        if cleaned != previous and hasattr(self, "move_storage_dir"):
+            self._clear_move_storage_override()
         if selected_subepoch_paths is not None:
             selected: list[str] = []
             selected_seen: set[str] = set()
@@ -3316,6 +3626,8 @@ class MainWindow(QMainWindow):
                 f"{len(cleaned)} sessions: {Path(cleaned[0]).name} -> {Path(cleaned[-1]).name}; "
                 f"{selection_label}"
             )
+        if hasattr(self, "move_storage_dir"):
+            self._update_move_storage_destination()
 
     def _set_cell_explorer_sorting_folders(self, paths: list[str]) -> None:
         cleaned: list[str] = []
@@ -3561,6 +3873,7 @@ class MainWindow(QMainWindow):
         )
         if not paths:
             return
+        self._clear_move_storage_override()
         cleaned = [str(Path(path).expanduser()) for path in paths]
         self._set_multi_day_session_paths(cleaned, selected_subepoch_paths=[])
         if not self.multi_day_name.text().strip() and len(cleaned) >= 2:
@@ -3582,6 +3895,566 @@ class MainWindow(QMainWindow):
             self.local_root.setText(path)
             self._auto_load_existing_chanmap()
             self._schedule_refresh()
+
+    def _apply_environment_backend_default(
+        self, capabilities: SlurmCapabilities
+    ) -> None:
+        if not self._environment_backend_default_pending:
+            return
+        self._environment_backend_default_pending = False
+        requested = (
+            RequestedBackend.SLURM
+            if _has_slurm_server_commands(
+                capabilities, require_sacct=True
+            )
+            else RequestedBackend.AUTO
+        )
+        index = self.execution_backend.findData(requested.value)
+        self.execution_backend.setCurrentIndex(index if index >= 0 else 0)
+
+    def _refresh_slurm_capabilities(self) -> None:
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self._slurm_capabilities = detect_slurm_capabilities(timeout=3.0)
+        finally:
+            QApplication.restoreOverrideCursor()
+        capabilities = self._slurm_capabilities
+        assert capabilities is not None
+        self._apply_environment_backend_default(capabilities)
+        requested = RequestedBackend(
+            str(self.execution_backend.currentData() or RequestedBackend.AUTO.value)
+        )
+        require_sacct = True
+        if requested == RequestedBackend.LOCAL:
+            detail = "Jobs will run on this computer."
+        elif capabilities.usable(require_sacct=require_sacct):
+            detail = "Slurm is available."
+        elif requested == RequestedBackend.AUTO:
+            detail = "Slurm is unavailable; Auto will run locally."
+        else:
+            detail = "Slurm is unavailable; submission will stop with an error."
+        errors = "; ".join(capabilities.errors)
+        self.execution_resolved.setText(detail)
+        self.execution_resolved.setToolTip(errors)
+
+    def _browse_persistent_run(self) -> None:
+        start = self.local_root.text().strip() or str(Path.cwd())
+        path = self._select_directory("Reopen persistent Run directory", start)
+        if not path:
+            return
+        run_dir = Path(path).expanduser().resolve()
+        if not (run_dir / "run.json").exists():
+            QMessageBox.critical(self, "Invalid Run", f"run.json was not found in {run_dir}")
+            return
+        self._set_active_run(run_dir)
+        self._request_run_reconcile()
+
+    @staticmethod
+    def _session_dir_for_run(run_dir: Path) -> Path | None:
+        try:
+            run = read_json(Path(run_dir) / "run.json")
+            claim_text = str(run.get("session_claim_path") or "").strip()
+            if claim_text:
+                return Path(claim_text).expanduser().resolve().parent
+            session_text = str(run.get("session_output_dir") or "").strip()
+            return Path(session_text).expanduser().resolve() if session_text else None
+        except Exception:
+            return None
+
+    def _current_persistent_session_dir(self) -> Path | None:
+        try:
+            settings = self._collect_settings()
+            return (
+                Path(settings.local_output_dir).resolve()
+                if settings.local_output_dir is not None
+                else None
+            )
+        except Exception:
+            return None
+
+    def _set_active_run(
+        self, run_dir: Path, *, session_dir: Path | None = None
+    ) -> None:
+        self._active_run_dir = Path(run_dir).resolve()
+        self._active_run_session_dir = (
+            Path(session_dir).resolve()
+            if session_dir is not None
+            else self._session_dir_for_run(self._active_run_dir)
+        )
+        self._persistent_monitor_ticks = 0
+        self._persistent_log_offsets.clear()
+        self._persistent_log_announced.clear()
+        self._last_persistent_status_signature = ""
+        self._run_monitor_timer.start()
+        self._refresh_persistent_run_monitor()
+
+    def _launch_persistent_controller(
+        self, arguments: list[str], *, report_errors: bool = True
+    ) -> bool:
+        if self._active_run_dir is None:
+            if report_errors:
+                QMessageBox.information(self, "Persistent Run", "No persistent Run is selected.")
+            return False
+        command_args = [
+            "-m",
+            "src.execution.controller",
+            "--run-dir",
+            str(self._active_run_dir),
+            *arguments,
+        ]
+        result = QProcess.startDetached(sys.executable, command_args, str(REPO_ROOT))
+        started = bool(result[0]) if isinstance(result, tuple) else bool(result)
+        if not started and report_errors:
+            QMessageBox.critical(
+                self,
+                "Persistent Run",
+                "Failed to start the detached Run controller.",
+            )
+        return started
+
+    def _request_run_reconcile(self) -> None:
+        if self._launch_persistent_controller(["--reconcile"]):
+            QTimer.singleShot(750, self._refresh_persistent_run_monitor)
+
+    def _request_run_resume(self) -> None:
+        if self._launch_persistent_controller([]):
+            self._append_log(f"Resume/submit requested for Run: {self._active_run_dir}\n")
+            QTimer.singleShot(750, self._refresh_persistent_run_monitor)
+
+    def _request_persistent_run_cancel(self) -> None:
+        if self._active_run_dir is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Force stop",
+            "Stop the current Run and cancel all active Local/Slurm jobs? "
+            "Logs and partial outputs will be kept.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if self._launch_persistent_controller(["--cancel"]):
+            self.force_stop.setEnabled(False)
+            self._append_log(f"Force stop requested for Run: {self._active_run_dir}\n")
+            QTimer.singleShot(750, self._refresh_persistent_run_monitor)
+
+    def _resource_settings_from_widgets(self, stage: StageName) -> StageResourceGuiSettings:
+        widgets = self._resource_widgets[stage.value]
+        return StageResourceGuiSettings(
+            cpus=int(widgets["cpus"].value()),  # type: ignore[attr-defined]
+            memory_mb=int(widgets["memory_gib"].value()) * 1024,  # type: ignore[attr-defined]
+            walltime_minutes=None,
+            gpu_count=1 if stage == StageName.SORTING else 0,
+        )
+
+    def _request_persistent_stage_cancel(self) -> None:
+        if self._active_run_dir is None:
+            return
+        try:
+            state = RunStore(self._active_run_dir).derive_state()
+        except Exception as exc:
+            QMessageBox.critical(self, "Cancel Stage failed", str(exc))
+            return
+        candidates = [
+            stage
+            for stage in StageName
+            if state["stages"][stage.value]["enabled"]
+            and state["stages"][stage.value]["status"]
+            not in {
+                StageStatus.COMPLETED.value,
+                StageStatus.FAILED.value,
+                StageStatus.CANCELLED.value,
+                StageStatus.SUPERSEDED.value,
+            }
+        ]
+        if not candidates:
+            QMessageBox.information(self, "Cancel Stage", "No active Stage can be cancelled.")
+            return
+        selected, accepted = QInputDialog.getItem(
+            self,
+            "Cancel Stage and downstream",
+            "Stage",
+            [stage.value for stage in candidates],
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Cancel Stage",
+            f"Cancel {selected} and all downstream Attempts? Logs and outputs will be kept.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if self._launch_persistent_controller(["--cancel-stage", str(selected)]):
+            self._append_log(f"Cancellation requested from Stage {selected}.\n")
+            QTimer.singleShot(750, self._refresh_persistent_run_monitor)
+
+    def _request_persistent_stage_retry(self) -> None:
+        if self._active_run_dir is None:
+            return
+        try:
+            state_path = self._active_run_dir / "state.json"
+            state = read_json(state_path) if state_path.exists() else RunStore(self._active_run_dir).derive_state()
+        except Exception as exc:
+            QMessageBox.critical(self, "Retry failed", str(exc))
+            return
+        retryable = {
+            StageStatus.FAILED.value,
+            StageStatus.CANCELLED.value,
+            StageStatus.BLOCKED.value,
+        }
+        candidates = [
+            stage
+            for stage in StageName
+            if state["stages"][stage.value]["enabled"]
+            and state["stages"][stage.value]["status"] in retryable
+        ]
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "Retry",
+                "No failed, cancelled, or blocked Stage is retryable. Lost/unknown Slurm "
+                "Attempts require scheduler investigation to avoid duplicate execution.",
+            )
+            return
+        labels = [stage.value for stage in candidates]
+        selected, accepted = QInputDialog.getItem(
+            self,
+            "Retry Stage",
+            "Stage",
+            labels,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        stage = StageName(selected)
+        resource = self._resource_settings_from_widgets(stage).to_resource_spec()
+        arguments = [
+            "--retry",
+            stage.value,
+            "--cpus",
+            str(resource.cpus),
+            "--memory-mb",
+            str(resource.memory_mb),
+        ]
+        if resource.walltime_minutes is None:
+            arguments.append("--unlimited-walltime")
+        else:
+            arguments.extend(["--walltime-minutes", str(resource.walltime_minutes)])
+        if self._launch_persistent_controller(arguments):
+            walltime_text = (
+                "partition default"
+                if resource.walltime_minutes is None
+                else f"{resource.walltime_minutes} min"
+            )
+            self._append_log(
+                f"Retry requested for {stage.value} with CPU={resource.cpus}, "
+                f"RAM={resource.memory_mb} MiB, walltime={walltime_text}.\n"
+            )
+            QTimer.singleShot(750, self._refresh_persistent_run_monitor)
+
+    def _discover_active_persistent_run(self) -> Path | None:
+        try:
+            settings = self._collect_settings()
+            session_dir = settings.local_output_dir
+            if session_dir is None:
+                return None
+            claim_path = Path(session_dir) / ".pipeline-active-run.json"
+            if not claim_path.exists():
+                return None
+            claim = read_json(claim_path)
+            if claim.get("kind", "run") != "run":
+                return None
+            run_dir = Path(str(claim.get("run_dir") or "")).expanduser().resolve()
+            return run_dir if (run_dir / "run.json").exists() else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _selected_attempt_view(stage_view: dict[str, Any]) -> dict[str, Any] | None:
+        attempts = stage_view.get("attempts") or []
+        selected = stage_view.get("selected_attempt")
+        for attempt in attempts:
+            if attempt.get("attempt") == selected:
+                return attempt
+        return attempts[-1] if attempts else None
+
+    @staticmethod
+    def _human_stage_status(stage_view: dict[str, Any]) -> str:
+        if not stage_view.get("enabled", False):
+            return "Not requested"
+        attempt = MainWindow._selected_attempt_view(stage_view) or {}
+        status = str(stage_view.get("status") or "unknown").lower()
+        if attempt.get("cancel_requested") and status in {
+            StageStatus.PENDING.value,
+            StageStatus.SUBMITTED.value,
+            StageStatus.RUNNING.value,
+        }:
+            return "Stopping"
+        observation = ((attempt.get("latest_observation") or {}).get("status") or {})
+        reason = str(observation.get("reason") or "")
+        if status == StageStatus.SUBMITTED.value and "dependency" in reason.lower():
+            return "Waiting for previous Stage"
+        labels = {
+            StageStatus.PENDING.value: "Not started",
+            StageStatus.SUBMITTED.value: "Queued",
+            StageStatus.RUNNING.value: "Running",
+            StageStatus.COMPLETED.value: "Completed",
+            StageStatus.FAILED.value: "Failed",
+            StageStatus.CANCELLED.value: "Cancelled",
+            StageStatus.BLOCKED.value: "Blocked",
+            StageStatus.LOST.value: "Status unknown",
+            StageStatus.SUPERSEDED.value: "Replaced",
+        }
+        return labels.get(status, status.capitalize() or "Unknown")
+
+    def _persistent_progress_log_paths(self, state: dict[str, Any]) -> list[Path]:
+        if self._active_run_dir is None:
+            return []
+        candidates: list[Path] = []
+        stages = state.get("stages") or {}
+        for stage in StageName:
+            stage_view = stages.get(stage.value) or {}
+            attempt = self._selected_attempt_view(stage_view)
+            if attempt is None:
+                continue
+            attempt_number = int(attempt.get("attempt") or 0)
+            if attempt_number <= 0:
+                continue
+            attempt_dir = (
+                self._active_run_dir
+                / "stages"
+                / stage.value
+                / f"attempt-{attempt_number:03d}"
+            )
+            candidates.extend([attempt_dir / "stdout.log", attempt_dir / "stderr.log"])
+
+        preprocess_view = stages.get(StageName.PREPROCESS.value) or {}
+        preprocess_attempt = self._selected_attempt_view(preprocess_view) or {}
+        preprocess_result = preprocess_attempt.get("result") or {}
+        preprocess_outputs = preprocess_result.get("outputs") or {}
+        preprocess_data = preprocess_outputs.get("preprocess_result") or {}
+        session_text = str(preprocess_data.get("local_output_dir") or "").strip()
+        if session_text:
+            manifest_path = Path(session_text) / "sorter_partition_manifest.json"
+            if manifest_path.exists():
+                try:
+                    manifest = read_json(manifest_path)
+                    for partition in manifest.get("partitions") or []:
+                        output_text = str(partition.get("output_folder") or "").strip()
+                        if not output_text:
+                            continue
+                        output = Path(output_text)
+                        candidates.extend(
+                            [
+                                output / "sorter_output" / "kilosort.log",
+                                output / "kilosort.log",
+                            ]
+                        )
+                except (OSError, ValueError, json.JSONDecodeError):
+                    pass
+
+        unique: list[Path] = []
+        seen: set[Path] = set()
+        for path in candidates:
+            resolved = path.expanduser().resolve()
+            if resolved not in seen and resolved.exists():
+                seen.add(resolved)
+                unique.append(resolved)
+        return unique
+
+    def _tail_persistent_progress_logs(self, state: dict[str, Any]) -> None:
+        max_initial_bytes = 128 * 1024
+        for path in self._persistent_progress_log_paths(state):
+            try:
+                size = path.stat().st_size
+                offset = self._persistent_log_offsets.get(path)
+                if offset is None:
+                    offset = max(0, size - max_initial_bytes)
+                elif offset > size:
+                    offset = 0
+                with path.open("rb") as handle:
+                    handle.seek(offset)
+                    payload = handle.read()
+                    self._persistent_log_offsets[path] = handle.tell()
+            except OSError:
+                continue
+            if not payload:
+                continue
+            if path not in self._persistent_log_announced:
+                self._persistent_log_announced.add(path)
+                try:
+                    label = str(path.relative_to(self._active_run_dir))
+                except ValueError:
+                    label = path.name
+                self._queue_log(f"\n--- {label} ---\n")
+            text = payload.decode(errors="replace").replace("\b", "").replace("\r", "")
+            self._queue_log(text)
+
+    @staticmethod
+    def _persistent_state_has_active_work(state: dict[str, Any]) -> bool:
+        active = {
+            StageStatus.PENDING.value,
+            StageStatus.SUBMITTED.value,
+            StageStatus.RUNNING.value,
+        }
+        for view in (state.get("stages") or {}).values():
+            if bool(view.get("enabled")) and str(view.get("status")) in active:
+                return True
+            for attempt in view.get("attempts") or []:
+                if not attempt.get("jobs"):
+                    continue
+                # A cancelled Attempt is emitted only after cancel_confirmed.json
+                # exists, so it is safe to treat even an unknown Local observation
+                # as inactive. Superseded Attempts intentionally do not get this
+                # shortcut because an older backend job may still be alive.
+                if str(attempt.get("status") or "") == StageStatus.CANCELLED.value:
+                    continue
+                status = ((attempt.get("latest_observation") or {}).get("status") or {})
+                terminal = bool(status.get("terminal", False))
+                conclusive = terminal and (
+                    status.get("successful") is not None
+                    or str(status.get("state") or "").lower()
+                    in {"cancelled", "canceled"}
+                )
+                if not conclusive:
+                    return True
+        return False
+
+    def _refresh_persistent_run_monitor(self) -> None:
+        current_session = self._current_persistent_session_dir()
+        if (
+            self._active_run_dir is not None
+            and current_session is not None
+            and self._active_run_session_dir is not None
+            and current_session != self._active_run_session_dir
+        ):
+            discovered = self._discover_active_persistent_run()
+            if discovered is not None:
+                self._set_active_run(discovered, session_dir=current_session)
+                self._append_log(
+                    f"\n=== Reconnected to active Run: {discovered.name} ===\n"
+                )
+                return
+            self._active_run_dir = None
+            self._active_run_session_dir = None
+            self._persistent_log_offsets.clear()
+            self._persistent_log_announced.clear()
+            self._last_persistent_status_signature = ""
+            self.execution_run_status.setText("No active Run for this session")
+            self.execution_run_status.setToolTip("")
+            for stage in StageName:
+                self.execution_stage_status_labels[stage.value].setText("—")
+                self.execution_stage_job_labels[stage.value].setText("—")
+            self.force_stop.setEnabled(False)
+            legacy_running = (
+                self._process is not None
+                and self._process.state() != QProcess.ProcessState.NotRunning
+            )
+            self.move_outputs.setEnabled(not legacy_running)
+            self.browse_move_storage.setEnabled(not legacy_running)
+            return
+        if self._active_run_dir is None:
+            discovered = self._discover_active_persistent_run()
+            if discovered is None:
+                self.execution_run_status.setText("No active Run")
+                legacy_running = (
+                    self._process is not None
+                    and self._process.state() != QProcess.ProcessState.NotRunning
+                )
+                self.move_outputs.setEnabled(not legacy_running)
+                self.browse_move_storage.setEnabled(not legacy_running)
+                return
+            self._set_active_run(discovered, session_dir=current_session)
+            self._append_log(f"\n=== Reconnected to active Run: {discovered.name} ===\n")
+            return
+        try:
+            state_path = self._active_run_dir / "state.json"
+            state = (
+                read_json(state_path)
+                if state_path.exists()
+                else RunStore(self._active_run_dir).derive_state()
+            )
+        except Exception as exc:
+            self.execution_run_status.setText(f"Run state error: {exc}")
+            return
+
+        run_status = str(state.get("status") or "unknown")
+        backend = str(state.get("resolved_backend") or "unknown")
+        run_id = str(state.get("run_id") or self._active_run_dir.name)
+        run_status_label = {
+            "pending": "Not started",
+            "submitted": "Queued",
+            "running": "Running",
+            "completed": "Completed",
+            "failed": "Failed",
+            "cancelled": "Cancelled",
+            "lost": "Status unknown",
+        }.get(run_status, run_status.capitalize())
+        self.execution_run_status.setText(
+            f"{run_status_label} on {backend.capitalize()} · {run_id}"
+        )
+        self.execution_run_status.setToolTip(str(self._active_run_dir))
+        self._persistent_monitor_ticks += 1
+        needs_backend_reconcile = any(
+            attempt.get("jobs")
+            and not (
+                bool(
+                    ((attempt.get("latest_observation") or {}).get("status") or {}).get(
+                        "terminal", False
+                    )
+                )
+                and (
+                    ((attempt.get("latest_observation") or {}).get("status") or {}).get(
+                        "successful"
+                    )
+                    is not None
+                    or str(
+                        ((attempt.get("latest_observation") or {}).get("status") or {}).get(
+                            "state", ""
+                        )
+                    ).lower()
+                    in {"cancelled", "canceled"}
+                )
+            )
+            for stage_view in state.get("stages", {}).values()
+            for attempt in stage_view.get("attempts", [])
+        )
+        if (
+            backend == BackendName.SLURM.value
+            and needs_backend_reconcile
+            and self._persistent_monitor_ticks % 8 == 0
+        ):
+            self._launch_persistent_controller(["--reconcile"], report_errors=False)
+
+        status_parts: list[str] = []
+        for stage in StageName:
+            stage_view = (state.get("stages") or {}).get(stage.value) or {}
+            human_status = self._human_stage_status(stage_view)
+            attempt = self._selected_attempt_view(stage_view) or {}
+            jobs = attempt.get("jobs") or []
+            job_ids = ", ".join(str(job.get("job_id") or "") for job in jobs)
+            self.execution_stage_status_labels[stage.value].setText(human_status)
+            self.execution_stage_job_labels[stage.value].setText(job_ids or "—")
+            status_parts.append(f"{stage.value}={human_status}")
+
+        signature = f"{run_status}|{'|'.join(status_parts)}"
+        if signature != self._last_persistent_status_signature:
+            self._last_persistent_status_signature = signature
+            self._append_log(
+                f"[Run progress] {run_status}: " + ", ".join(status_parts) + "\n"
+            )
+        self._tail_persistent_progress_logs(state)
+        legacy_running = (
+            self._process is not None
+            and self._process.state() != QProcess.ProcessState.NotRunning
+        )
+        persistent_active = self._persistent_state_has_active_work(state)
+        self.force_stop.setEnabled(legacy_running or persistent_active)
+        self.move_outputs.setEnabled(not legacy_running and not persistent_active)
+        self.browse_move_storage.setEnabled(not legacy_running and not persistent_active)
 
     def _browse_chanmap(self) -> None:
         path = self._select_open_file(
@@ -4146,7 +5019,8 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            self._apply_settings(PipelineGuiSettings.load(Path(path)))
+            config_path = Path(path)
+            self._apply_config_settings(PipelineGuiSettings.load(config_path), config_path)
             self._append_log(f"Loaded config: {path}\n")
         except Exception as exc:
             QMessageBox.critical(self, "Load config failed", str(exc))
@@ -4182,7 +5056,7 @@ class MainWindow(QMainWindow):
             loaded.postprocess.cell_explorer_sorting_folders = list(
                 current.postprocess.cell_explorer_sorting_folders
             )
-            self._apply_settings(loaded)
+            self._apply_config_settings(loaded, DEFAULT_CONFIG_PATH)
             self._append_log(f"Loaded default config: {DEFAULT_CONFIG_PATH}\n")
         except Exception as exc:
             QMessageBox.critical(self, "Load default config failed", str(exc))
@@ -4295,7 +5169,7 @@ class MainWindow(QMainWindow):
             run_sorter=self.run_sorter.isChecked(),
             sorter=self.sorter.currentText(),
             sorter_partition_mode=str(self.sorter_partition_mode.currentData() or "all"),
-            matlab_path=self.matlab_path.text().strip(),
+            matlab_path="",
             preprocess_worker_count=normalize_worker_count(self.preprocess_worker_count.value()),
             sorter_worker_count=normalize_worker_count(self.sorter_worker_count.value()),
             overwrite=self.pre_overwrite.isChecked(),
@@ -4336,7 +5210,26 @@ class MainWindow(QMainWindow):
             overwrite=self.post_overwrite.isChecked(),
             worker_count=normalize_worker_count(self.post_worker_count.value()),
         )
-        return PipelineGuiSettings(
+        basepath_text = self.basepath.text().strip()
+        basename = (
+            self.multi_day_name.text().strip()
+            if self._multi_day_session_paths and self.multi_day_name.text().strip()
+            else (Path(basepath_text).name if basepath_text else "")
+        )
+        local_root_text = self.local_root.text().strip() or str(REPO_ROOT / "preprocess_tmp")
+        execution = ExecutionGuiSettings(
+            requested_backend=str(
+                self.execution_backend.currentData() or RequestedBackend.AUTO.value
+            ),
+            workspace=str(Path(local_root_text).expanduser().resolve()),
+            matlab_path="",
+            shared_workspace_acknowledged=False,
+            require_sacct=True,
+            preprocess=self._resource_settings_from_widgets(StageName.PREPROCESS),
+            sorting=self._resource_settings_from_widgets(StageName.SORTING),
+            postprocess=self._resource_settings_from_widgets(StageName.POSTPROCESS),
+        )
+        settings = PipelineGuiSettings(
             basepath=self.basepath.text().strip(),
             local_root=self.local_root.text().strip(),
             xml_path=self.xml_path.text().strip(),
@@ -4348,9 +5241,24 @@ class MainWindow(QMainWindow):
             preprocess=preprocess,
             behavior=behavior,
             postprocess=postprocess,
+            execution=execution,
         )
+        resolve_existing_session_settings(settings)
+        return settings
+
+    def _apply_config_settings(
+        self, settings: PipelineGuiSettings, config_path: Path
+    ) -> None:
+        self._environment_backend_default_pending = not _default_config_has_backend_choice(
+            config_path
+        )
+        self._apply_settings(settings)
+        if self._slurm_capabilities is not None:
+            self._apply_environment_backend_default(self._slurm_capabilities)
 
     def _apply_settings(self, settings: PipelineGuiSettings) -> None:
+        self._move_storage_override = None
+        self._move_source_snapshot = None
         self._refresh_suspended = True
         try:
             self.basepath.setText(settings.basepath)
@@ -4416,7 +5324,7 @@ class MainWindow(QMainWindow):
             default_sorter_path, default_sorter_config = self._current_sorter_defaults()
             self.sorter_path.setText(p.sorter_path or default_sorter_path)
             self.sorter_config_path.setText(p.sorter_config_path or default_sorter_config)
-            self.matlab_path.setText(p.matlab_path)
+            self.matlab_path.setText("")
             self.preprocess_worker_count.setValue(normalize_worker_count(p.preprocess_worker_count))
             self.sorter_worker_count.setValue(normalize_worker_count(p.sorter_worker_count))
             self.pre_overwrite.setChecked(p.overwrite)
@@ -4464,12 +5372,25 @@ class MainWindow(QMainWindow):
                 field.setText("" if value is None else str(value))
             self.post_overwrite.setChecked(pp.overwrite)
             self.post_worker_count.setValue(normalize_worker_count(pp.worker_count))
+            execution = settings.execution
+            backend_index = self.execution_backend.findData(execution.requested_backend)
+            self.execution_backend.setCurrentIndex(backend_index if backend_index >= 0 else 0)
+            self._apply_stage_resource_settings(StageName.PREPROCESS, execution.preprocess)
+            self._apply_stage_resource_settings(StageName.SORTING, execution.sorting)
+            self._apply_stage_resource_settings(StageName.POSTPROCESS, execution.postprocess)
             chanmap = settings.resolved_chanmap_path()
             if not self._load_settings_chanmap_preview(settings) and chanmap is not None and chanmap.exists():
                 self._load_chanmap_preview(chanmap)
         finally:
             self._normalize_worker_fields()
             self._refresh_suspended = False
+
+    def _apply_stage_resource_settings(
+        self, stage: StageName, resource: StageResourceGuiSettings
+    ) -> None:
+        widgets = self._resource_widgets[stage.value]
+        widgets["cpus"].setValue(max(1, int(resource.cpus)))  # type: ignore[attr-defined]
+        widgets["memory_gib"].setValue(max(1, int(resource.memory_mb) // 1024))  # type: ignore[attr-defined]
 
     def _normalize_worker_fields(self) -> None:
         for field in (self.preprocess_worker_count, self.sorter_worker_count, self.post_worker_count):
@@ -4588,19 +5509,18 @@ class MainWindow(QMainWindow):
         xml_path = settings.resolved_xml_path()
         if xml_path is None or not xml_path.exists():
             return settings
-        basepath, basename, local_output_dir, _xml_path = select_paths_with_gui(
-            use_gui=False,
-            manual_basepath=settings.basepath_path,
-            local_root=settings.local_root_path,
-            manual_xml_path=xml_path,
-        )
+        basepath = settings.preprocess_source_path or settings.basepath_path
+        basename = settings.basename
+        local_output_dir = settings.local_output_dir
+        if basepath is None or local_output_dir is None:
+            raise ValueError("Cannot resolve raw source and processed-session output paths")
         chanmap_path, bad_channels = prepare_chanmap(
             basepath=basepath,
             basename=basename,
             local_output_dir=local_output_dir,
             probe_assignments=settings.preprocess.probe_assignments,
             reject_channels=settings.preprocess.reject_channels,
-            xml_path=_xml_path,
+            xml_path=xml_path,
         )
         settings.chanmap_path = str(chanmap_path)
         settings.preprocess.reject_channels = list(bad_channels)
@@ -4616,32 +5536,101 @@ class MainWindow(QMainWindow):
         self._append_log(f"Prepared chanMap for run: {chanmap_path}\nBad channels: {bad_channels}\n")
         return settings
 
-    def _move_outputs_to_basepath(self) -> None:
+    def _default_move_storage_dir_from_widgets(self) -> Path | None:
+        basepath_text = self.basepath.text().strip()
+        if not basepath_text:
+            return None
+        basepath = Path(basepath_text).expanduser()
+        name = self.multi_day_name.text().strip()
+        if self._multi_day_session_paths and name:
+            return (basepath.parent / name).resolve()
+        return basepath.resolve()
+
+    def _update_move_storage_destination(self) -> None:
+        if not hasattr(self, "move_storage_dir"):
+            return
+        destination = self._move_storage_override or self._default_move_storage_dir_from_widgets()
+        self.move_storage_dir.setText(str(destination) if destination is not None else "")
+
+    def _clear_move_storage_override(self, *_args: Any) -> None:
+        self._move_storage_override = None
+        self._move_source_snapshot = None
+        self._update_move_storage_destination()
+
+    def _browse_move_storage_dir(self) -> None:
+        try:
+            settings = self._collect_settings()
+            if settings.local_output_dir is None or not settings.basename:
+                raise ValueError("Select Basepath before choosing a storage destination.")
+            start = self.move_storage_dir.text().strip() or settings.basepath or str(Path.cwd())
+            path = self._select_directory("Select output storage directory", start)
+            if not path:
+                return
+            destination = Path(path).expanduser().resolve()
+            self._move_source_snapshot = (settings.local_output_dir.resolve(), settings.basename)
+            self._move_storage_override = destination
+            self.move_storage_dir.setText(str(destination))
+            # The selected storage location becomes the displayed Basepath as
+            # requested, while the pre-change Local source is retained above.
+            self.basepath.setText(str(destination))
+            self._schedule_refresh()
+        except Exception as exc:
+            QMessageBox.critical(self, "Select storage failed", str(exc))
+
+    def _move_outputs_to_storage(self) -> None:
         if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
             QMessageBox.warning(self, "Run active", "Cannot move outputs while a pipeline job is running.")
             return
+        if self._active_run_dir is not None:
+            try:
+                state_path = self._active_run_dir / "state.json"
+                active_state = (
+                    read_json(state_path)
+                    if state_path.exists()
+                    else RunStore(self._active_run_dir).derive_state()
+                )
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "Run state unavailable",
+                    f"Cannot safely move outputs until Run state can be checked: {exc}",
+                )
+                return
+            if self._persistent_state_has_active_work(active_state):
+                QMessageBox.warning(
+                    self,
+                    "Run active",
+                    "Cannot move outputs while a Local/Slurm pipeline job is active.",
+                )
+                return
         try:
             settings = self._collect_settings()
+            destination = self._move_storage_override or _default_output_storage_dir(settings)
+            source_dir = self._move_source_snapshot[0] if self._move_source_snapshot else None
+            source_basename = self._move_source_snapshot[1] if self._move_source_snapshot else None
             message = (
-                "Move local output files to basepath?\n\n"
-                f"Basepath: {settings.basepath or '-'}\n"
-                f"Local output: {settings.local_output_dir or '-'}\n"
+                "Move local output files to storage?\n\n"
+                f"Storage destination: {destination or '-'}\n"
+                f"Local output: {source_dir or settings.local_output_dir or '-'}\n"
                 f"Move basename.dat: {'yes' if self.move_dat_to_basepath.isChecked() else 'no'}\n"
                 f"Overwrite existing files: {'yes' if self.move_overwrite.isChecked() else 'no'}\n"
                 f"Clean local after move: {'yes' if self.move_clean_local.isChecked() else 'no'}"
             )
-            answer = QMessageBox.question(self, "Move outputs to basepath", message)
+            answer = QMessageBox.question(self, "Move outputs to storage", message)
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            result = _move_local_output_to_basepath(
+            result = _move_local_output_to_storage(
                 settings,
                 move_dat=self.move_dat_to_basepath.isChecked(),
                 overwrite=self.move_overwrite.isChecked(),
                 clean_after_move=self.move_clean_local.isChecked(),
+                destination_dir=self._move_storage_override,
+                source_dir=source_dir,
+                source_basename=source_basename,
             )
             lines = [
-                "Move to basepath finished",
-                f"Basepath: {result['basepath']}",
+                "Move to storage finished",
+                f"Storage destination: {result['storage_dir']}",
                 f"Local output: {result['local_output_dir']}",
                 "",
                 f"Moved ({len(result['moved'])}):",
@@ -4661,12 +5650,16 @@ class MainWindow(QMainWindow):
             lines.append("")
             lines.append(f"Cleaned local output: {'yes' if result['cleaned'] else 'no'}")
             lines.append("")
-            lines.append("Move outputs to basepath complete!")
+            lines.append("Move outputs to storage complete!")
             text = "\n".join(lines)
             self.run_preview.setPlainText(text)
             self._append_log(text + "\n")
         except Exception as exc:
             QMessageBox.critical(self, "Move outputs failed", str(exc))
+
+    def _move_outputs_to_basepath(self) -> None:
+        """Compatibility alias for older direct callers."""
+        self._move_outputs_to_storage()
 
     def _resolve_phy_params_path(self, sorting_folder: Path, *, prefer_postprocessed: bool = False) -> Path:
         sorting_folder = sorting_folder.expanduser().resolve()
@@ -4723,10 +5716,35 @@ class MainWindow(QMainWindow):
             and self._cell_explorer_process.state() != QProcess.ProcessState.NotRunning
         )
 
+    def _persistent_session_is_active(self, settings: PipelineGuiSettings) -> bool:
+        try:
+            session_dir = settings.local_output_dir
+            if session_dir is None:
+                return False
+            workspace_text = settings.execution.workspace.strip()
+            workspace = (
+                Path(workspace_text).expanduser().resolve()
+                if workspace_text
+                else settings.local_root_path
+            )
+            pipeline_root = workspace if workspace.name == ".pipeline" else workspace / ".pipeline"
+            from src.execution.session import active_session_claim
+
+            return (
+                active_session_claim(
+                    pipeline_root=pipeline_root,
+                    session_dir=Path(session_dir).resolve(),
+                )
+                is not None
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            # An unreadable persistent claim is unsafe to ignore.
+            return True
+
     def _resolve_matlab_program(self, settings: PipelineGuiSettings) -> str:
         from src.preprocess.sorter_runner import _resolve_matlab_cmd
 
-        matlab_text = settings.preprocess.matlab_path.strip()
+        matlab_text = (settings.execution.matlab_path or settings.preprocess.matlab_path).strip()
         matlab_cmd = _resolve_matlab_cmd(Path(matlab_text).expanduser() if matlab_text else None)
         if matlab_cmd is None:
             raise FileNotFoundError(
@@ -4782,11 +5800,29 @@ class MainWindow(QMainWindow):
         text = bytes(process.readAllStandardError()).decode(errors="replace")
         self._queue_log(text)
 
+    def _release_cell_explorer_session_claim(self) -> None:
+        claims = self._cell_explorer_session_claims
+        self._cell_explorer_session_claims = []
+        from src.execution.session import release_manual_session_claim
+
+        for session_dir, token in claims:
+            release_manual_session_claim(session_dir=session_dir, token=token)
+
+    def _release_phy_session_claim(self) -> None:
+        claim = self._phy_session_claim
+        self._phy_session_claim = None
+        if claim is None:
+            return
+        from src.execution.session import release_manual_session_claim
+
+        release_manual_session_claim(session_dir=claim[0], token=claim[1])
+
     def _cell_explorer_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
         self._flush_log_buffer()
         self._append_log(f"\n=== CellExplorer MATLAB process closed (exit code {exit_code}) ===\n")
         self._cell_explorer_process = None
         self._cell_explorer_working_dir = None
+        self._release_cell_explorer_session_claim()
         if self._process is None or self._process.state() == QProcess.ProcessState.NotRunning:
             self.launch_cell_explorer.setEnabled(True)
             if not self._phy_is_running():
@@ -4795,6 +5831,7 @@ class MainWindow(QMainWindow):
     def _cell_explorer_error_occurred(self, error: QProcess.ProcessError) -> None:
         self._cell_explorer_process = None
         self._cell_explorer_working_dir = None
+        self._release_cell_explorer_session_claim()
         if self._process is None or self._process.state() == QProcess.ProcessState.NotRunning:
             self.launch_cell_explorer.setEnabled(True)
         QMessageBox.critical(
@@ -4808,6 +5845,7 @@ class MainWindow(QMainWindow):
         if process is None or process.state() == QProcess.ProcessState.NotRunning:
             self._cell_explorer_process = None
             self._cell_explorer_working_dir = None
+            self._release_cell_explorer_session_claim()
             return
         pid = int(process.processId())
         if os.name == "nt" and pid > 0:
@@ -4826,6 +5864,7 @@ class MainWindow(QMainWindow):
             process.waitForFinished(2000)
         self._cell_explorer_process = None
         self._cell_explorer_working_dir = None
+        self._release_cell_explorer_session_claim()
 
     def _launch_cell_explorer(self) -> None:
         if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
@@ -4839,8 +5878,12 @@ class MainWindow(QMainWindow):
             return
         try:
             settings = self._collect_settings()
+            if self._persistent_session_is_active(settings):
+                raise RuntimeError(
+                    "A persistent Run still owns this session. Wait for it to finish or cancel it before CellExplorer."
+                )
             basepath = settings.local_output_dir
-            source_basepath = settings.basepath_path
+            source_basepath = settings.preprocess_source_path or settings.basepath_path
             if basepath is None or not settings.basename:
                 raise ValueError("Local output directory cannot be resolved.")
             if source_basepath is None:
@@ -4854,6 +5897,19 @@ class MainWindow(QMainWindow):
                 raise FileNotFoundError(f"CellExplorer MATLAB wrapper not found: {wrapper_path}")
             sorting_dirs = self._resolve_cell_explorer_sorting_dirs(settings)
             matlab_program = self._resolve_matlab_program(settings)
+            from src.execution.session import acquire_manual_session_claim
+
+            claim_dirs = {Path(basepath).resolve()}
+            for sorting_dir in sorting_dirs:
+                run_root = (
+                    sorting_dir.parent if sorting_dir.name == "sorter_output" else sorting_dir
+                )
+                claim_dirs.add(run_root.parent.resolve())
+            for claim_dir in sorted(claim_dirs, key=str):
+                claim_token = acquire_manual_session_claim(
+                    session_dir=claim_dir, owner="CellExplorer"
+                )
+                self._cell_explorer_session_claims.append((claim_dir, claim_token))
             if self._channel_regions:
                 saved = self._persist_anatomical_map_to_default()
                 if saved is not None:
@@ -4889,6 +5945,9 @@ class MainWindow(QMainWindow):
             )
 
             process = QProcess(self)
+            process_environment = QProcessEnvironment.systemEnvironment()
+            process_environment.insert("CUDA_VISIBLE_DEVICES", "")
+            process.setProcessEnvironment(process_environment)
             process.setProgram(matlab_program)
             process.setArguments(["-nosplash", "-r", matlab_command])
             process.setWorkingDirectory(str(basepath))
@@ -4906,7 +5965,20 @@ class MainWindow(QMainWindow):
             process.start()
             if not process.waitForStarted(5000):
                 self._cell_explorer_error_occurred(process.error())
+            else:
+                from src.execution.session import update_manual_session_claim_pid
+
+                child_pid = int(process.processId())
+                try:
+                    for claim_dir, claim_token in self._cell_explorer_session_claims:
+                        update_manual_session_claim_pid(
+                            session_dir=claim_dir, token=claim_token, child_pid=child_pid
+                        )
+                except Exception:
+                    self._terminate_cell_explorer_process()
+                    raise
         except Exception as exc:
+            self._release_cell_explorer_session_claim()
             QMessageBox.critical(self, "Run CellExplore postprocess failed", str(exc))
 
     def _format_seconds(self, total_seconds: float) -> str:
@@ -5020,6 +6092,7 @@ class MainWindow(QMainWindow):
         self._phy_process = None
         self._phy_working_dir = None
         self._phy_last_counts = None
+        self._release_phy_session_claim()
         if self._process is None or self._process.state() == QProcess.ProcessState.NotRunning:
             self.run_phy.setEnabled(True)
             if not self._cell_explorer_is_running():
@@ -5030,6 +6103,7 @@ class MainWindow(QMainWindow):
         self._phy_process = None
         self._phy_working_dir = None
         self._phy_last_counts = None
+        self._release_phy_session_claim()
         if self._process is None or self._process.state() == QProcess.ProcessState.NotRunning:
             self.run_phy.setEnabled(True)
             if not self._cell_explorer_is_running():
@@ -5045,18 +6119,34 @@ class MainWindow(QMainWindow):
             return
         try:
             settings = self._collect_settings()
+            if self._persistent_session_is_active(settings):
+                raise RuntimeError(
+                    "A persistent Run still owns this session. Wait for it to finish or cancel it before Phy."
+                )
             manual_text = self.manual_sorting_folder.text().strip()
             sorting_folder = Path(manual_text).expanduser() if manual_text else settings.postprocess_sorting_folder()
             if sorting_folder is None:
                 raise FileNotFoundError(
                     "No sorting folder could be resolved. Run postprocess first or choose a Manual Curation folder."
                 )
-            params_path = self._resolve_phy_params_path(sorting_folder)
+            params_path = self._resolve_phy_params_path(
+                sorting_folder,
+                prefer_postprocessed=not bool(manual_text),
+            )
             phy_program = self._resolve_phy_program()
             working_dir = params_path.parent
+            run_root = sorting_folder.parent if sorting_folder.name == "sorter_output" else sorting_folder
+            session_dir = run_root.parent.resolve()
+            from src.execution.session import acquire_manual_session_claim
+
+            claim_token = acquire_manual_session_claim(session_dir=session_dir, owner="Phy")
+            self._phy_session_claim = (session_dir, claim_token)
             self._append_log(f"\n=== Launching Phy ===\n{phy_program} template-gui {params_path.name}\n")
             self._append_log(f"Working directory: {working_dir}\n")
             process = QProcess(self)
+            process_environment = QProcessEnvironment.systemEnvironment()
+            process_environment.insert("CUDA_VISIBLE_DEVICES", "")
+            process.setProcessEnvironment(process_environment)
             process.setProgram(phy_program)
             process.setArguments(["template-gui", params_path.name])
             process.setWorkingDirectory(str(working_dir))
@@ -5071,14 +6161,45 @@ class MainWindow(QMainWindow):
             if not process.waitForStarted(3000):
                 self._phy_error_occurred(process.error())
                 return
+            from src.execution.session import update_manual_session_claim_pid
+
+            try:
+                update_manual_session_claim_pid(
+                    session_dir=session_dir,
+                    token=claim_token,
+                    child_pid=int(process.processId()),
+                )
+            except Exception:
+                process.kill()
+                process.waitForFinished(3000)
+                raise
             QTimer.singleShot(3000, lambda: self._append_phy_curation_status(force=True))
             QTimer.singleShot(3000, lambda path=working_dir / "phy.log": self._append_phy_log_summary(path))
             self._phy_status_timer.start()
         except Exception as exc:
+            self._release_phy_session_claim()
             QMessageBox.critical(self, "Run phy failed", str(exc))
 
     def _force_stop_process(self) -> None:
         if self._process is None or self._process.state() == QProcess.ProcessState.NotRunning:
+            # Basepath/Local working dir may have changed since the last monitor
+            # tick. Rebind synchronously so this click cannot cancel the Run from
+            # the previously selected session.
+            self._refresh_persistent_run_monitor()
+            if self._active_run_dir is not None:
+                try:
+                    state_path = self._active_run_dir / "state.json"
+                    state = (
+                        read_json(state_path)
+                        if state_path.exists()
+                        else RunStore(self._active_run_dir).derive_state()
+                    )
+                except Exception as exc:
+                    QMessageBox.critical(self, "Force stop failed", str(exc))
+                    return
+                if self._persistent_state_has_active_work(state):
+                    self._request_persistent_run_cancel()
+                    return
             self._append_log("\n=== Force stop requested, but no pipeline job is running ===\n")
             return
         dialog = QMessageBox(self)
@@ -5125,12 +6246,9 @@ class MainWindow(QMainWindow):
 
         self._force_stop_requested = False
         self._process_stop_escalated = False
-        if mode in {"all", "preprocess"}:
-            try:
-                settings = self._ensure_current_chanmap_for_run(settings)
-            except Exception as exc:
-                QMessageBox.critical(self, "Generate chanMap failed", str(exc))
-                return
+        if mode in {"all", "preprocess", "postprocess"}:
+            self._start_persistent_run(settings, mode)
+            return
         self._set_running(True)
         self._append_log(f"\n=== Running {mode} ===\n")
         fd, config_name = tempfile.mkstemp(prefix="preprocess_gui_", suffix=".json")
@@ -5163,6 +6281,49 @@ class MainWindow(QMainWindow):
         process.start()
         if not process.waitForStarted(3000):
             self._process_error_occurred(process.error())
+
+    def _start_persistent_run(self, settings: PipelineGuiSettings, mode: RunMode) -> None:
+        try:
+            requested = RequestedBackend(settings.execution.requested_backend.lower())
+            capabilities = (
+                None
+                if requested == RequestedBackend.LOCAL
+                else self._slurm_capabilities or detect_slurm_capabilities(timeout=3.0)
+            )
+            resolved, capabilities = resolve_backend(
+                requested,
+                require_sacct=settings.execution.require_sacct,
+                capabilities=capabilities,
+            )
+            if requested != RequestedBackend.LOCAL:
+                self._slurm_capabilities = capabilities
+            execution = settings.execution.to_execution_config(resolved_backend=resolved)
+            run_dir = create_run(
+                settings=settings,
+                execution=execution,
+                mode=mode,
+                capabilities=capabilities,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Persistent Run submission failed", str(exc))
+            return
+        self._set_active_run(run_dir, session_dir=settings.local_output_dir)
+        self.execution_resolved.setText(f"Using {resolved.value.capitalize()} for this Run.")
+        if not self._launch_persistent_controller([]):
+            self._append_warning_log(
+                f"[WARN] Run was created but its controller did not start: {run_dir}\n"
+            )
+            return
+        self._append_log(
+            f"\n=== Persistent {mode} Run submitted ===\n"
+            f"Run directory: {run_dir}\n"
+            f"Requested backend: {requested.value}\n"
+            f"Resolved backend: {resolved.value}\n"
+            "The GUI may be closed without cancelling this Run.\n"
+        )
+        self.tabs.setCurrentIndex(0)
+        self.ephys_tabs.setCurrentIndex(self._ephys_run_tab_index)
+        QTimer.singleShot(750, self._refresh_persistent_run_monitor)
 
     def _read_process_stdout(self) -> None:
         process = self._process
@@ -5427,6 +6588,7 @@ class MainWindow(QMainWindow):
             self.run_noise_label,
             self.run_behavior_cleanup,
             self.run_behavior,
+            self.browse_move_storage,
             self.move_outputs,
         ]:
             button.setEnabled(not running)
@@ -5477,6 +6639,7 @@ class MainWindow(QMainWindow):
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     window = MainWindow()
+    window._fit_to_available_screen()
     window.show()
     return int(app.exec())
 

@@ -1,7 +1,5 @@
 ﻿from __future__ import annotations
 
-from dataclasses import replace
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -41,17 +39,9 @@ from .recording import (
 )
 from .session import build_session_struct, save_session_mat
 from .metafile import PreprocessConfig, PreprocessResult
-from .sorter_runner import build_sorter_partitions, execute_sorting_job, write_sorter_partition_manifest
+from .sorting_stage import run_sorting_stage
+from .sorter_runner import execute_sorting_job
 from .state_scoring import run_state_scoring
-
-
-def _sorter_output_prefix(sorter_name: str) -> str:
-    sorter_normalized = sorter_name.strip().lower()
-    if sorter_normalized == "kilosort":
-        return "Kilosort"
-    if sorter_normalized == "kilosort4":
-        return "Kilosort4"
-    return sorter_name[:1].upper() + sorter_name[1:].lower()
 
 
 def _make_tree_world_rw(root: Path) -> None:
@@ -1104,119 +1094,6 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         state_score_figure_paths = list(state_score_result.figure_paths)
 
     _step("Run spike sorter (optional)")
-    sorter_output_dir: Path | None = None
-    sorter_output_dirs: list[Path] = []
-    sorter_partition_manifest_path: Path | None = None
-    if config.sorter:
-        sorter_dat_path = output_dir / f"{basename}.dat"
-        sorter_preprocess_for_sorting = False
-        sorter_input_is_preprocessed = bool(config.do_preprocess)
-        if config.bad_channels and bad_0 and not sorter_input_is_preprocessed:
-            sorter_exclude_channels_0based = bad_0
-        else:
-            sorter_exclude_channels_0based = None
-        sorter_partition_exclude_channels_0based = bad_0 if config.bad_channels else []
-
-        sorter_label = str(config.sorter).strip()
-        sorter_name_for_folder = _sorter_output_prefix(sorter_label)
-        partition_mode = str(config.sorter_partition_mode).strip().lower()
-        if partition_mode not in {"all", "probe", "shank"}:
-            raise ValueError(
-                "sorter_partition_mode must be one of ['all', 'probe', 'shank']. "
-                f"Got: {config.sorter_partition_mode}"
-            )
-        partitions = build_sorter_partitions(
-            mode=partition_mode,
-            chanmap_mat_path=effective_chanmap_mat_path,
-            num_channels=output_n_channels,
-            excluded_channels_0based=sorter_partition_exclude_channels_0based,
-        )
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        manifest_partitions = []
-        for partition in partitions:
-            folder_suffix = "" if partition.mode == "all" else f"_{partition.name}"
-            partition_output_dir = output_dir / f"{sorter_name_for_folder}_{timestamp}{folder_suffix}"
-            if partition_output_dir.exists():
-                suffix = 1
-                while True:
-                    candidate = output_dir / f"{sorter_name_for_folder}_{timestamp}{folder_suffix}_{suffix:02d}"
-                    if not candidate.exists():
-                        partition_output_dir = candidate
-                        break
-                    suffix += 1
-            print(
-                f"Sorter partition {partition.name}: "
-                f"{len(partition.channels_0based)} channels -> {partition_output_dir}"
-            )
-            completed_partition = replace(
-                partition,
-                output_folder=str(partition_output_dir),
-                status="running",
-            )
-            manifest_partitions.append(completed_partition)
-            sorter_partition_manifest_path = write_sorter_partition_manifest(
-                output_dir=output_dir,
-                mode=partition_mode,
-                sorter=sorter_label,
-                partitions=manifest_partitions,
-            )
-            _ = execute_sorting_job(
-                sorter=config.sorter,
-                dat_path=sorter_dat_path,
-                xml_path=xml_path,
-                output_folder=partition_output_dir,
-                config_path=config.sorter_config_path,
-                kilosort1_path=config.sorter_path,
-                kilosort25_path=config.sorter_path,
-                kilosort4_path=config.sorter_path,
-                matlab_path=config.matlab_path,
-                matlab_max_workers=config.matlab_max_workers,
-                chanmap_mat_path=effective_chanmap_mat_path,
-                dtype=config.dtype,
-                gain_to_uV=config.gain_to_uV,
-                offset_to_uV=config.offset_to_uV,
-                sampling_frequency=effective_sr,
-                num_channels=output_n_channels,
-                active_channels_0based=(
-                    partition.channels_0based if partition.mode != "all" else None
-                ),
-                exclude_channels_0based=(
-                    sorter_partition_exclude_channels_0based
-                    if partition.mode != "all"
-                    else sorter_exclude_channels_0based
-                ),
-                job_kwargs=config.job_kwargs,
-                remove_existing_folder=config.overwrite,
-                preprocess_for_sorting=sorter_preprocess_for_sorting,
-                input_is_preprocessed=sorter_input_is_preprocessed,
-                bandpass_min_hz=config.bandpass_min_hz,
-                bandpass_max_hz=config.bandpass_max_hz,
-                reference=config.reference,
-                local_radius_um=config.local_radius_um,
-                sorter_verbose=bool(config.sorter_verbose),
-                cleanup_temp_wh=bool(config.cleanup_temp_wh),
-            )
-            sorter_output_dirs.append(partition_output_dir)
-            manifest_partitions[-1] = replace(
-                manifest_partitions[-1],
-                status="completed",
-            )
-            sorter_partition_manifest_path = write_sorter_partition_manifest(
-                output_dir=output_dir,
-                mode=partition_mode,
-                sorter=sorter_label,
-                partitions=manifest_partitions,
-            )
-        sorter_output_dir = sorter_output_dirs[0] if len(sorter_output_dirs) == 1 else None
-        if sorter_output_dirs:
-            print(
-                "Sorter output folders: "
-                + ", ".join(str(path) for path in sorter_output_dirs)
-            )
-        if sorter_partition_manifest_path is not None:
-            print(f"Sorter partition manifest: {sorter_partition_manifest_path}")
-
-    _step("Save manifest and return")
     result = PreprocessResult(
         basepath=basepath,
         basename=basename,
@@ -1237,13 +1114,18 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         subsession_sample_counts=(
             merge_data.firstlasttimepoints_samples[:, 1].astype(int).tolist()
         ),
-        sorter=config.sorter,
-        sorter_output_dir=sorter_output_dir,
-        sorter_output_dirs=sorter_output_dirs,
-        sorter_partition_manifest_path=sorter_partition_manifest_path,
+        sorter=None,
+        sorter_output_dir=None,
+        sorter_output_dirs=[],
+        sorter_partition_manifest_path=None,
         state_score_paths=state_score_paths,
         state_score_figure_paths=state_score_figure_paths,
     )
+
+    if config.sorter:
+        result = run_sorting_stage(config, result, execute_job=execute_sorting_job)
+
+    _step("Save manifest and return")
 
     save_params_and_manifest(
         config=config,

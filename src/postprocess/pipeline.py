@@ -49,7 +49,7 @@ def _find_sorting_output_dirs(root: Path) -> list[Path]:
             p
             for pattern in _SORTING_OUTPUT_PATTERNS
             for p in root.glob(pattern)
-            if p.is_dir() and not p.name.endswith("_spi")
+            if p.is_dir() and "_spi" not in p.name and ".preserved-" not in p.name
         ],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
@@ -68,7 +68,12 @@ def _find_sorting_output_dirs_from_manifest(root: Path) -> list[Path]:
         if not folder_text:
             continue
         folder = Path(folder_text).expanduser().resolve()
-        if not folder.exists() or not folder.is_dir() or folder.name.endswith("_spi"):
+        if (
+            not folder.exists()
+            or not folder.is_dir()
+            or "_spi" in folder.name
+            or ".preserved-" in folder.name
+        ):
             continue
         if folder in seen:
             continue
@@ -300,6 +305,21 @@ def _clear_folder_contents(folder: Path, *, keep_names: set[str] | None = None) 
             _safe_rmtree(child)
         else:
             child.unlink(missing_ok=True)
+
+
+def _preserve_or_remove_postprocess_output(folder: Path) -> Path | None:
+    """Version prior output so a failed replacement cannot destroy valid results."""
+
+    if not folder.exists():
+        return None
+    suffix = time.strftime("%Y-%m-%d_%H%M%S")
+    preserved = folder.with_name(f"{folder.name}.preserved-{suffix}")
+    counter = 1
+    while preserved.exists():
+        preserved = folder.with_name(f"{folder.name}.preserved-{suffix}-{counter}")
+        counter += 1
+    folder.rename(preserved)
+    return preserved
 
 
 def _count_units_and_spikes(sorting) -> tuple[int, int]:
@@ -782,8 +802,10 @@ def _run_postprocess_single_session(
         )
 
     _log(f"sorting_phy_folder={sorting_phy_folder}")
-    if output_folder.exists() and overwrite and not config.skip_curation:
-        _safe_rmtree(output_folder)
+    if output_folder.exists() and overwrite:
+        preserved = _preserve_or_remove_postprocess_output(output_folder)
+        if preserved is not None:
+            _log(f"versioned prior output before overwrite: {preserved}")
     output_folder.mkdir(parents=True, exist_ok=True)
     _log(f"output_folder={output_folder}")
     if analyzer_cache_root is not None:

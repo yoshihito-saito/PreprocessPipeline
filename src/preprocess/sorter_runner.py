@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import hashlib
 import signal
 import subprocess
 from contextlib import contextmanager, nullcontext
@@ -9,6 +10,7 @@ from dataclasses import dataclass, asdict
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import sys
 import tempfile
@@ -165,10 +167,18 @@ def _matlab_shim_dir() -> Path:
     return _runtime_root() / "matlab_shim"
 
 
+def _path_identity(path: Path) -> str:
+    resolved = Path(path).expanduser().resolve()
+    return hashlib.sha256(os.fsencode(str(resolved))).hexdigest()[:12]
+
+
 def _matlab_log_path(output_folder: Path | None = None) -> Path:
     if output_folder is None:
         return _matlab_shim_dir() / "matlab_run.log"
-    return _matlab_shim_dir() / f"{Path(output_folder).name}_matlab_run.log"
+    output_folder = Path(output_folder)
+    return _matlab_shim_dir() / (
+        f"{output_folder.name}_{_path_identity(output_folder)}_matlab_run.log"
+    )
 
 
 def _sorter_matlab_log_path(output_folder: Path) -> Path:
@@ -257,8 +267,11 @@ def _inject_matlab_shim(
     *,
     matlab_max_workers: int | None = None,
 ) -> Path:
-    shim_dir = _matlab_shim_dir()
+    shim_dir = _matlab_shim_dir() / f"{matlab_log.stem}_{_path_identity(matlab_log)}"
     shim_dir.mkdir(parents=True, exist_ok=True)
+    matlab_job_storage = shim_dir / "jobs"
+    matlab_job_storage.mkdir(parents=True, exist_ok=True)
+    matlab_job_storage_text = str(matlab_job_storage).replace("'", "''")
     requested_workers = None if matlab_max_workers is None else int(matlab_max_workers)
     if requested_workers is not None and requested_workers < 1:
         requested_workers = 1
@@ -275,6 +288,7 @@ def _inject_matlab_shim(
                 "    if isempty(getCurrentTask())",
                 f"        requested_workers = {requested_workers};",
                 "        c = parcluster('Processes');",
+                f"        c.JobStorageLocation = '{matlab_job_storage_text}';",
                 "        detected_max_workers = c.NumWorkers;",
                 "        pool_workers = min(requested_workers, detected_max_workers);",
                 "        if pool_workers >= 1",
@@ -304,12 +318,14 @@ def _inject_matlab_shim(
         )
     startup_m = shim_dir / "startup.m"
     startup_m.write_text("\n".join(startup_lines) + "\n", encoding="utf-8")
-    existing_matlabpath = os.environ.get("MATLABPATH", "")
-    os.environ["MATLABPATH"] = (
-        str(shim_dir) if not existing_matlabpath else str(shim_dir) + os.pathsep + existing_matlabpath
-    )
 
     if _is_windows():
+        existing_matlabpath = os.environ.get("MATLABPATH", "")
+        os.environ["MATLABPATH"] = (
+            str(shim_dir)
+            if not existing_matlabpath
+            else str(shim_dir) + os.pathsep + existing_matlabpath
+        )
         shim_path = shim_dir / "matlab.bat"
         matlab_engine_log = str(matlab_log) + ".matlab.log"
         matlab_stdout_log = str(matlab_log) + ".stdout.log"
@@ -340,20 +356,29 @@ def _inject_matlab_shim(
         _prepend_to_windows_path(str(shim_dir))
         return shim_path
 
+    startup_matlab_path = str(startup_m).replace("'", "''")
+    startup_command = shlex.quote(f"run('{startup_matlab_path}'); ")
+    matlab_cmd_shell = shlex.quote(matlab_cmd)
+    matlab_log_shell = shlex.quote(str(matlab_log))
     shim_path = shim_dir / "matlab"
     shim_path.write_text(
         (
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
+            f"startup_command={startup_command}\n"
             "args=(\"$@\")\n"
             "for ((i=0; i<${#args[@]}; i++)); do\n"
             "  if [[ \"${args[$i]}\" == \"-r\" ]] && (( i + 1 < ${#args[@]} )); then\n"
-            "    args[$((i + 1))]=\"${args[$((i + 1))]}; try, delete(gcp('nocreate')); catch, end; exit\"\n"
+            "    args[$((i + 1))]=\"${startup_command}${args[$((i + 1))]}; try, delete(gcp('nocreate')); catch, end; exit\"\n"
             "    break\n"
             "  fi\n"
             "done\n"
-            f"matlab_log={repr(str(matlab_log))}\n"
-            f"\"{matlab_cmd}\" -logfile \"$matlab_log\" \"${{args[@]}}\" &\n"
+            f"matlab_log={matlab_log_shell}\n"
+            "matlab_stdio_log=\"${matlab_log}.stdio\"\n"
+            ": > \"$matlab_stdio_log\"\n"
+            "cleanup_stdio_log() { rm -f -- \"$matlab_stdio_log\"; }\n"
+            "trap cleanup_stdio_log EXIT\n"
+            f"{matlab_cmd_shell} -logfile \"$matlab_log\" \"${{args[@]}}\" </dev/null >\"$matlab_stdio_log\" 2>&1 &\n"
             "matlab_pid=$!\n"
             "monitor_pid=\"\"\n"
             "(\n"
@@ -417,6 +442,10 @@ def _inject_matlab_shim(
             "if [[ -n \"$monitor_pid\" ]]; then\n"
             "  kill \"$monitor_pid\" 2>/dev/null || true\n"
             "  wait \"$monitor_pid\" 2>/dev/null || true\n"
+            "fi\n"
+            "if (( exit_code != 0 )) && [[ -s \"$matlab_stdio_log\" ]]; then\n"
+            "  printf '%s\\n' '[matlab-shim] MATLAB launcher stdout/stderr follows' >> \"$matlab_log\"\n"
+            "  cat -- \"$matlab_stdio_log\" >> \"$matlab_log\"\n"
             "fi\n"
             "exit \"$exit_code\"\n"
         ),

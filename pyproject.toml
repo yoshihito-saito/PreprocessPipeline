@@ -26,6 +26,8 @@ dependencies = [
 
 [project.scripts]
 preprocess-gui = "src.preprocess.gui:main"
+preprocess-run-controller = "src.execution.controller:main"
+preprocess-stage-worker = "src.execution.worker:main"
 
 [project.optional-dependencies]
 dev = [

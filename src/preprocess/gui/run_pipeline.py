@@ -8,8 +8,8 @@ import traceback
 from typing import Any
 
 from src.postprocess import PostprocessConfig, run_postprocess_session
-from src.preprocess import prepare_chanmap, run_preprocess_session, select_paths_with_gui
-from src.preprocess.multiday import prepare_multi_day_basepath
+from src.preprocess import run_preprocess_session
+from src.preprocess.runtime_prep import prepare_preprocess_settings
 
 from .config_model import PipelineGuiSettings, RunMode
 
@@ -58,69 +58,7 @@ def run_pipeline(settings: PipelineGuiSettings, mode: RunMode) -> dict[str, Any]
     payload: dict[str, Any] = {"mode": mode}
     pre_result = None
     if mode in ("all", "preprocess"):
-        if settings.multi_day_enabled:
-            session_paths = [Path(path) for path in settings.multi_day_session_paths if str(path).strip()]
-            if len(session_paths) < 2:
-                raise ValueError(
-                    "Multi-day preprocessing requires at least two session folders. "
-                    "Use Browse for multi-days and select all session folders before running."
-                )
-            if not settings.multi_day_name.strip():
-                raise ValueError(
-                    "Multi-day basepath name is required. "
-                    "Use Browse for multi-days or enter a Multi-day name before running."
-                )
-            selected_subepoch_paths = [
-                Path(path)
-                for path in settings.multi_day_selected_subepoch_paths
-                if str(path).strip()
-            ]
-            staged = prepare_multi_day_basepath(
-                session_paths=session_paths,
-                selected_subepoch_paths=selected_subepoch_paths or None,
-                local_root=settings.local_root_path,
-                name=settings.multi_day_name.strip(),
-                xml_path=settings.resolved_xml_path(),
-                dtype="int16",
-                overwrite=settings.preprocess.overwrite,
-            )
-            settings.basepath = str(staged.server_basepath)
-            settings.multi_day_name = staged.name
-            settings.xml_path = str(staged.server_basepath / f"{staged.name}.xml")
-            payload["multi_day_result"] = {
-                "name": staged.name,
-                "server_basepath": str(staged.server_basepath),
-                "local_basepath": str(staged.local_basepath),
-                "manifest_path": str(staged.manifest_path),
-                "selected_subepochs_csv_path": str(staged.selected_subepochs_csv_path),
-                "subepoch_count": len(staged.subepochs),
-                "selected_subepoch_count": len(selected_subepoch_paths) or len(staged.subepochs),
-            }
-            print(f"Prepared multi-day basepath: {staged.server_basepath}", flush=True)
-            print(f"Multi-day manifest: {staged.manifest_path}", flush=True)
-            print(f"Selected subepochs CSV: {staged.selected_subepochs_csv_path}", flush=True)
-        if settings.basepath_path is None:
-            raise ValueError("basepath is required.")
-        chanmap = settings.resolved_chanmap_path()
-        if chanmap is None or not chanmap.exists():
-            print("chanMap is missing; generating before preprocess.", flush=True)
-            basepath, basename, local_output_dir, _xml_path = select_paths_with_gui(
-                use_gui=False,
-                manual_basepath=settings.basepath_path,
-                local_root=settings.local_root_path,
-                manual_xml_path=settings.resolved_xml_path(),
-            )
-            chanmap_path, bad_channels = prepare_chanmap(
-                basepath=basepath,
-                basename=basename,
-                local_output_dir=local_output_dir,
-                probe_assignments=settings.preprocess.probe_assignments,
-                reject_channels=settings.preprocess.reject_channels,
-                xml_path=_xml_path,
-            )
-            print(f"Generated chanMap: {chanmap_path}", flush=True)
-            print(f"Bad channels: {bad_channels}", flush=True)
-            settings.chanmap_path = str(chanmap_path)
+        payload.update(prepare_preprocess_settings(settings))
         pre_result = run_preprocess_session(settings.to_preprocess_config())
         payload["preprocess_result"] = {
             "sorter_output_dir": str(pre_result.sorter_output_dir) if pre_result.sorter_output_dir else "",

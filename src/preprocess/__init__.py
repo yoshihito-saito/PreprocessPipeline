@@ -2,6 +2,7 @@ from .metafile import MergePointsData, PreprocessConfig, PreprocessResult, XmlMe
 from .behavior import BehaviorProcessingResult, discover_dlc_files, process_dlc_behavior
 from .io import prepare_chanmap, select_basepath, select_paths_with_gui, show_chanmap
 from .pipeline import run_preprocess_session
+from .sorting_stage import run_sorting_stage
 from .state_scoring import StateScoreResult, run_state_scoring
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "discover_dlc_files",
     "process_dlc_behavior",
     "run_preprocess_session",
+    "run_sorting_stage",
     "run_state_scoring",
     "StateScoreResult",
     "select_basepath",

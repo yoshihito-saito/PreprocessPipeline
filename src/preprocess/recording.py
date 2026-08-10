@@ -2,6 +2,8 @@
 
 from pathlib import Path
 from typing import Any, Callable
+import os
+import uuid
 import warnings
 
 import numpy as np
@@ -364,14 +366,25 @@ def write_concatenated_dat(
         )
         return output_dat_path
 
+    partial_path = output_dat_path.with_name(
+        f"{output_dat_path.name}.partial-{uuid.uuid4().hex[:12]}"
+    )
     si.write_binary_recording(
         recording,
-        file_paths=str(output_dat_path),
+        file_paths=str(partial_path),
         add_file_extension=False,
         dtype=dtype,
         verbose=True,
         **job_kwargs,
     )
+    _validate_existing_binary_size(
+        path=partial_path,
+        dtype=dtype,
+        num_channels=int(recording.get_num_channels()),
+        expected_frames=_recording_num_frames(recording),
+        label="new concatenated dat",
+    )
+    os.replace(partial_path, output_dat_path)
     return output_dat_path
 
 
@@ -983,12 +996,33 @@ def write_lfp(
         direction="forward-backward",
     )
     rec_lfp = spre.resample(rec_lfp_prefiltered, resample_rate=lfp_rate)
+    partial_path = lfp_path.with_name(f"{lfp_path.name}.partial-{uuid.uuid4().hex[:12]}")
     si.write_binary_recording(
         rec_lfp,
-        file_paths=str(lfp_path),
+        file_paths=str(partial_path),
         add_file_extension=False,
         dtype=dtype,
         verbose=True,
         **job_kwargs,
     )
+    n_channels = (
+        int(recording_raw.get_num_channels())
+        if hasattr(recording_raw, "get_num_channels")
+        else 1
+    )
+    raw_frames = _recording_num_frames(recording_raw)
+    expected_lfp_frames = (
+        int(round(float(raw_frames) * float(lfp_rate) / input_fs))
+        if raw_frames is not None and input_fs > 0
+        else None
+    )
+    _validate_existing_binary_size(
+        path=partial_path,
+        dtype=dtype,
+        num_channels=n_channels,
+        expected_frames=expected_lfp_frames,
+        frame_tolerance=1,
+        label="new lfp",
+    )
+    os.replace(partial_path, lfp_path)
     return lfp_path

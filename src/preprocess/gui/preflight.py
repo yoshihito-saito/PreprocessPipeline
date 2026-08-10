@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import tempfile
 
 import numpy as np
 from scipy.io import loadmat
@@ -9,6 +11,7 @@ from scipy.io import loadmat
 from src.preprocess.io import build_channel_map_data, find_rhd_source
 from src.preprocess.paths import resolve_project_path
 from src.preprocess.recording import _local_reference_channels_without_neighbors
+from src.execution.models import StageName
 
 from .config_model import (
     PipelineGuiSettings,
@@ -174,6 +177,19 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
     chanmap_path = settings.resolved_chanmap_path()
 
     checks.append(_check_path("Basepath", basepath, must_be_dir=True))
+    if (
+        mode in ("all", "preprocess")
+        and settings.existing_session_dir
+        and settings.preprocess_source_path is None
+    ):
+        checks.append(
+            CheckResult(
+                "Raw source provenance",
+                "warn",
+                "no readable raw basepath is recorded; completed Stages may be reused, "
+                "but a preprocess rerun will be rejected",
+            )
+        )
     if output_dir is None:
         checks.append(CheckResult("Local output", "error", "basepath is required first"))
     else:
@@ -202,28 +218,90 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
                 )
             )
 
-    if mode in ("all", "preprocess"):
-        if chanmap_path is None:
-            checks.append(CheckResult("chanMap", "warn", "not set"))
-        else:
+    if mode in ("all", "preprocess", "postprocess"):
+        workspace_text = settings.execution.workspace.strip()
+        if workspace_text:
+            workspace = Path(workspace_text).expanduser()
+            existing_parent = workspace
+            while not existing_parent.exists() and existing_parent != existing_parent.parent:
+                existing_parent = existing_parent.parent
+            writable = existing_parent.exists() and os.access(existing_parent, os.W_OK)
             checks.append(
                 CheckResult(
-                    "chanMap",
-                    "ok" if chanmap_path.exists() else "warn",
-                    str(chanmap_path) if chanmap_path.exists() else f"will be generated or expected at: {chanmap_path}",
+                    "Persistent Run workspace",
+                    "ok" if writable else "error",
+                    str(workspace) if writable else f"not creatable from: {existing_parent}",
                 )
             )
+            requested_backend = settings.execution.requested_backend.strip().lower()
+            if requested_backend != "local":
+                temp_root = Path(tempfile.gettempdir()).resolve()
+                try:
+                    obvious_local_temp = workspace.resolve().is_relative_to(temp_root)
+                except OSError:
+                    obvious_local_temp = False
+                if obvious_local_temp:
+                    checks.append(
+                        CheckResult(
+                            "Slurm workspace visibility",
+                            "warn",
+                            f"{workspace} is under node-local temporary storage; select a shared filesystem",
+                        )
+                    )
+        else:
+            checks.append(CheckResult("Persistent Run workspace", "error", "not set"))
+        for stage, resource in (
+            (StageName.PREPROCESS, settings.execution.preprocess),
+            (StageName.SORTING, settings.execution.sorting),
+            (StageName.POSTPROCESS, settings.execution.postprocess),
+        ):
+            try:
+                resource.to_resource_spec().validate(stage=stage)
+            except ValueError as exc:
+                checks.append(CheckResult(f"{stage.value} resources", "error", str(exc)))
+            else:
+                checks.append(
+                    CheckResult(
+                        f"{stage.value} resources",
+                        "ok",
+                        f"CPU={resource.cpus}, RAM={resource.memory_mb} MiB, "
+                        "walltime="
+                        + (
+                            "partition default"
+                            if resource.walltime_minutes is None
+                            else f"{resource.walltime_minutes} min"
+                        )
+                        + f", GPU={resource.gpu_count}",
+                    )
+                )
+        if mode in ("all", "preprocess"):
+            if chanmap_path is None:
+                checks.append(CheckResult("chanMap", "warn", "not set"))
+            else:
+                checks.append(
+                    CheckResult(
+                        "chanMap",
+                        "ok" if chanmap_path.exists() else "warn",
+                        str(chanmap_path) if chanmap_path.exists() else f"will be generated or expected at: {chanmap_path}",
+                    )
+                )
         local_cmr = _local_cmr_check(settings)
         if local_cmr is not None:
             checks.append(local_cmr)
-        sorter = settings.preprocess.sorter if settings.preprocess.run_sorter else None
+        sorter = (
+            settings.preprocess.sorter
+            if mode in ("all", "preprocess") and settings.preprocess.run_sorter
+            else None
+        )
         if sorter and sorter.lower() != "disabled":
             sorter_path = _repo_relative_path(settings.preprocess.sorter_path)
             sorter_config = _repo_relative_path(settings.preprocess.sorter_config_path)
             checks.append(_check_path("Sorter path", sorter_path, must_be_dir=True))
             checks.append(_check_path("Sorter config", sorter_config))
             if "kilosort" in sorter.lower() and sorter.lower() != "kilosort4":
-                matlab_text = settings.preprocess.matlab_path.strip()
+                matlab_text = (
+                    settings.execution.matlab_path or settings.preprocess.matlab_path
+                ).strip()
                 if matlab_text:
                     checks.append(_check_path("MATLAB path", Path(matlab_text).expanduser()))
                 else:
