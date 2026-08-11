@@ -1,12 +1,37 @@
 # PreprocessPipeline
 
-## Overview
+PreprocessPipeline is a GUI application for preparing extracellular electrophysiology recordings, running spike sorting, and postprocessing sorted units.
 
-PreprocessPipeline is a preprocessing and postprocessing pipeline for spike sorting and neural data analysis.
+It supports Intan and Open Ephys recordings, single-day and multi-day sessions, local or Slurm execution, Kilosort, Phy, and CellExplorer-compatible outputs.
+
+## What the pipeline does
+
+```text
+raw recordings
+    -> preprocess
+    -> spike sorting
+    -> postprocess
+    -> Phy / CellExplorer
+```
+
+- **Preprocess:** discover recordings, concatenate selected sessions, filter and reference signals, remove artifacts, export events, generate `.dat` and `.lfp`, and optionally run state scoring.
+- **Spike sorting:** run Kilosort on all channels or separately by probe or shank.
+- **Postprocess:** remove duplicate spikes, merge or split units, calculate quality metrics, and label noise clusters.
+- **Multi-day processing:** combine selected days and subepochs while preserving their order and per-recording channel metadata.
+- **Persistent execution:** run locally or through Slurm and reconnect from the GUI after it is closed.
 
 ## Installation
 
-### Windows Installation
+### Requirements
+
+- Windows or Linux
+- Git
+- Conda or Miniforge
+- A graphical display for the Qt GUI
+- MATLAB and a compatible GPU/CUDA setup when required by the selected sorter
+- Slurm client commands when submitting jobs to a Slurm cluster
+
+Clone the repository and create the environment:
 
 ```bash
 git clone https://github.com/yoshihito-saito/PreprocessPipeline.git
@@ -15,380 +40,163 @@ python scripts/setup_env.py
 conda activate preprocess
 ```
 
-To rebuild the environment from scratch:
+To recreate the environment from scratch:
 
 ```bash
 python scripts/setup_env.py --force-recreate
 conda activate preprocess
 ```
 
-### Linux Installation
-
-```bash
-git clone https://github.com/yoshihito-saito/PreprocessPipeline.git
-cd PreprocessPipeline
-python scripts/setup_env.py
-conda activate preprocess
-```
-
-To rebuild the environment from scratch:
-
-```bash
-python scripts/setup_env.py --force-recreate
-conda activate preprocess
-```
-
-## Run GUI
-
-The GUI provides basepath selection, preprocess/postprocess settings, `chanMap.mat` preview, preflight checks, run buttons, and pipeline logs.
-
-Recommended command:
+## Start the GUI
 
 ```bash
 conda activate preprocess
 preprocess-gui
 ```
 
-The command starts the standalone Qt desktop GUI. It requires a working display
-server, for example a local desktop session, X forwarding, or a VS Code remote
-display setup.
+The GUI requires a local desktop, X forwarding, or another working remote display setup.
 
-## Persistent Local and Slurm Runs
+## Quick start
 
-Configure scientific parameters under **Ephys > Preprocess** and
-**Ephys > Postprocess**, then use **Ephys > Run** to run the standard raw-data
-workflow as persistent Stages:
+### Single-day session
 
-```text
-preprocess -> sorting -> postprocess
-```
+1. Click **Browse basepath** at the top of the window.
+2. Select the raw recording directory.
+3. Click **Browse local** and select a **Local working dir** for temporary and processed output.
+4. Under **Ephys > Preprocess**, review the channel map and configure preprocessing and Sorting.
+5. Configure unit processing under **Ephys > Postprocess** when needed.
+6. Open **Ephys > Run**, select **Local** or **Slurm**, and set Stage resources.
+7. Click **Run all**, **Preprocess only**, or **Postprocess only**.
 
-Each Run is stored under `<Local working dir>/.pipeline/<run-id>/`. The directory holds
-the immutable analysis snapshot, execution resources, provenance, per-Attempt
-specifications, logs, backend job IDs, results, failures, and a regenerable
-`state.json`. Keep this directory; it is the recovery and audit record.
+### Multi-day session
 
-Local execution uses detached workers. Closing the GUI does not cancel the Run.
-When the same session is selected after reopening the GUI, its active-Run claim
-reconnects the compact **Ephys > Run** status automatically. Slurm also uses the
-same Stage worker, submitted through one `sbatch` job per Attempt with `afterok`
-dependencies. New Stage stdout/stderr and Kilosort progress are mirrored into
-the main GUI Log while the persistent files remain the complete audit record.
+1. Click **Browse for multi-days** at the top of the window and select the day directories in processing order.
+2. Select the subepochs to include from each day.
+3. Enter a unique **Multi-day name**.
+4. Review the common channel map and processing settings.
+5. Start the Run from **Ephys > Run**.
 
-To reopen an existing Local output without browsing the file server again, use
-**Browse local session to resume** and select the scientific session directory,
-for example `sorting_temp/RM018_day33_260611` or
-`sorting_temp/multiday_Day14_to_Day217`. This action is shared by single-day and
-multi-day sessions. Do not select the hidden `.pipeline` directory or a
-`Kilosort_*` folder. The GUI restores the saved source paths, multi-day order and
-subepoch selection, scientific settings, backend, and Stage resources. An
-active or failed persistent Run is reconnected and reconciled; a completed
-session is restored from `preprocess_run.yaml`. Browsing never submits or retries
-a job, changes overwrite, or modifies immutable analysis settings.
+Only selected subepochs contribute acquisition data and input provenance. Changes in unselected sibling recordings do not invalidate an otherwise compatible resume.
 
-**Load config** opens the `config/` directory of the installed or editable
-PreprocessPipeline project by default, independent of the shell working
-directory used to launch the GUI.
+### Run button behavior
 
-Backend selection is strict:
+- **Run all:** preprocess, run Sorting when enabled, and then postprocess.
+- **Preprocess only:** preprocess and also run Sorting when `run_sorter` is enabled.
+- **Postprocess only:** postprocess an existing Kilosort/Phy result.
 
-- With no explicitly saved backend choice, an environment with the required
-  Slurm client commands initially selects explicit **Slurm**. Other environments
-  initially select **Auto**. A saved backend choice is preserved. A temporary
-  scheduler outage therefore reports a Slurm error instead of silently changing
-  this server default into a Local run.
-- **Auto** uses Slurm only when the configured capability checks pass before any
-  submission; otherwise it resolves to Local.
-- **Local** never depends on Slurm commands.
-- **Slurm** reports an error when Slurm is unavailable. It never silently starts
-  the analysis locally.
-- An ambiguous `sbatch` outcome is recorded as `lost`, not as an ordinary
-  retryable failure, and is never retried locally.
+## Main preprocess parameters
 
-For Slurm, the Local working directory, input data, sorter installation, and
-output paths must be visible from the compute node. The **Run** page requests
-independent **CPU cores** and host **Memory (GiB)** for every Stage. Preprocess
-and postprocess request no GPU; Sorting requests exactly one untyped GPU and
-shows `1 (auto)`. The GPU device ID is intentionally not selectable: Slurm
-chooses an available device when the job starts and exposes it to the worker.
-CPU values are exact requests and are not capped by the GUI host's CPU count.
+Channel indices shown in the GUI and configuration are **0-based** unless stated otherwise. CellExplorer channel values saved to MATLAB files are 1-based.
 
-GUI-created Runs always use the partition walltime default and omit the Slurm
-`--time` directive. On this cluster's `regular` partition,
-`DefaultTime=NONE`/`MaxTime=UNLIMITED`, so the effective limit is unlimited.
-The execution model and CLI retain explicit walltime support for scripted or
-backward-compatible use. Resources are released as soon as the Stage exits; a
-hung Run can be cancelled with the single bottom **Force stop** button.
+| Group | Main parameters | Purpose |
+|---|---|---|
+| Signal processing | `do_preprocess`, `bandpass_min_hz`, `bandpass_max_hz` | Enable spike-band filtering and set its frequency range. |
+| Reference | `reference`, `local_radius_um` | Select the reference method and local-reference radius. |
+| Channels | `chanmap_mat_path`, `reject_channels`, `bad_channels`, `zero_bad` | Define probe geometry and exclude or zero unwanted channels. |
+| TTL artifacts | `artifact_TTL_channel`, `artifact_TTL_ms_before`, `artifact_TTL_ms_after`, `artifact_TTL_mode` | Remove stimulation artifacts around selected TTL edges. |
+| High-amplitude artifacts | `highamp_threshold_sigma`, `highamp_ms_before`, `highamp_ms_after`, `highamp_mode` | Detect and remove unusually large signal windows. |
+| LFP | `make_lfp`, `lfp_fs` | Generate a downsampled `.lfp` output. |
+| State scoring | `state_score`, `sw_channels`, `theta_channels` | Generate EMG, sleep-score LFP, sleep states, episodes, and diagnostic figures. |
+| Events | `analog_inputs`, `digital_inputs` | Export available analog and digital event data. |
+| Sorting | `sorter`, `sorter_config_path`, `sorter_partition_mode` | Select the sorter, its configuration, and all/probe/shank partitioning. |
+| Existing output | `overwrite` | Reuse compatible outputs when disabled; explicitly rebuild outputs when enabled. |
 
-The persistent workspace is derived automatically from Local working dir, and
-each Slurm script checks that it is readable and writable on its assigned
-compute node before starting the worker. Paths under the system temporary
-directory still produce a preflight warning.
+Artifact windows are specified in milliseconds, frequencies in hertz, and local-reference radii in micrometers. TTL channels, state-scoring channels, rejected channels, and alternate sorter partitions use 0-based indices.
 
-Cancellation is explicit and preserves logs and partial outputs. The GUI's
-**Force stop** cancels every active Local/Slurm Stage in the current Run. Stage
-cancel, Attempt retry, manual reconcile, and resume remain controller/CLI
-recovery operations rather than normal GUI controls. A new GUI Run reuses
-compatible completed Stages and creates immutable Attempts from the first Stage
-that must run; it never overwrites prior Attempt records or silently changes
-scientific settings. A Stage is complete only after its expected outputs pass
-validation.
+## Main postprocess parameters
 
-The saved overwrite choice is authoritative inside every worker. With
-**overwrite disabled**, preprocess validates and reuses compatible canonical
-suboutputs independently: acquisition sidecars and events, artifact events,
-`.dat`, `.lfp`, MergePoints, `session.mat`, and state-scoring MAT/figure files.
-Only missing descendants are created. For example, a Run interrupted during
-state scoring can retain a validated artifact scan, `.dat`, `.lfp`, session,
-and EMG result and continue with the missing sleep-state outputs. An existing
-corrupt or configuration-incompatible target causes a fail-closed error naming
-that path; it is never silently replaced. **Overwrite enabled** is the explicit
-request to rebuild or version applicable outputs.
+| Group | Main parameters | Purpose |
+|---|---|---|
+| Input | `sorting_phy_folder`, `exclude_cluster_groups` | Select a Kilosort/Phy folder and omit groups such as `noise` or `mua`. |
+| Optional filtering | `apply_preprocess`, `bandpass_min_hz`, `bandpass_max_hz`, `reference` | Apply filtering/reference while constructing the postprocess recording. |
+| Duplicate removal | `duplicate_censored_period_ms`, `duplicate_threshold`, `remove_strategy` | Detect and remove duplicate spikes. |
+| Merge | `merge_min_spikes`, `merge_corr_diff_thresh`, `merge_template_diff_thresh` | Merge likely fragments of the same unit. |
+| Autosplit | `split_contamination`, `split_wf_threshold`, `split_amp_mad_scale` | Split feature outliers while retaining waveform-compatible spikes. |
+| Metrics | `metric_names`, `template_metric_names` | Choose unit quality and waveform metrics. |
+| Noise labeling | `noise_thresholds`, `noise_label_only` | Label clusters using firing rate, ISI, presence ratio, SNR, and amplitude rules. |
+| Existing output | `overwrite` | Reuse a complete output when disabled or replace/version it when enabled. |
 
-The existing **Basepath** field may also point directly to a processed session,
-for example `sorting_temp/RM018_day33_260611`. The GUI keeps using that directory
-as the scientific output directory and recovers the original raw-data path from
-`preprocess_run.yaml` or legacy preprocess metadata. With overwrite disabled,
-compatible and deeply validated Stages are reused; execution restarts at the
-first incomplete, invalid, or parameter-incompatible Stage. With overwrite
-enabled, the requested Stage scope is recomputed. A partial processed folder
-whose raw-data source cannot be recovered is rejected before a preprocess rerun.
-For a multi-day Run with explicit subepoch selections, acquisition provenance
-recursively tracks only those selected subepochs; files in unselected sibling
-recordings do not invalidate reuse.
-Large state-scoring intermediates retain the same `SleepScoreLFP` MATLAB
-structure but are stored as MATLAB v7.3/HDF5 when the v5 format cannot represent
-the payload. Ordinary-sized MAT outputs remain v5.
+Autosplit first identifies feature outliers and then applies waveform and amplitude gates. Noise thresholds ending in `_lt` reject values below the threshold; thresholds ending in `_gt` reject values above it. When both ISI ratio and count thresholds are configured, both conditions must be met to label the unit as noise.
 
-The bottom **Move outputs to storage** action shows its destination before
-moving, including the move/retain/delete inventory and byte counts. A
-single-day Run defaults to Basepath. A multi-day Run defaults to a
-new sibling directory named from **Multi-day name**
-(`<Basepath parent>/<Multi-day name>`), keeping combined output out of the first
-raw day. **Browse save dir** selects an exact existing destination and updates
-the displayed Basepath; the Local source resolved before that selection remains
-the move source. Files are copied into destination-side staging, validated,
-published, and only then removed from Local. Relocated Run metadata is rewritten
-to the new session path. A custom destination receives required XML/RHD metadata
-before cleanup. The existing `.dat`, overwrite, and clean-Local options still
-control which files are moved and whether retained Local files are removed.
+Settings can be saved and restored with **Save config** and **Load config**. **Load config** opens this repository's `config/` directory by default.
 
-Only one persistent Run may mutate a processed session at a time, even when two
-controllers use different Run workspaces. **Run all**, **Preprocess only**, and
-**Postprocess only** are available only on the Run page and all use persistent
-Local/Slurm execution. Phy and
-CellExplorer remain interactive Local applications, do not request a Slurm job
-or GPU, and are blocked while that session has an active persistent Run. Legacy
-noise labeling uses the same session claim, so it cannot race a persistent
-postprocess. **Preprocess only** retains its established meaning: when
-`run_sorter` is enabled, Sorting is also submitted after preprocess succeeds.
-Conclusive terminal backend failures such as Slurm `OUT_OF_MEMORY` release this
-exclusion even if the killed worker could not write its final failure fact, so a
-Run button may create a new Run with updated resources while preserving the
-failed Run as history. Running, submitted, lost, ambiguous, and unknown backend
-outcomes continue to block replacement to prevent duplicate execution.
+## Local and Slurm execution
 
-The visible successful-session record is intentionally compact:
+Runs can execute locally or be submitted to Slurm from **Ephys > Run**. For Slurm, set CPU and memory separately for each Stage; Sorting requests one GPU when required. Input data, output directories, MATLAB, and sorter installations must be visible from the compute node.
+
+Closing the GUI does not cancel a persistent Run. **Force stop** requests cancellation of all active Stages in the current Run.
+
+Run metadata, scheduler job IDs, logs, results, and failures are stored under:
 
 ```text
-<session>/preprocess_run.yaml
-<session>/preprocess.log
-<session>/sorter_partition_manifest.json       # when partitioned sorting is used
-<session>/Kilosort_<timestamp>/kilosort.log
-<session>/Kilosort_<timestamp>/sorter_config_resolved.yaml
+<local-working-directory>/.pipeline/<run-id>/
 ```
 
-`preprocess_run.yaml` records the exact analysis parameters, execution
-resources, input/code/environment provenance, Stage timings, scheduler job IDs,
-terminal telemetry, validation, and warning/error summary. `preprocess.log` is
-the consolidated human-readable Run log. Persistent Runs do not generate
-`preprocessSession.log`; successful finalization retains Stage stdout/stderr,
-sorter source/helper files, the exact submitted `job.sbatch`, and submission
-intent in the hidden Run record. Failed, cancelled, ambiguous, lost, and
-successful Runs therefore retain their complete diagnostics under
-`<Local working dir>/.pipeline/<run-id>/`.
+Keep this directory while a Run may need to be inspected or resumed.
 
-Large `.dat` and `.lfp` outputs are published by same-filesystem atomic replace,
-so a failed rewrite does not replace the previous valid file. Sorting reruns use
-a new timestamped Kilosort directory, and an in-progress partition manifest does
-not replace the last completed canonical manifest. Postprocess overwrite
-versions every prior
-`*_spi` directory before recomputation, so an interrupted replacement cannot
-destroy a valid result; `.phy` and `phy.log` remain preserved with it.
+## Resume an existing session
 
-On POSIX, every Kilosort Attempt uses its own immutable shim, startup file, and
-MATLAB Processes job-storage directory. The generated startup runs only in the
-parent MATLAB process, so concurrent or previously interrupted Attempts do not
-share configuration or a MATLAB job queue.
+Click **Browse local session to resume** and select the processed session directory, for example:
 
-An Attempt whose scheduler outcome is `lost` or ambiguous is not offered for
-normal retry: investigate the scheduler first, because submitting a replacement
-could duplicate a job that Slurm actually accepted. Both whole-Run cancellation
-and cancellation from a selected Stage (including downstream Attempts) are
-available.
-
-The controller and worker are also available directly:
-
-```bash
-preprocess-run-controller --help
-preprocess-stage-worker --help
+```text
+sorting_temp/RM018_day33_260611
+sorting_temp/multiday_Day14_to_Day217
 ```
 
+Select the session directory itself, not `.pipeline/` or a `Kilosort_*` directory. The GUI restores the raw source paths, selected subepochs, scientific settings, execution backend, and Stage resources. Browsing does not submit a job or change `overwrite`.
 
-## Phy2
+With `overwrite=False`, compatible completed outputs are validated and reused. Missing outputs are generated where safe. An incompatible or untrusted existing output causes the Run to stop before replacing it.
 
-Install this for curate sorting results in the Phy GUI.
+## Main outputs
+
+Depending on the enabled options, a processed session contains:
+
+```text
+<session>/
+|-- <basename>.dat
+|-- <basename>.lfp
+|-- <basename>.session.mat
+|-- <basename>.MergePoints.events.mat
+|-- <basename>.artifactTTL.events.mat
+|-- <basename>.artifactHigh.events.mat
+|-- <basename>.SleepScoreLFP.LFP.mat
+|-- <basename>.SleepState.states.mat
+|-- preprocess_run.yaml
+|-- preprocess.log
+`-- Kilosort_<timestamp>/
+```
+
+Very large `SleepScoreLFP` outputs use MATLAB v7.3/HDF5 when they exceed the MATLAB v5 format limit. Ordinary MAT outputs remain in v5 format.
+
+Use **Move outputs to storage** to copy selected outputs from the Local working directory to their final destination. The GUI displays which files will be moved, retained, or deleted before starting.
+
+## Optional tools
+
+### Phy
+
+Install Phy in the environment used to launch the GUI:
 
 ```bash
 pip install git+https://github.com/cortex-lab/phy.git
 ```
 
-### Phy2 Plugins
+The GUI can launch Phy after Sorting. Optional plugins are available from [phy2-plugins](https://github.com/petersenpeter/phy2-plugins).
 
-Install this to use the Phy plugin workflow.
+### MATLAB and Kilosort1
 
-1. Download the plugins from `https://github.com/petersenpeter/phy2-plugins`.
-2. Copy the `plugins` folder to your Phy config directory.
-   Linux/macOS: `~/.phy`
-   Windows: `%USERPROFILE%\\.phy`
-3. Copy `tempdir.py` from this repository's `plugins` directory into `*YourPhyDirectory*/phy/utils`.
-4. If you use KlustaKwik on Windows, install `Visual C++ Redistributable for Visual Studio 2013`.
-   x64: `https://www.microsoft.com/en-us/download/details.aspx?id=40784`
-
-### MATLAB
-
-Install MATLAB separately.
-
-## Kilosort1 MATLAB/CUDA Compilation
-
-### Windows
-
-1. Install Visual Studio 2022 with `MSVC v143 - VS 2022 C++ x64/x86 build tools (v14.36-17.6)`.
-2. In MATLAB, go to `sorter/KiloSort1/CUDA`.
-3. Run:
+Install MATLAB separately. Kilosort1 may require compiling its CUDA functions from MATLAB:
 
 ```matlab
 cd(fullfile('<PreprocessPipeline repo root>', 'sorter', 'KiloSort1', 'CUDA'))
 mexGPUall
 ```
 
-### Linux
+On Windows, install a compatible Visual Studio C++ build toolchain before compiling CUDA code.
 
-1. In MATLAB, go to `sorter/KiloSort1/CUDA`.
-2. Run:
+## Current limitations
 
-```matlab
-cd(fullfile('<PreprocessPipeline repo root>', 'sorter', 'KiloSort1', 'CUDA'))
-mexGPUall
-```
+The Python pipeline does not yet implement:
 
-## Workflow
-
-### Setup and Configuration
-
-- Select Data: Choose the folder containing raw recording files.
-- Map Channels: Define probe geometry and exclude known bad channels.
-- Set Parameters: Configure filtering, artifact removal rules, and spike sorting options.
-
-### Data Preparation
-
-- Merge Files: Discover and concatenate raw `.dat` files across subsessions.
-- Extract Events: Export analog, digital, and TTL event timestamps.
-
-### Signal Processing
-
-- Filter: Apply bandpass filtering and Common Median Reference (CMR).
-- Remove Artifacts: Detect and remove TTL stimulation artifacts and high-amplitude noise windows.
-
-### Output and Analysis
-
-- Save Clean Data: Export the cleaned continuous `.dat` and downsampled `LFP` files.
-- State Scoring: Optionally run sleep/wake state scoring.
-- Spike Sorting: Run Kilosort (or another sorter) to extract unit candidates.
-
-### Post-Processing
-
-- Refine Sorting: Clean sorting outputs by removing duplicate spikes, merging fragmented units, splitting outliers, and labeling noisy units.
-
-## Artifact Removal
-
-- TTL artifact removal: `remove_artifact_TTL=True`
-- TTL channel selection: `artifact_TTL_channel` (0-based `[0..15]`)
-- TTL edge behavior:
-  - default: rising edges only (`digitalIn.timestampsOn`; `artifact_TTL_include_offset=False`)
-  - include falling edges: `artifact_TTL_include_offset=True` (`timestampsOn + timestampsOff`)
-- TTL cleaning params: `artifact_TTL_ms_before`, `artifact_TTL_ms_after`, `artifact_TTL_mode`, `artifact_TTL_by_group`
-- High-amplitude artifact removal: `remove_highamp_artifact=True`
-- High-amplitude params: `highamp_*`, `highamp_ms_before`, `highamp_ms_after`, `highamp_mode`, `highamp_remove_by_group`
-- Config index inputs are 0-based: `artifact_TTL_channel`, `sw_channels`, `theta_channels`, `reject_channels`, `alt_sort`
-- Output files:
-  - `basename.artifactTTL.events.mat`
-  - `basename.artifactHigh.events.mat`
-
-## Autosplit
-
-Autosplit first identifies outlier spike candidates from PCA features using Mahalanobis distance. A waveform rescue step is then applied only to those candidates.
-
-- Main idea:
-  - candidate spikes are rescued only when waveform shape is similar to the clean template
-  - and their best-channel PTP amplitude stays within `median(clean_amp) +/- split_amp_mad_scale * MAD(clean_amp)`
-- Main parameter:
-  - `split_amp_mad_scale = 10.0`
-  - smaller values are stricter and keep more splits
-
-Related autosplit settings in the notebook include `split_contamination`, `split_threshold_mode`, `split_wf_threshold`, `split_wf_n_chans`, and `split_amp_mad_scale`.
-
-## Postprocess Metrics and Noise Rules
-
-- `quality_metrics`:
-  - `firing_rate`
-  - `isi_violation`
-  - `presence_ratio`
-  - `snr`
-  - `amplitude_median`
-- `template_metrics`:
-  - `peak_to_valley`
-  - `peak_trough_ratio`
-  - `half_width`
-  - `repolarization_slope`
-  - `recovery_slope`
-  - `slope = min(abs(repolarization_slope), abs(recovery_slope)) / 1000` (`uV/ms`)
-
-Noise thresholds:
-
-- `isi_violations_ratio_gt = 5.0`
-  - Exclude units with an excessively high refractory-period violation ratio.
-- `isi_violations_count_gt = 50.0`
-  - Exclude units with too many absolute refractory-period violations.
-  - When both `isi_violations_ratio_gt` and `isi_violations_count_gt` are set, the unit is marked as noise only if both thresholds are exceeded.
-- `presence_ratio_lt = 0.1`
-  - Exclude units with too little presence across the full recording.
-- `snr_lt = 2.0`
-  - Exclude units with low SNR and poorly separated waveforms.
-- `amplitude_median_lt = 5.0`
-  - Exclude units whose absolute median spike amplitude is too small.
-- `amplitude_median_gt = 2000.0`
-  - Exclude likely artifacts whose absolute median spike amplitude is too large.
-- `firing_rate_lt = 0.01`
-  - Exclude units with firing rate that is too low.
-
-Waveform-shape thresholds are computed for review, but they are not used for
-the default noise decision.
-
-## Python Implementation Status
-
-- [x] `session` metafile (`basename.session.mat`)
-- [x] `MergePoints` metafile (`basename.MergePoints.events.mat`)
-- [x] Concatenate `.dat` files (`basename.dat`) across multiple sessions
-- [x] Analog/Digital input processing (`analogin.dat`, `digitalin.dat`, `*.events.mat`) (needs double-check)
-- [x] LFP extraction (exact sample-level parity)
-- [x] Bad-channel handling (sorting target channels and output channel maps)
-- [x] Artifact removal (`remove_artifact_TTL`, `remove_highamp_artifact`)
-- [ ] Denoise (`removeNoise`)
-- [x] State scoring
-- [x] Spike sorting
-- [ ] Open Ephys `analog_inputs` support (currently TTL/digital only; no analog event export path)
-- [ ] Acceleration extraction (`getAcceleration` / `computeIntanAccel`)
-- [ ] Tracking/DLC (`getPos`, `path_to_dlc_bat_file`, `general_behavior_file`)
-- [ ] Session summary (`runSummary` / `sessionSummary`)
-- [ ] Concatenation option (`fillMissingDatFiles`)
+- Open Ephys analog-event export
+- acceleration extraction
+- session-summary generation
