@@ -156,6 +156,9 @@ whose raw-data source cannot be recovered is rejected before a preprocess rerun.
 For a multi-day Run with explicit subepoch selections, acquisition provenance
 recursively tracks only those selected subepochs; files in unselected sibling
 recordings do not invalidate reuse.
+Large state-scoring intermediates retain the same `SleepScoreLFP` MATLAB
+structure but are stored as MATLAB v7.3/HDF5 when the v5 format cannot represent
+the payload. Ordinary-sized MAT outputs remain v5.
 
 The bottom **Move outputs to storage** action shows its destination before
 moving, including the move/retain/delete inventory and byte counts. A

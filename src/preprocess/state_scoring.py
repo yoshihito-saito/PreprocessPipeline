@@ -2604,11 +2604,11 @@ def run_state_scoring(
             f"ancestor {missing} is missing or unrequested with overwrite=False"
         )
     if not config.overwrite and all(path.exists() for path in required_outputs):
-        validate_mat_output(emg_path, "EMGFromLFP")
-        validate_mat_output(sleep_state_path, "SleepState")
-        validate_mat_output(episodes_path, "SleepStateEpisodes")
+        validate_mat_output(emg_path, "EMGFromLFP", load_payload=False)
+        validate_mat_output(sleep_state_path, "SleepState", load_payload=False)
+        validate_mat_output(episodes_path, "SleepStateEpisodes", load_payload=False)
         if config.state_save_lfp_mat:
-            validate_mat_output(sleep_lfp_path, "SleepScoreLFP")
+            validate_mat_output(sleep_lfp_path, "SleepScoreLFP", load_payload=False)
         invalid_figure = next((p for p in fig_paths if not p.is_file() or p.stat().st_size == 0), None)
         if invalid_figure is not None:
             raise ValueError(f"Invalid existing state-score figure with overwrite=False: {invalid_figure}")

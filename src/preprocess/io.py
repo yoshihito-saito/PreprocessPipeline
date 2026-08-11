@@ -17,6 +17,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 from scipy.io import loadmat, savemat
+from scipy.io.matlab import MatWriteError
 
 from .intan_rhd import IntanRhdHeader, read_intan_rhd_header
 from .metafile import (
@@ -66,8 +67,213 @@ def atomic_write_path(
     return target
 
 
-def validate_mat_output(path: Path, required_key: str) -> dict:
+_MAT_V5_SAFE_PAYLOAD_BYTES = (2**31) - (64 * 1024**2)
+
+
+def _mat_payload_nbytes(value: object) -> int:
+    if isinstance(value, dict):
+        return sum(_mat_payload_nbytes(item) for item in value.values())
+    if isinstance(value, str):
+        return len(value.encode("utf-16-le"))
+    try:
+        return int(np.asarray(value).nbytes)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _matlab_class_for_dtype(dtype: np.dtype) -> str:
+    dtype = np.dtype(dtype)
+    if dtype.kind == "b":
+        return "logical"
+    if dtype.kind == "f":
+        return "single" if dtype.itemsize == 4 else "double"
+    if dtype.kind in {"i", "u"}:
+        return dtype.name
+    raise TypeError(f"Unsupported MATLAB v7.3 numeric dtype: {dtype}")
+
+
+def _write_mat73_fields_attribute(group, field_names: list[str]) -> None:
+    import h5py
+
+    field_dtype = h5py.vlen_dtype(np.dtype("S1"))
+    fields = np.empty((len(field_names),), dtype=object)
+    for index, name in enumerate(field_names):
+        fields[index] = np.frombuffer(name.encode("ascii"), dtype="S1")
+    group.attrs.create("MATLAB_fields", fields, dtype=field_dtype)
+
+
+def _write_mat73_value(parent, name: str, value: object) -> None:
+    if isinstance(value, dict):
+        group = parent.create_group(name)
+        group.attrs["MATLAB_class"] = np.bytes_("struct")
+        group.attrs["H5PATH"] = np.bytes_(parent.name)
+        field_names = list(value)
+        _write_mat73_fields_attribute(group, field_names)
+        for field_name in field_names:
+            _write_mat73_value(group, field_name, value[field_name])
+        return
+
+    if isinstance(value, str):
+        array = np.fromiter((ord(char) for char in value), dtype=np.uint16).reshape(1, -1)
+        dataset = parent.create_dataset(name, data=array.T)
+        dataset.attrs["MATLAB_class"] = np.bytes_("char")
+        dataset.attrs["MATLAB_int_decode"] = np.int64(2)
+        dataset.attrs["H5PATH"] = np.bytes_(parent.name)
+        return
+
+    array = np.asarray(value)
+    if array.ndim == 0:
+        array = array.reshape(1, 1)
+    matlab_class = _matlab_class_for_dtype(array.dtype)
+    if matlab_class == "logical":
+        array = array.astype(np.uint8, copy=False)
+    if array.size == 0:
+        dataset = parent.create_dataset(
+            name,
+            data=np.asarray(array.shape, dtype=np.uint64),
+        )
+        dataset.attrs["MATLAB_empty"] = np.uint8(1)
+    else:
+        stored = np.transpose(array, axes=tuple(reversed(range(array.ndim))))
+        options: dict[str, object] = {}
+        if array.nbytes >= 1024**2:
+            options.update(compression="gzip", compression_opts=4, shuffle=True)
+        dataset = parent.create_dataset(name, data=stored, **options)
+    dataset.attrs["MATLAB_class"] = np.bytes_(matlab_class)
+    dataset.attrs["H5PATH"] = np.bytes_(parent.name)
+
+
+def _write_mat73(path: Path, payload: dict) -> None:
+    import h5py
+
+    with h5py.File(path, "w", userblock_size=512) as handle:
+        for name, value in payload.items():
+            _write_mat73_value(handle, str(name), value)
+        handle.flush()
+    description = (
+        "MATLAB 7.3 MAT-file, Platform: GLNXA64, Created on: "
+        f"{datetime.now().strftime('%a %b %d %H:%M:%S %Y')} HDF5 schema 1.00 ."
+    )
+    header = description.encode("ascii")[:116].ljust(116, b" ")
+    header += b"\x00" * 8 + b"\x00\x02IM"
+    with Path(path).open("r+b") as stream:
+        stream.write(header)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _read_mat73_value(node) -> object:
+    import h5py
+
+    if isinstance(node, h5py.Group):
+        return {name: _read_mat73_value(child) for name, child in node.items()}
+    matlab_class = node.attrs.get("MATLAB_class", b"")
+    if isinstance(matlab_class, bytes):
+        matlab_class = matlab_class.decode("ascii", errors="replace")
+    if int(node.attrs.get("MATLAB_empty", 0)):
+        shape = tuple(int(value) for value in np.asarray(node).reshape(-1))
+        dtype = np.float64 if matlab_class == "double" else np.dtype(str(matlab_class))
+        return np.empty(shape, dtype=dtype)
+    array = np.asarray(node)
+    if array.ndim:
+        array = np.transpose(array, axes=tuple(reversed(range(array.ndim))))
+    if matlab_class == "char":
+        return "".join(chr(int(value)) for value in array.reshape(-1))
+    if matlab_class == "logical":
+        return array.astype(bool, copy=False)
+    return array
+
+
+def _decode_mat73_class(node) -> str:
+    value = node.attrs.get("MATLAB_class", b"")
+    if isinstance(value, bytes):
+        return value.decode("ascii", errors="replace")
+    return str(value)
+
+
+def _decode_mat73_fields(value: object) -> list[str]:
+    fields: list[str] = []
+    for item in np.asarray(value, dtype=object).reshape(-1):
+        chars = np.asarray(item).reshape(-1)
+        fields.append(b"".join(bytes(char) for char in chars).decode("ascii"))
+    return fields
+
+
+def _validate_mat73_node(node) -> None:
+    import h5py
+
+    matlab_class = _decode_mat73_class(node)
+    if isinstance(node, h5py.Group):
+        if matlab_class != "struct":
+            raise ValueError(f"group {node.name} is not a MATLAB struct")
+        if "MATLAB_fields" not in node.attrs:
+            raise ValueError(f"struct {node.name} has no MATLAB_fields metadata")
+        fields = _decode_mat73_fields(node.attrs["MATLAB_fields"])
+        if fields != list(node.keys()):
+            # HDF5 iterates children lexically while MATLAB_fields preserves
+            # struct order, so compare membership separately from ordering.
+            if set(fields) != set(node.keys()):
+                raise ValueError(f"struct {node.name} field metadata do not match datasets")
+        for child in node.values():
+            _validate_mat73_node(child)
+        return
+
+    supported = {
+        "char", "logical", "double", "single",
+        "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64",
+    }
+    if matlab_class not in supported:
+        raise ValueError(f"dataset {node.name} has unsupported MATLAB_class {matlab_class!r}")
+    if int(node.attrs.get("MATLAB_empty", 0)):
+        dimensions = np.asarray(node).reshape(-1)
+        if node.dtype != np.dtype(np.uint64) or np.any(dimensions < 0):
+            raise ValueError(f"dataset {node.name} has invalid MATLAB empty dimensions")
+        return
+    if matlab_class == "char" and node.dtype != np.dtype(np.uint16):
+        raise ValueError(f"dataset {node.name} has invalid MATLAB char dtype")
+    if matlab_class == "logical" and node.dtype not in {np.dtype(np.uint8), np.dtype(bool)}:
+        raise ValueError(f"dataset {node.name} has invalid MATLAB logical dtype")
+    if matlab_class not in {"char", "logical"}:
+        expected = np.dtype(matlab_class)
+        if node.dtype.kind != expected.kind or node.dtype.itemsize != expected.itemsize:
+            raise ValueError(f"dataset {node.name} dtype does not match MATLAB_class")
+    if node.size:
+        first = tuple(0 for _ in node.shape)
+        node[first]
+        last = tuple(size - 1 for size in node.shape)
+        if last != first:
+            node[last]
+
+
+def validate_mat_output(
+    path: Path, required_key: str, *, load_payload: bool = True
+) -> dict:
     """Load a MATLAB output and require its producer's top-level payload."""
+    try:
+        import h5py
+
+        is_hdf5 = h5py.is_hdf5(path)
+    except (ImportError, OSError):
+        is_hdf5 = False
+    if is_hdf5:
+        try:
+            with h5py.File(path, "r") as handle:
+                if required_key not in handle:
+                    raise ValueError(
+                        f"MAT output {path} does not contain required "
+                        f"{required_key!r} payload"
+                    )
+                _validate_mat73_node(handle[required_key])
+                value = (
+                    _read_mat73_value(handle[required_key])
+                    if load_payload
+                    else None
+                )
+        except Exception as exc:
+            if isinstance(exc, ValueError) and "does not contain required" in str(exc):
+                raise
+            raise ValueError(f"Invalid MATLAB v7.3 output {path}: {exc}") from exc
+        return {required_key: value}
     try:
         loaded = loadmat(path, simplify_cells=True)
     except Exception as exc:
@@ -78,11 +284,37 @@ def validate_mat_output(path: Path, required_key: str) -> dict:
 
 
 def atomic_savemat(path: Path, payload: dict, *, required_key: str) -> Path:
+    use_v73 = _mat_payload_nbytes(payload) > _MAT_V5_SAFE_PAYLOAD_BYTES
+
+    def writer(temporary: Path) -> None:
+        if use_v73:
+            _write_mat73(temporary, payload)
+            return
+        try:
+            savemat(temporary, payload, do_compression=True)
+        except MatWriteError as exc:
+            if "too large" not in str(exc).lower():
+                raise
+            _write_mat73(temporary, payload)
+
     return atomic_write_path(
         path,
-        lambda temporary: savemat(temporary, payload, do_compression=True),
-        validator=lambda temporary: validate_mat_output(temporary, required_key),
+        writer,
+        validator=lambda temporary: validate_mat_output(
+            temporary,
+            required_key,
+            load_payload=not h5py_is_hdf5(temporary),
+        ),
     )
+
+
+def h5py_is_hdf5(path: Path) -> bool:
+    try:
+        import h5py
+
+        return bool(h5py.is_hdf5(path))
+    except (ImportError, OSError):
+        return False
 
 
 def atomic_write_json(path: Path, payload: object) -> Path:

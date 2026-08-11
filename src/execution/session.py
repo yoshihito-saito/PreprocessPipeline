@@ -537,9 +537,7 @@ def validate_output_inventory(inventory: dict[str, Any], *, label: str) -> list[
                 fail(role, path, f"invalid XML: {exc}")
         elif suffix == ".mat":
             try:
-                from scipy.io import loadmat
-
-                loaded = loadmat(path, simplify_cells=True)
+                from src.preprocess.io import validate_mat_output
             except Exception as exc:
                 fail(role, path, f"invalid MAT payload: {exc}")
             required_key = {
@@ -563,10 +561,20 @@ def validate_output_inventory(inventory: dict[str, Any], *, label: str) -> list[
                     required_key = "artifactTTL"
                 elif ".artifactHigh.events." in name:
                     required_key = "artifactHigh"
-            if required_key is not None and required_key not in loaded:
-                fail(role, path, f"missing MAT key {required_key!r}")
-            if required_key is None and not any(not str(key).startswith("__") for key in loaded):
-                fail(role, path, "MAT payload has no public data")
+            if required_key is not None:
+                try:
+                    validate_mat_output(path, required_key, load_payload=False)
+                except ValueError as exc:
+                    fail(role, path, f"invalid MAT payload: {exc}")
+            else:
+                try:
+                    from scipy.io import loadmat
+
+                    loaded = loadmat(path, simplify_cells=True)
+                except Exception as exc:
+                    fail(role, path, f"invalid MAT payload: {exc}")
+                if not any(not str(key).startswith("__") for key in loaded):
+                    fail(role, path, "MAT payload has no public data")
         elif suffix == ".npy":
             try:
                 np.load(path, mmap_mode="r", allow_pickle=False)
