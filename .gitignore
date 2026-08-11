@@ -49,6 +49,4 @@ config/preprocess_gui_default_config.local.json
 config/preprocess_gui_default_config.json
 config/*_preprocess.json
 AGENTS.md
-implementation_plan/
-change_log/
 paperflow/
