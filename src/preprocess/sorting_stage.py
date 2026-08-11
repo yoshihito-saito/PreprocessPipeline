@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -96,6 +97,7 @@ def run_sorting_stage(
     manifest_partitions = []
     sorter_output_dirs: list[Path] = []
     manifest_path: Path | None = None
+    attempt_manifest_name = f"sorter_partition_manifest.attempt-{timestamp}-{uuid.uuid4().hex[:8]}.json"
     for partition in partitions:
         suffix = "" if partition.mode == "all" else f"_{partition.name}"
         output_folder = output_dir / f"{sorter_output_prefix(sorter_label)}_{timestamp}{suffix}"
@@ -110,11 +112,12 @@ def run_sorting_stage(
         )
         current = replace(partition, output_folder=str(output_folder), status="running")
         manifest_partitions.append(current)
-        manifest_path = write_sorter_partition_manifest(
+        write_sorter_partition_manifest(
             output_dir=output_dir,
             mode=partition_mode,
             sorter=sorter_label,
             partitions=manifest_partitions,
+            filename=attempt_manifest_name,
         )
         execute_job(
             sorter=sorter_label,
@@ -154,6 +157,15 @@ def run_sorting_stage(
         )
         sorter_output_dirs.append(output_folder)
         manifest_partitions[-1] = replace(current, status="completed")
+        write_sorter_partition_manifest(
+            output_dir=output_dir,
+            mode=partition_mode,
+            sorter=sorter_label,
+            partitions=manifest_partitions,
+            filename=attempt_manifest_name,
+        )
+
+    if manifest_partitions:
         manifest_path = write_sorter_partition_manifest(
             output_dir=output_dir,
             mode=partition_mode,

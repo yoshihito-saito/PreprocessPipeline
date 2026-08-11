@@ -4,12 +4,16 @@ import csv
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
+import os
 from math import isclose
 import re
 import shutil
+import uuid
 from pathlib import Path
 
 from .io import (
+    atomic_write_json,
+    atomic_write_path,
     _find_openephys_datetime_ancestor,
     _infer_sample_count_from_binary,
     _subsession_sort_key,
@@ -199,8 +203,13 @@ def _replace_symlink(target: Path, source: Path, *, overwrite: bool) -> None:
         if target.is_dir() and not target.is_symlink():
             shutil.rmtree(target)
         else:
-            target.unlink()
-    target.symlink_to(source.resolve(), target_is_directory=source.is_dir())
+            temporary = target.with_name(f".{target.name}.partial-{uuid.uuid4().hex}")
+            temporary.symlink_to(source.resolve(), target_is_directory=source.is_dir())
+            os.replace(temporary, target)
+            return
+    temporary = target.with_name(f".{target.name}.partial-{uuid.uuid4().hex}")
+    temporary.symlink_to(source.resolve(), target_is_directory=source.is_dir())
+    os.replace(temporary, target)
 
 
 def _resolve_path_set(paths: list[Path] | None) -> set[str]:
@@ -213,6 +222,7 @@ def _cleanup_stale_staged_subepochs(
     *,
     manifest_path: Path,
     active_staged_folders: set[Path],
+    staging_root: Path,
     overwrite: bool,
 ) -> None:
     if not manifest_path.exists():
@@ -227,6 +237,16 @@ def _cleanup_stale_staged_subepochs(
         if not staged_text:
             continue
         staged_path = Path(staged_text).expanduser().absolute()
+        try:
+            staged_path.relative_to(staging_root.resolve())
+        except ValueError:
+            raise ValueError(
+                f"Refusing to delete manifest path outside multi-day staging root: {staged_path}"
+            )
+        if staged_path.parent.resolve() != staging_root.resolve():
+            raise ValueError(
+                f"Refusing to delete non-direct staged child from manifest: {staged_path}"
+            )
         if staged_path in active or not (staged_path.exists() or staged_path.is_symlink()):
             continue
         if not overwrite:
@@ -258,13 +278,19 @@ def _write_selected_subepochs_csv(path: Path, subepochs: list[MultiDaySubepoch])
         "binary_sampling_frequency",
         "sample_count",
     ]
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for staged_order, subepoch in enumerate(subepochs, start=1):
-            row = asdict(subepoch)
-            row["staged_order"] = staged_order
-            writer.writerow({field: row.get(field, "") for field in fieldnames})
+    def _write(temporary: Path) -> None:
+        with temporary.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for staged_order, subepoch in enumerate(subepochs, start=1):
+                row = asdict(subepoch)
+                row["staged_order"] = staged_order
+                writer.writerow({field: row.get(field, "") for field in fieldnames})
+    atomic_write_path(
+        path,
+        _write,
+        validator=lambda temporary: list(csv.DictReader(temporary.open(encoding="utf-8"))),
+    )
 
 
 def prepare_multi_day_basepath(
@@ -298,18 +324,19 @@ def prepare_multi_day_basepath(
 
     staged_xml = server_basepath / f"{multiday_name}.xml"
     has_authoritative_xml = xml_path is not None or staged_xml.exists()
+    xml_copy_source: Path | None = None
     if xml_path is not None:
         selected_xml = Path(xml_path).expanduser().resolve()
         if not selected_xml.exists() or not selected_xml.is_file():
             raise FileNotFoundError(f"Selected multi-day XML file does not exist: {selected_xml}")
+        reference_xml = selected_xml
         if selected_xml != staged_xml.resolve():
-            shutil.copy2(selected_xml, staged_xml)
-        reference_xml = staged_xml
+            xml_copy_source = selected_xml
     elif staged_xml.exists():
         reference_xml = staged_xml
     else:
         reference_xml = _find_session_xml(sessions[0])
-        shutil.copy2(reference_xml, staged_xml)
+        xml_copy_source = reference_xml
 
     reference_meta = load_xml_metadata(reference_xml)
     if not has_authoritative_xml:
@@ -323,8 +350,7 @@ def prepare_multi_day_basepath(
                 )
 
     first_rhd = find_rhd_source(sessions[0], sessions[0].name, use_first_child_match=True)
-    if first_rhd is not None:
-        shutil.copy2(first_rhd, server_basepath / f"{multiday_name}.rhd")
+    staged_rhd = server_basepath / f"{multiday_name}.rhd"
 
     subepochs: list[MultiDaySubepoch] = []
     openephys_stream_channels: int | None = None
@@ -365,12 +391,69 @@ def prepare_multi_day_basepath(
     if not stage_plan:
         raise ValueError("No multi-day subepochs were selected for staging.")
 
+    def _same_file(left: Path, right: Path) -> bool:
+        if not left.is_file() or not right.is_file() or left.stat().st_size != right.stat().st_size:
+            return False
+        import hashlib
+
+        def digest(path: Path) -> str:
+            hasher = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    hasher.update(block)
+            return hasher.hexdigest()
+        return digest(left) == digest(right)
+
+    # Validate every canonical conflict before copying XML/RHD or changing a
+    # link.  Under overwrite=False exact existing files/links are reusable;
+    # any difference fails without mutating the established staging tree.
+    planned_links = {staged for _row, _source, staged in stage_plan}
+    for _row, source, staged in stage_plan:
+        if staged.exists() or staged.is_symlink():
+            same_link = staged.is_symlink() and staged.resolve() == source.resolve()
+            if not same_link and not overwrite:
+                raise FileExistsError(
+                    f"Staged multi-day subepoch already exists: {staged}. "
+                    "Enable overwrite to replace it."
+                )
+    if xml_copy_source is not None and (staged_xml.exists() or staged_xml.is_symlink()):
+        if not _same_file(xml_copy_source, staged_xml) and not overwrite:
+            raise FileExistsError(
+                f"Multi-day XML already exists with different content: {staged_xml}. "
+                "Enable overwrite to replace it."
+            )
+    if first_rhd is not None and (staged_rhd.exists() or staged_rhd.is_symlink()):
+        if not _same_file(first_rhd, staged_rhd) and not overwrite:
+            raise FileExistsError(
+                f"Multi-day RHD already exists with different content: {staged_rhd}. "
+                "Enable overwrite to replace it."
+            )
+
     manifest_path = server_basepath / MULTI_DAY_MANIFEST
-    _cleanup_stale_staged_subepochs(
-        manifest_path=manifest_path,
-        active_staged_folders={staged_folder for _row, _source_folder, staged_folder in stage_plan},
-        overwrite=overwrite,
-    )
+    stale_links: list[Path] = []
+    if manifest_path.exists():
+        try:
+            prior_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"Cannot safely update invalid multi-day manifest: {manifest_path}") from exc
+        for entry in prior_manifest.get("subepochs", []):
+            staged_text = entry.get("staged_subepoch_path")
+            if not staged_text:
+                continue
+            stale = Path(staged_text).expanduser().absolute()
+            if stale.parent.resolve() != server_basepath or stale in planned_links:
+                if stale not in planned_links:
+                    raise ValueError(f"Refusing manifest path outside direct staging children: {stale}")
+                continue
+            if stale.exists() or stale.is_symlink():
+                if not overwrite:
+                    raise FileExistsError(
+                        f"Stale staged multi-day subepoch exists: {stale}. "
+                        "Enable overwrite to remove subepochs excluded from the current selection."
+                    )
+                stale_links.append(stale)
+
+    manifest_xml_path = staged_xml if xml_copy_source is not None or staged_xml.exists() else reference_xml
 
     for row, source_folder, staged_folder in stage_plan:
         discovered_path = Path(row.discovered_path)
@@ -405,7 +488,6 @@ def prepare_multi_day_basepath(
                     "Open Ephys recordings with mismatched sampling frequencies are unsupported: "
                     f"{openephys_sampling_frequency} vs {source_binary.sampling_frequency} ({discovered_path})"
                 )
-        _replace_symlink(staged_folder, source_folder, overwrite=overwrite)
         sample_count = _infer_sample_count_from_binary(
             source_binary.path,
             n_channels=source_binary.binary_n_channels,
@@ -437,20 +519,89 @@ def prepare_multi_day_basepath(
         "server_basepath": str(server_basepath),
         "local_basepath": str(local_basepath),
         "source_sessions": [str(path) for path in sessions],
-        "xml_path": str(reference_xml),
+        "xml_path": str(manifest_xml_path),
         "sampling_frequency": float(reference_meta.sr),
         "n_channels": int(reference_meta.n_channels),
         "dtype": dtype,
         "subepochs": [asdict(item) for item in subepochs],
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    (local_basepath / MULTI_DAY_MANIFEST).write_text(
-        json.dumps(manifest, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
     selected_subepochs_csv_path = server_basepath / MULTI_DAY_SELECTED_SUBEPOCHS_CSV
-    _write_selected_subepochs_csv(selected_subepochs_csv_path, subepochs)
-    _write_selected_subepochs_csv(local_basepath / MULTI_DAY_SELECTED_SUBEPOCHS_CSV, subepochs)
+    transaction_id = uuid.uuid4().hex
+    # os.replace is only atomic within one filesystem.  Server and local
+    # staging commonly reside on distinct mounts, so each side gets its own
+    # staging/backup root while the journal below coordinates both swaps.
+    server_transaction_root = server_basepath / f".multiday-publish-{transaction_id}"
+    local_transaction_root = local_basepath / f".multiday-publish-{transaction_id}"
+    server_transaction_root.mkdir()
+    local_transaction_root.mkdir()
+    try:
+        staged_server = server_transaction_root / "staged"
+        staged_local = local_transaction_root / "staged"
+        staged_server.mkdir()
+        staged_local.mkdir()
+        server_backups = server_transaction_root / "backups"
+        local_backups = local_transaction_root / "backups"
+        server_backups.mkdir()
+        local_backups.mkdir()
+        publications: list[tuple[Path, Path | None, Path]] = []
+        for _row, source, target in stage_plan:
+            staged = staged_server / target.name
+            staged.symlink_to(source.resolve(), target_is_directory=True)
+            publications.append((target, staged, server_backups))
+        if xml_copy_source is not None:
+            staged = staged_server / staged_xml.name
+            shutil.copy2(xml_copy_source, staged)
+            publications.append((staged_xml, staged, server_backups))
+        if first_rhd is not None:
+            staged = staged_server / staged_rhd.name
+            shutil.copy2(first_rhd, staged)
+            publications.append((staged_rhd, staged, server_backups))
+        server_manifest_stage = staged_server / MULTI_DAY_MANIFEST
+        local_manifest_stage = staged_local / MULTI_DAY_MANIFEST
+        server_csv_stage = staged_server / MULTI_DAY_SELECTED_SUBEPOCHS_CSV
+        local_csv_stage = staged_local / MULTI_DAY_SELECTED_SUBEPOCHS_CSV
+        atomic_write_json(server_manifest_stage, manifest)
+        atomic_write_json(local_manifest_stage, manifest)
+        _write_selected_subepochs_csv(server_csv_stage, subepochs)
+        _write_selected_subepochs_csv(local_csv_stage, subepochs)
+        # Validate all staged metadata before touching canonical server/local views.
+        json.loads(server_manifest_stage.read_text(encoding="utf-8"))
+        json.loads(local_manifest_stage.read_text(encoding="utf-8"))
+        for csv_stage in (server_csv_stage, local_csv_stage):
+            list(csv.DictReader(csv_stage.open(encoding="utf-8")))
+        publications.extend([
+            (manifest_path, server_manifest_stage, server_backups),
+            (selected_subepochs_csv_path, server_csv_stage, server_backups),
+            (local_basepath / MULTI_DAY_MANIFEST, local_manifest_stage, local_backups),
+            (local_basepath / MULTI_DAY_SELECTED_SUBEPOCHS_CSV, local_csv_stage, local_backups),
+        ])
+        publications.extend((stale, None, server_backups) for stale in stale_links)
+        applied: list[tuple[Path, Path | None]] = []
+        try:
+            for index, (target, staged, backup_root) in enumerate(publications):
+                backup: Path | None = None
+                if target.exists() or target.is_symlink():
+                    backup = backup_root / str(index)
+                    os.replace(target, backup)
+                applied.append((target, backup))
+                if staged is not None:
+                    os.replace(staged, target)
+        except BaseException:
+            for target, backup in reversed(applied):
+                if target.exists() or target.is_symlink():
+                    if target.is_dir() and not target.is_symlink():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                if backup is not None and backup.exists():
+                    # Use rename for rollback so a failed/instrumented publish
+                    # replace cannot prevent restoration of the prior view.
+                    os.rename(backup, target)
+            raise
+    finally:
+        for transaction_root in (server_transaction_root, local_transaction_root):
+            if transaction_root.exists():
+                shutil.rmtree(transaction_root, ignore_errors=True)
     return MultiDayStagingResult(
         name=multiday_name,
         server_basepath=server_basepath,

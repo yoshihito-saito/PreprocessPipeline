@@ -7,12 +7,14 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 from typing import Any
 import uuid
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from .models import StageName, StageStatus
+from .models import AnalysisConfig, StageName, StageStatus
 from .store import (
     RunStore,
     atomic_write_json,
@@ -34,6 +36,17 @@ _POST_REQUIRED = (
     "cluster_info.tsv",
     "quality_metrics.csv",
 )
+
+# These identifiers deliberately describe the producer/output contract, rather
+# than the checkout state.  A dirty unrelated GUI edit must not invalidate a
+# scientifically compatible output, while a deliberate producer-format change
+# has an explicit way to do so.
+OUTPUT_INVENTORY_SCHEMA = "execution-output-inventory-v1"
+PRODUCER_SCHEMAS = {
+    StageName.PREPROCESS.value: "preprocess-output-v2",
+    StageName.SORTING.value: "sorting-output-v1",
+    StageName.POSTPROCESS.value: "postprocess-output-v1",
+}
 
 
 def _hash_payload(value: Any) -> str:
@@ -128,13 +141,22 @@ def _persistent_input_provenance_compatible(
         prior_record = yaml.safe_load(prior_path.read_text(encoding="utf-8")) or {}
         prior_snapshot = (prior_record.get("provenance") or {}).get("inputs") or {}
         current_snapshot = read_json(current_path)
-        return _input_snapshots_compatible(prior_snapshot, current_snapshot, settings)
+        return _input_snapshots_compatible(
+            prior_snapshot,
+            current_snapshot,
+            settings,
+            prior_cutoff_at=prior_record.get("started_at") or prior_record.get("created_at"),
+        )
     except (OSError, TypeError, ValueError):
         return False
 
 
 def _input_snapshots_compatible(
-    prior_snapshot: dict[str, Any], current_snapshot: dict[str, Any], settings: Any
+    prior_snapshot: dict[str, Any],
+    current_snapshot: dict[str, Any],
+    settings: Any,
+    *,
+    prior_cutoff_at: str | None = None,
 ) -> bool:
     prior_entries = {
         str(item.get("path")): item for item in prior_snapshot.get("inputs", [])
@@ -142,39 +164,125 @@ def _input_snapshots_compatible(
     current_entries = {
         str(item.get("path")): item for item in current_snapshot.get("inputs", [])
     }
-    relevant = [settings.preprocess_source_path]
-    relevant.extend(
-        Path(value).expanduser()
-        for value in settings.multi_day_session_paths
-        if str(value).strip()
-    )
-    relevant.extend(
-        Path(value).expanduser()
-        for value in settings.multi_day_selected_subepoch_paths
-        if str(value).strip()
-    )
+    from .controller import _input_provenance, _recursive_input_roots
+
+    relevant = _recursive_input_roots(settings)
     relevant_roots = {str(Path(path).resolve()) for path in relevant if path is not None}
     if not relevant_roots:
         return False
-    relevant_paths = {
-        path
-        for path in current_entries
-        if any(path == root or path.startswith(root + os.sep) for root in relevant_roots)
-    }
-    prior_relevant_paths = {
-        path
-        for path in prior_entries
-        if any(path == root or path.startswith(root + os.sep) for root in relevant_roots)
-    }
-    if relevant_paths != prior_relevant_paths:
+
+    def relevant_entries(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        return {
+            str(item.get("path")): item
+            for item in snapshot.get("inputs", [])
+            if any(
+                str(item.get("path")) == root
+                or str(item.get("path")).startswith(root + os.sep)
+                for root in relevant_roots
+            )
+        }
+
+    def timestamp_ns(value: Any) -> int | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp() * 1_000_000_000)
+        except (OverflowError, TypeError, ValueError):
+            return None
+
+    # The immutable current snapshot is captured during Run creation.  Re-scan
+    # immediately before trusting it so an input added, removed, or changed
+    # while the Run waited for its worker cannot authorize stale output reuse.
+    live_snapshot = _input_provenance(settings)
+    stored_current = relevant_entries(current_snapshot)
+    live_current = relevant_entries(live_snapshot)
+    if not stored_current or stored_current.keys() != live_current.keys():
         return False
-    keys = ("exists", "size", "mtime_ns", "is_dir")
-    return all(
+    current_cutoff_ns = timestamp_ns(
+        current_snapshot.get("scan_started_at")
+        or current_snapshot.get("recorded_at")
+    )
+    live_ctimes: dict[str, int] = {}
+    metadata_keys = ("exists", "size", "mtime_ns", "is_dir")
+    for path, stored in stored_current.items():
+        live = live_current[path]
+        if any(stored.get(key) != live.get(key) for key in metadata_keys):
+            return False
+        live_ctime = live.get("ctime_ns")
+        if not isinstance(live_ctime, int):
+            return False
+        stored_ctime = stored.get("ctime_ns")
+        if isinstance(stored_ctime, int):
+            if stored_ctime != live_ctime:
+                return False
+        elif current_cutoff_ns is None or live_ctime > current_cutoff_ns:
+            return False
+        live_ctimes[path] = live_ctime
+
+    relevant_paths = set(stored_current)
+    prior_relevant_paths = set(relevant_entries(prior_snapshot))
+    if not prior_relevant_paths or not prior_relevant_paths.issubset(relevant_paths):
+        return False
+    if not all(
         path in prior_entries
         and path in current_entries
-        and all(prior_entries[path].get(key) == current_entries[path].get(key) for key in keys)
-        for path in relevant_paths
+        and all(
+            prior_entries[path].get(key) == current_entries[path].get(key)
+            for key in metadata_keys
+        )
+        for path in prior_relevant_paths
+    ):
+        return False
+
+    newly_tracked_paths = relevant_paths - prior_relevant_paths
+    # Input provenance was expanded after Persistent Runs were already in use.
+    # The immutable prior Run/scan-start cutoff proves that a path omitted by a
+    # legacy schema—and any legacy entry lacking ctime—already existed in its
+    # current form before that Run began.
+    recorded_at = (
+        prior_cutoff_at
+        or prior_snapshot.get("scan_started_at")
     )
+    recorded_ns = timestamp_ns(recorded_at)
+    current_recorded_ns = timestamp_ns(
+        current_snapshot.get("scan_started_at")
+        or current_snapshot.get("recorded_at")
+    )
+    now_ns = int(datetime.now(timezone.utc).timestamp() * 1_000_000_000)
+    needs_legacy_cutoff = bool(newly_tracked_paths) or any(
+        not isinstance(prior_entries[path].get("ctime_ns"), int)
+        for path in prior_relevant_paths
+    )
+    if needs_legacy_cutoff and (
+        recorded_ns is None
+        or current_recorded_ns is None
+        or recorded_ns > current_recorded_ns
+        or recorded_ns > now_ns
+    ):
+        return False
+    for path in prior_relevant_paths:
+        prior_ctime = prior_entries[path].get("ctime_ns")
+        if isinstance(prior_ctime, int):
+            if live_ctimes[path] != prior_ctime:
+                return False
+        elif recorded_ns is None or live_ctimes[path] > recorded_ns:
+            return False
+    for path in newly_tracked_paths:
+        entry = current_entries[path]
+        if (
+            entry.get("exists") is not True
+            or entry.get("is_dir") is not False
+            or not isinstance(entry.get("mtime_ns"), int)
+            or entry["mtime_ns"] > recorded_ns
+        ):
+            return False
+        if live_ctimes[path] > recorded_ns:
+            return False
+    return True
 
 
 def _legacy_preprocess_compatible(session_dir: Path, settings: Any) -> bool:
@@ -252,6 +360,278 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _inventory_entry(path: Path, role: str) -> dict[str, str]:
+    return {"path": str(path.expanduser().resolve()), "role": role}
+
+
+def preprocess_output_inventory(result: Any, config: Any) -> dict[str, Any]:
+    """Return every preprocess product requested by this immutable config.
+
+    The inventory is intentionally path-oriented: it is both the completion
+    checkpoint and the evidence that a later Run must revalidate before reuse.
+    """
+    output_dir = Path(result.local_output_dir)
+    basename = str(result.basename)
+    entries: list[dict[str, Any]] = []
+
+    def add(
+        path: Path | None,
+        role: str,
+        *,
+        required: bool = True,
+        binary: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if path is None:
+            if required:
+                entries.append({"path": "", "role": role})
+            return None
+        entry = _inventory_entry(Path(path), role)
+        if binary is not None:
+            entry["binary"] = binary
+        entries.append(entry)
+        return entry
+
+    add(result.dat_path, "dat")
+    add(result.session_mat_path, "session_mat")
+    add(result.mergepoints_mat_path, "mergepoints_mat")
+    add(output_dir / f"{basename}.xml", "xml")
+    add(output_dir / "chanMap.mat", "chanmap")
+    if bool(getattr(config, "save_raw", False)):
+        add(output_dir / f"{basename}_raw.dat", "raw_dat")
+    copied_rhd = output_dir / f"{basename}.rhd"
+    if copied_rhd.is_file():
+        add(copied_rhd, "rhd")
+    if bool(getattr(config, "make_lfp", False)):
+        add(result.lfp_path, "lfp")
+    for index, path in enumerate(result.analog_event_paths):
+        add(path, f"analog_event_{index:03d}")
+    for index, path in enumerate(result.digital_event_paths):
+        add(path, f"digital_event_{index:03d}")
+    for name, path in sorted(result.intermediate_dat_paths.items()):
+        path = Path(path)
+        if path.suffix.lower() != ".dat":
+            add(path, f"intermediate_{name}")
+            continue
+        layout_path = path.with_name(f"{path.name}.layout.json")
+        fallback_channels = 1
+        if name == "analogin":
+            fallback_channels = max(1, len(getattr(config, "source_adc_channels", []) or []))
+        binary: dict[str, Any] = {
+            "dtype": str(getattr(config, "dtype", "int16")),
+            "n_channels": fallback_channels,
+        }
+        if layout_path.is_file():
+            try:
+                layout = json.loads(layout_path.read_text(encoding="utf-8"))
+                binary.update(
+                    {
+                        "dtype": str(layout.get("dtype") or binary["dtype"]),
+                        "n_channels": int(layout["num_channels"]),
+                        "expected_frames": (
+                            int(sum(int(value) for value in layout["sample_counts"]))
+                            if isinstance(layout.get("sample_counts"), list)
+                            else None
+                        ),
+                    }
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                # The JSON entry below makes a malformed layout fail during
+                # completion rather than silently weakening binary validation.
+                pass
+            layout_entry = add(layout_path, f"intermediate_{name}_layout")
+            assert layout_entry is not None
+            layout_entry["sha256"] = hashlib.sha256(layout_path.read_bytes()).hexdigest()
+        add(path, f"intermediate_{name}", binary=binary)
+    chan_coords = output_dir / f"{basename}.chanCoords.channelInfo.mat"
+    if chan_coords.is_file():
+        add(chan_coords, "chancoords")
+    if bool(getattr(config, "state_score", False)):
+        # State scoring has a fixed dependency graph.  Derive the requested
+        # leaves from configuration (rather than merely trusting a partial
+        # returned list), while respecting the optional SleepScoreLFP MAT.
+        from src.preprocess.state_scoring import _expected_state_score_outputs
+
+        *_, expected_state = _expected_state_score_outputs(
+            basepath=output_dir,
+            basename=basename,
+            save_lfp_mat=bool(getattr(config, "state_save_lfp_mat", True)),
+        )
+        for index, path in enumerate(expected_state):
+            add(path, f"state_score_{index:03d}")
+    chanmap_path = output_dir / "chanMap.mat"
+    layout_sha256 = ""
+    if chanmap_path.is_file():
+        layout_sha256 = hashlib.sha256(chanmap_path.read_bytes()).hexdigest()
+    return {
+        "schema": OUTPUT_INVENTORY_SCHEMA,
+        "producer_schema": PRODUCER_SCHEMAS[StageName.PREPROCESS.value],
+        "metadata": {
+            "n_channels": int(result.n_channels),
+            "dtype": str(getattr(config, "dtype", "int16")),
+            "dat_frames": int(sum(int(value) for value in result.subsession_sample_counts)),
+            # LFP is resampled, so its frame count is not the raw-data count;
+            # it must still consist of complete channel frames.
+            "lfp_n_channels": int(result.n_channels),
+            "channel_layout_sha256": layout_sha256,
+        },
+        "entries": entries,
+    }
+
+
+def validate_output_inventory(inventory: dict[str, Any], *, label: str) -> list[str]:
+    if inventory.get("schema") != OUTPUT_INVENTORY_SCHEMA:
+        raise RuntimeError(f"{label} has an unsupported output inventory schema")
+    entries = inventory.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise RuntimeError(f"{label} has no recorded output inventory")
+    metadata = inventory.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise RuntimeError(f"{label} has invalid output inventory metadata")
+    metadata = metadata or {}
+    validated: list[str] = []
+
+    def fail(role: str, path: Path, detail: str) -> None:
+        raise RuntimeError(f"{label} validation failed for {role}: {path} ({detail})")
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"{label} has an invalid output inventory entry")
+        path_text = str(entry.get("path") or "")
+        role = str(entry.get("role") or "output")
+        path = Path(path_text) if path_text else None
+        if path is None or not path.is_file() or path.stat().st_size == 0:
+            raise RuntimeError(f"{label} validation failed for {role}: {path_text or '<missing path>'}")
+        expected_sha256 = str(entry.get("sha256") or "")
+        if expected_sha256 and hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha256:
+            fail(role, path, "content fingerprint changed")
+        suffix = path.suffix.lower()
+        binary = entry.get("binary") if isinstance(entry.get("binary"), dict) else None
+        if role in {"dat", "raw_dat", "lfp"} or binary is not None:
+            try:
+                if binary is not None:
+                    n_channels = int(binary.get("n_channels") or 1)
+                    itemsize = np.dtype(str(binary["dtype"])).itemsize
+                    expected_frames = binary.get("expected_frames")
+                else:
+                    n_channels = int(metadata["n_channels" if role in {"dat", "raw_dat"} else "lfp_n_channels"])
+                    itemsize = np.dtype(str(metadata["dtype"])).itemsize
+                    expected_frames = metadata.get("dat_frames") if role in {"dat", "raw_dat"} else None
+            except (KeyError, TypeError, ValueError) as exc:
+                # Older inventories had no shape metadata; retain their
+                # compatibility path while current inventories fail closed.
+                if metadata:
+                    fail(role, path, "missing binary shape metadata")
+                n_channels = 0
+                itemsize = 0
+            if n_channels and itemsize:
+                frame_bytes = n_channels * itemsize
+                if path.stat().st_size % frame_bytes:
+                    fail(role, path, f"size is not aligned to {frame_bytes}-byte frames")
+                if expected_frames is not None:
+                    if path.stat().st_size // frame_bytes != int(expected_frames):
+                        fail(role, path, "frame count differs from merged subsessions")
+        elif suffix == ".xml":
+            try:
+                ET.parse(path)
+            except (OSError, ET.ParseError) as exc:
+                fail(role, path, f"invalid XML: {exc}")
+        elif suffix == ".mat":
+            try:
+                from scipy.io import loadmat
+
+                loaded = loadmat(path, simplify_cells=True)
+            except Exception as exc:
+                fail(role, path, f"invalid MAT payload: {exc}")
+            required_key = {
+                "session_mat": "session",
+                "mergepoints_mat": "MergePoints",
+                "chanmap": "chanMap",
+            }.get(role)
+            name = path.name
+            if required_key is None:
+                if ".EMGFromLFP." in name:
+                    required_key = "EMGFromLFP"
+                elif ".SleepScoreLFP." in name:
+                    required_key = "SleepScoreLFP"
+                elif ".SleepStateEpisodes." in name:
+                    required_key = "SleepStateEpisodes"
+                elif ".SleepState." in name:
+                    required_key = "SleepState"
+                elif ".chanCoords." in name:
+                    required_key = "chanCoords"
+                elif ".artifactTTL.events." in name:
+                    required_key = "artifactTTL"
+                elif ".artifactHigh.events." in name:
+                    required_key = "artifactHigh"
+            if required_key is not None and required_key not in loaded:
+                fail(role, path, f"missing MAT key {required_key!r}")
+            if required_key is None and not any(not str(key).startswith("__") for key in loaded):
+                fail(role, path, "MAT payload has no public data")
+        elif suffix == ".npy":
+            try:
+                np.load(path, mmap_mode="r", allow_pickle=False)
+            except (OSError, ValueError) as exc:
+                fail(role, path, f"invalid NumPy array: {exc}")
+        elif suffix == ".json":
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                fail(role, path, f"invalid JSON: {exc}")
+            if role.endswith("_layout"):
+                try:
+                    if int(payload["schema_version"]) != 1:
+                        raise ValueError("unsupported schema_version")
+                    np.dtype(str(payload["dtype"]))
+                    n_channels = int(payload["num_channels"])
+                    if n_channels <= 0:
+                        raise ValueError("num_channels must be positive")
+                    sample_counts = payload["sample_counts"]
+                    if not isinstance(sample_counts, list) or any(
+                        int(value) < 0 for value in sample_counts
+                    ):
+                        raise ValueError("sample_counts must be a nonnegative list")
+                    n_epochs = len(sample_counts)
+                    for field in (
+                        "source_num_channels",
+                        "source_channel_indices",
+                        "destination_channel_indices",
+                    ):
+                        values = payload.get(field)
+                        if values is not None and (
+                            not isinstance(values, list) or len(values) != n_epochs
+                        ):
+                            raise ValueError(f"{field} must align with sample_counts")
+                    destinations = payload.get("destination_channel_indices") or []
+                    sources = payload.get("source_channel_indices") or []
+                    for index, mapping in enumerate(destinations):
+                        if mapping is None:
+                            continue
+                        mapped = [int(value) for value in mapping]
+                        if len(set(mapped)) != len(mapped) or any(
+                            value < 0 or value >= n_channels for value in mapped
+                        ):
+                            raise ValueError("destination mapping is outside output layout")
+                        if index < len(sources) and sources[index] is not None:
+                            if len(mapped) != len(sources[index]):
+                                raise ValueError("source/destination mapping lengths differ")
+                except (KeyError, TypeError, ValueError) as exc:
+                    fail(role, path, f"invalid sidecar layout: {exc}")
+        elif suffix in {".jpg", ".jpeg"}:
+            header = path.read_bytes()[:2]
+            tail = b""
+            with path.open("rb") as handle:
+                handle.seek(-2, os.SEEK_END)
+                tail = handle.read(2)
+            if header != b"\xff\xd8" or tail != b"\xff\xd9":
+                fail(role, path, "invalid JPEG signature")
+        if role == "chanmap" and metadata.get("channel_layout_sha256"):
+            actual_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            if actual_sha256 != metadata["channel_layout_sha256"]:
+                fail(role, path, "channel-layout fingerprint changed")
+        validated.append(str(path.resolve()))
+    return validated
+
+
 def settings_for_store(store: RunStore):
     from src.preprocess.gui.config_model import PipelineGuiSettings
 
@@ -263,6 +643,209 @@ def session_output_dir(settings: Any) -> Path:
     if output is None:
         raise ValueError("The session output directory cannot be resolved")
     return Path(output).expanduser().resolve()
+
+
+_PREPROCESS_CONTRACT_NAME = ".preprocess-output-contract.json"
+
+
+def _preprocess_contract_identity(store: RunStore, session_dir: Path) -> dict[str, str]:
+    try:
+        inputs = read_json(store.run_dir / "snapshots" / "inputs.json")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Missing immutable acquisition provenance for preprocess output contract") from exc
+    return {
+        "schema": "preprocess-output-contract-v1",
+        "producer_schema": PRODUCER_SCHEMAS[StageName.PREPROCESS.value],
+        "session_dir": str(session_dir.resolve()),
+        "stage_fingerprint": str(store.load_run().get("stage_fingerprints", {}).get("preprocess") or ""),
+        "input_provenance_sha256": _hash_payload({"inputs": inputs.get("inputs", [])}),
+    }
+
+
+def _known_preprocess_outputs(session_dir: Path, basename: str) -> list[Path]:
+    names = (
+        f"{basename}.dat", f"{basename}.lfp", f"{basename}.session.mat",
+        f"{basename}.MergePoints.events.mat", f"{basename}.xml",
+        f"{basename}.chanCoords.channelInfo.mat", f"{basename}_raw.dat", f"{basename}.rhd",
+        "chanMap.mat", "analogin.dat", "digitalin.dat", "auxiliary.dat", "supply.dat", "time.dat",
+        "digitalIn.events.mat", "preprocessSession_manifest.json", "preprocessSession_params.json",
+    )
+    paths = [session_dir / name for name in names]
+    # Explicit producer-owned MAT products only.  In particular, do not glob
+    # every ``<basename>.*.mat``: CellExplorer/user behavior and cell-info
+    # products share that convention but are outside preprocess authority.
+    paths.extend(
+        session_dir / name
+        for name in (
+            f"{basename}.analogInput.behavior.mat",
+            f"{basename}.pulses.events.mat",
+            f"{basename}.artifactTTL.events.mat",
+            f"{basename}.artifactHigh.events.mat",
+            f"{basename}.EMGFromLFP.LFP.mat",
+            f"{basename}.SleepScoreLFP.LFP.mat",
+            f"{basename}.SleepState.states.mat",
+            f"{basename}.SleepStateEpisodes.states.mat",
+        )
+    )
+    paths.extend(session_dir.glob("*DigitalIn.events.mat"))
+    paths.extend(session_dir.glob("*.dat.layout.json"))
+    for directory in ("StateScoreFigures", "pulses", "Pulses"):
+        path = session_dir / directory
+        if path.exists():
+            paths.append(path)
+    # A path may match both an explicit name and a glob.  Sorting largest
+    # paths first prevents moving a child after its parent directory.
+    unique = {path.resolve() for path in paths if path.exists()}
+    return sorted(unique, key=lambda path: (len(path.parts), str(path)), reverse=True)
+
+
+def _trusted_preprocess_evidence(
+    store: RunStore,
+    settings: Any,
+    identity: dict[str, str],
+    *,
+    required_prior_input_sha256: str = "",
+) -> bool:
+    """Accept legacy partial outputs only when immutable prior evidence agrees."""
+    session_dir = Path(identity["session_dir"])
+    record_path = session_dir / "preprocess_run.yaml"
+    if record_path.exists():
+        try:
+            import yaml
+
+            record = yaml.safe_load(record_path.read_text(encoding="utf-8")) or {}
+            if (record.get("stage_fingerprints") or {}).get("preprocess") != identity["stage_fingerprint"]:
+                return False
+            prior_inputs = ((record.get("provenance") or {}).get("inputs") or {})
+            if required_prior_input_sha256 and _hash_payload(
+                {"inputs": prior_inputs.get("inputs", [])}
+            ) != required_prior_input_sha256:
+                return False
+            current_inputs = read_json(store.run_dir / "snapshots" / "inputs.json")
+            return _input_snapshots_compatible(
+                prior_inputs,
+                current_inputs,
+                settings,
+                prior_cutoff_at=record.get("started_at") or record.get("created_at"),
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+    for previous in _previous_persistent_stores(store):
+        try:
+            previous_run = previous.load_run()
+            if str(previous_run.get("stage_fingerprints", {}).get("preprocess") or "") != identity["stage_fingerprint"]:
+                continue
+            prior_inputs = read_json(previous.run_dir / "snapshots" / "inputs.json")
+            if required_prior_input_sha256 and _hash_payload(
+                {"inputs": prior_inputs.get("inputs", [])}
+            ) != required_prior_input_sha256:
+                continue
+            current_inputs = read_json(store.run_dir / "snapshots" / "inputs.json")
+            if _input_snapshots_compatible(
+                prior_inputs,
+                current_inputs,
+                settings,
+                prior_cutoff_at=previous_run.get("created_at"),
+            ):
+                return True
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    return False
+
+
+def prepare_preprocess_output_contract(
+    store: RunStore, settings: Any, *, overwrite: bool
+) -> Path:
+    """Commit or verify the pre-mutation authority for canonical preprocess outputs."""
+    session_dir = session_output_dir(settings)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    identity = _preprocess_contract_identity(store, session_dir)
+    contract_path = session_dir / _PREPROCESS_CONTRACT_NAME
+    basename = str(getattr(settings, "basename", session_dir.name))
+    existing_outputs = _known_preprocess_outputs(session_dir, basename)
+    existing: dict[str, Any] | None = None
+    if contract_path.exists():
+        try:
+            existing = read_json(contract_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            if not overwrite:
+                raise RuntimeError(f"Invalid preprocess output contract: {contract_path}") from exc
+    if existing == identity:
+        return contract_path
+    if isinstance(existing, dict) and existing.get("producer_schema") == "legacy-preprocess-v1":
+        legacy_identity = dict(existing)
+        legacy_identity.pop("producer_schema", None)
+        current_identity = dict(identity)
+        current_identity.pop("producer_schema", None)
+        if legacy_identity == current_identity:
+            return contract_path
+    if (
+        isinstance(existing, dict)
+        and existing.get("schema") == identity["schema"]
+        and existing.get("session_dir") == identity["session_dir"]
+        and existing.get("stage_fingerprint") == identity["stage_fingerprint"]
+        and existing.get("producer_schema")
+        in {"legacy-preprocess-v1", identity["producer_schema"]}
+        and _trusted_preprocess_evidence(
+            store,
+            settings,
+            identity,
+            required_prior_input_sha256=str(
+                existing.get("input_provenance_sha256") or ""
+            ),
+        )
+    ):
+        migrated_identity = dict(identity)
+        migrated_identity["producer_schema"] = str(existing["producer_schema"])
+        atomic_write_json(contract_path, migrated_identity)
+        return contract_path
+    if existing is None and existing_outputs and _trusted_preprocess_evidence(store, settings, identity):
+        legacy_identity = dict(identity)
+        legacy_identity["producer_schema"] = "legacy-preprocess-v1"
+        atomic_write_json(contract_path, legacy_identity)
+        return contract_path
+    if existing is not None or existing_outputs:
+        if not overwrite:
+            raise RuntimeError(
+                "Existing preprocess outputs have no compatible persistent output contract; "
+                f"refusing mutation with overwrite=False: {session_dir}"
+            )
+        # Do not relabel stale output as current.  Preserve every known
+        # canonical product in a recoverable sibling before publishing the new
+        # contract; the producer can then create a coherent replacement set.
+        backup = session_dir / ".preprocess-output-backups" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-%fZ")
+        backup.mkdir(parents=True, exist_ok=False)
+        moved: list[tuple[Path, Path]] = []
+        contract_publish_attempted = False
+        try:
+            for path in existing_outputs:
+                target = backup / path.name
+                shutil.move(str(path), str(target))
+                moved.append((path, target))
+            if contract_path.exists():
+                target = backup / contract_path.name
+                shutil.move(str(contract_path), str(target))
+                moved.append((contract_path, target))
+            # Contract publication is the commit record for this migration and
+            # therefore belongs to the same rollback boundary as the moves.
+            contract_publish_attempted = True
+            atomic_write_json(contract_path, identity)
+            return contract_path
+        except BaseException:
+            # Never leave a partially migrated canonical session behind.
+            if contract_publish_attempted and contract_path.exists():
+                contract_path.unlink()
+            for original, moved_path in reversed(moved):
+                if moved_path.exists():
+                    shutil.move(str(moved_path), str(original))
+            try:
+                backup.rmdir()
+                backup.parent.rmdir()
+            except OSError:
+                pass
+            raise
+    atomic_write_json(contract_path, identity)
+    return contract_path
 
 
 def _claim_path(pipeline_root: Path, session_dir: Path) -> Path:
@@ -301,23 +884,27 @@ def _claim_blocks_new_run(claim: dict[str, Any]) -> bool:
     for stage in StageName:
         for attempt in store.list_attempt_numbers(stage):
             submitted = store.read_attempt_fact(stage, attempt, "submitted.json")
+            observation = store.latest_observation(stage, attempt) or {}
+            backend_status = observation.get("status") or {}
+            backend_conclusive_terminal = bool(
+                backend_status.get("terminal", False)
+            ) and (
+                backend_status.get("successful") is not None
+                or str(backend_status.get("state") or "").lower()
+                in {"cancelled", "canceled"}
+            )
+            cancel_confirmed = (
+                store.read_attempt_fact(stage, attempt, "cancel_confirmed.json")
+                is not None
+            )
             if submitted is not None:
-                observation = store.latest_observation(stage, attempt) or {}
-                backend_status = observation.get("status") or {}
-                conclusive = (
-                    backend_status.get("terminal") is True
-                    and backend_status.get("successful") is not None
-                )
-                cancelled = (
-                    store.read_attempt_fact(stage, attempt, "cancel_confirmed.json") is not None
-                )
-                if not conclusive and not cancelled:
+                if not backend_conclusive_terminal and not cancel_confirmed:
                     return True
             started = store.read_attempt_fact(stage, attempt, "started.json")
             if started is not None and not any(
                 store.read_attempt_fact(stage, attempt, name) is not None
                 for name in ("result.json", "failure.json", "cancel_confirmed.json")
-            ):
+            ) and not backend_conclusive_terminal:
                 return True
             intent = store.read_attempt_fact(stage, attempt, "submission_intent.json")
             submission_failure = store.read_attempt_fact(
@@ -342,6 +929,7 @@ def acquire_session_claim(
     guard = claim_path.parent / f".{claim_path.name}.lock"
     with short_file_lock(guard, timeout=60.0):
         previous_run_dir = ""
+        previous_run_dirs: list[str] = []
         if claim_path.exists():
             claim = read_json(claim_path)
             if _claim_blocks_new_run(claim):
@@ -351,6 +939,16 @@ def acquire_session_claim(
                 )
             if claim.get("kind", "run") == "run":
                 previous_run_dir = str(claim.get("run_dir") or "")
+                previous_run_dirs = [previous_run_dir] if previous_run_dir else []
+                previous_run_dirs.extend(
+                    str(value)
+                    for value in claim.get("previous_run_dirs", [])
+                    if str(value).strip()
+                )
+                legacy_previous = str(claim.get("previous_run_dir") or "")
+                if legacy_previous:
+                    previous_run_dirs.append(legacy_previous)
+                previous_run_dirs = list(dict.fromkeys(previous_run_dirs))
         atomic_write_json(
             claim_path,
             {
@@ -360,6 +958,7 @@ def acquire_session_claim(
                 "run_dir": str(run_dir.resolve()),
                 "session_dir": str(session_dir.resolve()),
                 "previous_run_dir": previous_run_dir,
+                "previous_run_dirs": previous_run_dirs,
                 "created_at": utc_now(),
             },
         )
@@ -379,6 +978,16 @@ def abandon_session_claim(*, claim_path: Path, run_id: str) -> None:
         previous_dir = Path(str(claim.get("previous_run_dir") or ""))
         if (previous_dir / "run.json").exists():
             previous_run = read_json(previous_dir / "run.json")
+            lineage = [
+                str(value)
+                for value in claim.get("previous_run_dirs", [])
+                if str(value).strip()
+            ]
+            prior_lineage = (
+                lineage[1:]
+                if lineage and Path(lineage[0]).resolve() == previous_dir.resolve()
+                else []
+            )
             atomic_write_json(
                 claim_path,
                 {
@@ -387,6 +996,8 @@ def abandon_session_claim(*, claim_path: Path, run_id: str) -> None:
                     "run_id": previous_run.get("run_id", previous_dir.name),
                     "run_dir": str(previous_dir.resolve()),
                     "session_dir": str(claim.get("session_dir") or claim_path.parent),
+                    "previous_run_dir": prior_lineage[0] if prior_lineage else "",
+                    "previous_run_dirs": prior_lineage,
                     "created_at": previous_run.get("created_at", utc_now()),
                 },
             )
@@ -536,6 +1147,32 @@ def _legacy_preprocess_result(session_dir: Path, settings: Any) -> tuple[dict[st
         session_dir / f"{basename}.xml",
         session_dir / "chanMap.mat",
     ]
+    config = settings.to_preprocess_config()
+    if bool(config.make_lfp):
+        required.append(Path(str(manifest.get("lfp_path") or session_dir / f"{basename}.lfp")))
+    # Manifest fields are the authoritative inventory for sidecars and
+    # artifact-event checkpoints from legacy/direct runs.  Validate every
+    # recorded output instead of treating the primary dat/MAT pair as proof of
+    # completion.
+    for field in ("analog_event_paths", "digital_event_paths", "state_score_paths", "state_score_figure_paths"):
+        required.extend(Path(str(value)) for value in manifest.get(field, []) if str(value).strip())
+    required.extend(
+        Path(str(value))
+        for value in dict(manifest.get("intermediate_dat_paths", {})).values()
+        if str(value).strip()
+    )
+    if bool(config.state_score):
+        try:
+            from src.preprocess.state_scoring import _expected_state_score_outputs
+
+            *_, expected_state = _expected_state_score_outputs(
+                basepath=session_dir,
+                basename=basename,
+                save_lfp_mat=bool(config.state_save_lfp_mat),
+            )
+            required.extend(expected_state)
+        except (ImportError, AttributeError):
+            return None
     if any(not path.exists() or (path.is_file() and path.stat().st_size == 0) for path in required):
         return None
     n_channels = int(manifest.get("n_channels") or 0)
@@ -597,7 +1234,15 @@ def _sorting_outputs(session_dir: Path) -> tuple[list[Path], Path | None]:
                 continue
             value = str(item.get("output_folder") or "").strip()
             if value:
-                outputs.append(Path(value).expanduser().resolve())
+                candidate = Path(value).expanduser().resolve()
+                if (
+                    candidate.parent == session_dir.resolve()
+                    and candidate.is_dir()
+                    and candidate.name.startswith("Kilosort")
+                    and "_spi" not in candidate.name
+                    and ".preserved-" not in candidate.name
+                ):
+                    outputs.append(candidate)
     if not outputs:
         outputs = sorted(
             (
@@ -623,6 +1268,15 @@ def _write_adopted_result(
     source: str,
 ) -> None:
     now = utc_now()
+    inventory = {
+        "schema": OUTPUT_INVENTORY_SCHEMA,
+        "producer_schema": PRODUCER_SCHEMAS[stage.value],
+        "entries": [
+            _inventory_entry(Path(path), "validated_output") for path in validated_paths
+        ],
+    }
+    outputs = dict(outputs)
+    outputs["output_inventory"] = inventory
     store.write_attempt_fact(
         stage,
         attempt,
@@ -643,23 +1297,67 @@ def _write_adopted_result(
             "finished_at": now,
             "adopted": True,
             "outputs": _json_safe(outputs),
-            "validation": {"passed": True, "validated_paths": validated_paths},
+            "producer_schema": PRODUCER_SCHEMAS[stage.value],
+            "validation": {
+                "passed": True,
+                "validated_paths": validated_paths,
+                "output_inventory": inventory,
+            },
         },
     )
 
 
 def _previous_persistent_store(store: RunStore) -> RunStore | None:
-    claim_text = str(store.load_run().get("session_claim_path") or "").strip()
-    if not claim_text or not Path(claim_text).exists():
-        return None
+    stores = _previous_persistent_stores(store)
+    return stores[0] if stores else None
+
+
+def _previous_persistent_stores(store: RunStore) -> list[RunStore]:
+    """Return immutable Run lineage, with the current claim as a legacy fallback."""
+
+    run = store.load_run()
+    candidates: list[str] = []
+    candidates.extend(
+        str(value) for value in run.get("previous_run_dirs", []) if str(value).strip()
+    )
+    previous = str(run.get("previous_run_dir") or "").strip()
+    if previous:
+        candidates.append(previous)
+    claim_text = str(run.get("session_claim_path") or "").strip()
     try:
-        claim = read_json(Path(claim_text))
-        previous = Path(str(claim.get("previous_run_dir") or ""))
-        if previous == store.run_dir or not (previous / "run.json").exists():
-            return None
-        return RunStore(previous)
+        if claim_text and Path(claim_text).exists():
+            claim = read_json(Path(claim_text))
+            # A claim is mutable.  Consult it only while it still names this
+            # Run; persisted lineage above remains valid after a later Run
+            # replaces the claim.
+            if Path(str(claim.get("run_dir") or "")).resolve() == store.run_dir:
+                candidates.extend(
+                    str(value)
+                    for value in claim.get("previous_run_dirs", [])
+                    if str(value).strip()
+                )
+                legacy_previous = str(claim.get("previous_run_dir") or "").strip()
+                if legacy_previous:
+                    candidates.append(legacy_previous)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return None
+        pass
+    session_dir = str(run.get("session_output_dir") or "").strip()
+    result: list[RunStore] = []
+    seen: set[Path] = {store.run_dir}
+    for value in candidates:
+        path = Path(value).expanduser().resolve()
+        if path in seen or not (path / "run.json").exists():
+            continue
+        try:
+            prior = RunStore(path)
+            prior_run = prior.load_run()
+            if session_dir and str(prior_run.get("session_output_dir") or "") != session_dir:
+                continue
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        seen.add(path)
+        result.append(prior)
+    return result
 
 
 def _completed_previous_result(
@@ -687,6 +1385,27 @@ def _completed_previous_result(
 
 
 def _revalidate_previous_outputs(stage: StageName, result: dict[str, Any]) -> list[str]:
+    producer_schema = result.get("producer_schema")
+    expected_producer = PRODUCER_SCHEMAS[stage.value]
+    allowed_producers = {expected_producer}
+    if stage == StageName.PREPROCESS:
+        allowed_producers.add("preprocess-output-validated-legacy-resume-v1")
+    if producer_schema is not None and producer_schema not in allowed_producers:
+        raise RuntimeError(
+            f"previous {stage.value} output was produced by incompatible schema "
+            f"{producer_schema!r}"
+        )
+    inventory = (result.get("validation") or {}).get("output_inventory")
+    if inventory is None:
+        inventory = (result.get("outputs") or {}).get("output_inventory")
+    if inventory is not None:
+        if inventory.get("producer_schema") not in allowed_producers:
+            raise RuntimeError(f"previous {stage.value} output inventory has incompatible producer schema")
+        inventory_validated = validate_output_inventory(
+            inventory, label=f"previous {stage.value} output"
+        )
+        if stage == StageName.PREPROCESS:
+            return inventory_validated
     outputs = dict(result.get("outputs") or {})
     if stage == StageName.PREPROCESS:
         pre = dict(outputs.get("preprocess_result") or {})
@@ -779,7 +1498,12 @@ def adopt_existing_outputs(store: RunStore) -> dict[str, str]:
             current_inputs = read_json(store.run_dir / "snapshots" / "inputs.json")
         except (OSError, ValueError, json.JSONDecodeError):
             return False
-        return _input_snapshots_compatible(prior_inputs, current_inputs, settings)
+        return _input_snapshots_compatible(
+            prior_inputs,
+            current_inputs,
+            settings,
+            prior_cutoff_at=previous.load_run().get("created_at"),
+        )
 
     def compatible(stage: StageName) -> bool:
         if prior_fingerprints is not None:
@@ -1208,7 +1932,10 @@ def finalize_successful_run(store: RunStore) -> dict[str, Any] | None:
 
     final_path = store.run_dir / "final.json"
     if final_path.exists():
-        return read_json(final_path)
+        record = read_json(final_path)
+        if _conclusive_success(store):
+            release_session_claim(store)
+        return record
     if not _conclusive_success(store):
         return None
     settings = settings_for_store(store)
@@ -1242,6 +1969,49 @@ def finalize_successful_run(store: RunStore) -> dict[str, Any] | None:
     current_fingerprints = stage_fingerprints(store.load_analysis())
     for stage_name in enabled_stage_names:
         fingerprints[stage_name] = current_fingerprints[stage_name]
+    current_analysis = store.load_analysis().to_dict()
+    prior_analysis = prior_record.get("analysis") or {}
+    # A postprocess-only Run intentionally has a narrow analysis snapshot.
+    # Publishing it wholesale would erase the preprocess/sorting parameters
+    # that produced the retained upstream outputs and break faithful session
+    # recovery.  Preserve that stage-owned portion of the prior record while
+    # recording the current postprocess settings.
+    if (
+        StageName.PREPROCESS.value not in enabled_stage_names
+        and isinstance(prior_analysis, dict)
+        and isinstance(prior_analysis.get("settings"), dict)
+    ):
+        prior_settings = prior_analysis["settings"]
+        current_settings = dict(current_analysis.get("settings") or {})
+        if isinstance(prior_settings.get("preprocess"), dict):
+            current_settings["preprocess"] = dict(prior_settings["preprocess"])
+        current_analysis["settings"] = current_settings
+        prior_artifacts = prior_analysis.get("artifact_sha256")
+        if isinstance(prior_artifacts, dict):
+            artifacts = dict(current_analysis.get("artifact_sha256") or {})
+            for name in ("sorter_config",):
+                if name in prior_artifacts:
+                    artifacts[name] = prior_artifacts[name]
+            current_analysis["artifact_sha256"] = artifacts
+    # The merged settings are a new immutable snapshot, not the hash of the
+    # narrow post-only snapshot.  Validate its serialized form immediately.
+    current_analysis = AnalysisConfig.create(
+        dict(current_analysis["settings"]),
+        artifact_sha256=dict(current_analysis.get("artifact_sha256") or {}),
+    ).to_dict()
+    AnalysisConfig.from_dict(current_analysis)
+    current_stage_provenance = {
+        name: read_json(store.run_dir / "snapshots" / f"{name}.json")
+        for name in ("git", "environment", "inputs")
+        if (store.run_dir / "snapshots" / f"{name}.json").exists()
+    }
+    stage_provenance = dict(prior_record.get("stage_provenance") or {})
+    prior_provenance = prior_record.get("provenance")
+    if isinstance(prior_provenance, dict):
+        for stage_name in (prior_record.get("stages") or {}):
+            stage_provenance.setdefault(str(stage_name), prior_provenance)
+    for stage_name in enabled_stage_names:
+        stage_provenance[stage_name] = current_stage_provenance
     record = {
         "schema_version": 1,
         "run_id": store.load_run().get("run_id"),
@@ -1257,14 +2027,11 @@ def finalize_successful_run(store: RunStore) -> dict[str, Any] | None:
             settings.preprocess_source_path or prior_record.get("source_basepath") or ""
         ),
         "session_output_dir": str(session_dir),
-        "analysis": store.load_analysis().to_dict(),
+        "analysis": current_analysis,
         "stage_fingerprints": fingerprints,
         "execution": store.load_execution().to_dict(),
-        "provenance": {
-            name: read_json(store.run_dir / "snapshots" / f"{name}.json")
-            for name in ("git", "environment", "inputs")
-            if (store.run_dir / "snapshots" / f"{name}.json").exists()
-        },
+        "provenance": current_stage_provenance,
+        "stage_provenance": stage_provenance,
         "stages": stage_results,
         "warnings": {"count": len(warnings_found), "items": warnings_found},
         "errors": {"count": len(errors_found), "items": errors_found},
@@ -1284,6 +2051,5 @@ def finalize_successful_run(store: RunStore) -> dict[str, Any] | None:
         errors_found=errors_found,
     )
     atomic_write_json(final_path, _json_safe(record))
-    _remove_success_helpers(store, sorting_dirs)
     release_session_claim(store)
     return record

@@ -25,7 +25,7 @@ import yaml
 from scipy.io import loadmat, savemat
 from spikeinterface.core.job_tools import job_keys as _SI_JOB_KEYS
 
-from .io import load_xml_metadata
+from .io import atomic_write_json, load_xml_metadata
 from .paths import find_project_root
 from .recording import apply_preprocessing, attach_probe_from_chanmap, select_recording_channels
 from src.worker_defaults import default_worker_count
@@ -1234,6 +1234,7 @@ def write_sorter_partition_manifest(
     mode: str,
     sorter: str,
     partitions: list[SorterPartition],
+    filename: str = SORTER_PARTITION_MANIFEST,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -1242,9 +1243,10 @@ def write_sorter_partition_manifest(
         "sorter": sorter,
         "partitions": [asdict(p) for p in partitions],
     }
-    manifest_path = output_dir / SORTER_PARTITION_MANIFEST
-    manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    return manifest_path
+    manifest_path = output_dir / filename
+    # Publishing only after serialization succeeds leaves a previous completed
+    # manifest available when a sorter attempt fails between partitions.
+    return atomic_write_json(manifest_path, payload)
 
 
 def _patch_params_py(

@@ -202,7 +202,17 @@ def _run_preprocess(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
     from src.preprocess.runtime_prep import prepare_preprocess_settings
 
     settings = _settings_for_run(store)
+    from .session import prepare_preprocess_output_contract
+
+    # This must happen before runtime preparation or pipeline execution can
+    # reuse/create a single canonical scientific output.
+    contract_path = prepare_preprocess_output_contract(
+        store, settings, overwrite=bool(settings.preprocess.overwrite)
+    )
     preparation = prepare_preprocess_settings(settings)
+    # Runtime preparation may replace the source basepath with a staged
+    # multi-day combined input; construct the scientific config only after
+    # that rewrite while retaining the contract's canonical output identity.
     config = settings.to_preprocess_config()
     config.sorter = None
     config.sorter_path = None
@@ -213,20 +223,9 @@ def _run_preprocess(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
     config.save_params_json = False
     config.save_manifest_json = False
     config.save_log_mat = False
-    output_dir = settings.local_output_dir
-    if output_dir is not None and Path(output_dir).exists():
-        basename = settings.basename
-        stage_owned_outputs = (
-            Path(output_dir) / f"{basename}.dat",
-            Path(output_dir) / f"{basename}.lfp",
-            Path(output_dir) / f"{basename}.session.mat",
-            Path(output_dir) / f"{basename}.MergePoints.events.mat",
-        )
-        if any(path.exists() for path in stage_owned_outputs):
-            # If this Attempt is executing, the existing Stage was not adopted
-            # as compatible/complete. Do not mix its partial artifacts with a
-            # new computation even when the user-level overwrite toggle is off.
-            config.overwrite = True
+    # `overwrite` is part of the immutable analysis snapshot.  In particular,
+    # an interrupted attempt must not turn a later resume into destructive
+    # recomputation of already published canonical outputs.
     config.highamp_n_jobs = spec.resources.cpus
     config.job_kwargs = {
         **dict(config.job_kwargs),
@@ -235,14 +234,16 @@ def _run_preprocess(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
         "progress_bar": False,
     }
     result = run_preprocess_session(config)
-    required = [
-        Path(result.dat_path) if result.dat_path is not None else Path("__missing_dat__"),
-        Path(result.session_mat_path),
-        Path(result.mergepoints_mat_path),
-        Path(result.local_output_dir) / f"{result.basename}.xml",
-        Path(result.local_output_dir) / "chanMap.mat",
-    ]
-    validated = _validate_paths(required, label="preprocess output")
+    from .session import preprocess_output_inventory, validate_output_inventory
+
+    inventory = preprocess_output_inventory(result, config)
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        contract = {}
+    if contract.get("producer_schema") == "legacy-preprocess-v1":
+        inventory["producer_schema"] = "preprocess-output-validated-legacy-resume-v1"
+    validated = validate_output_inventory(inventory, label="preprocess output")
     return {
         **preparation,
         "preprocess_result": _serialize_dataclass(result),
@@ -250,6 +251,7 @@ def _run_preprocess(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
         "chanmap_path": str((Path(result.local_output_dir) / "chanMap.mat").resolve()),
         "dtype": config.dtype,
         "validated_paths": validated,
+        "output_inventory": inventory,
     }
 
 
@@ -306,10 +308,9 @@ def _run_postprocess(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
 
     settings = _settings_for_run(store)
     config = settings.to_postprocess_config()
-    # An executing Attempt was not adopted as compatible and complete. Force a
-    # real Stage rerun even when the user-level overwrite toggle is false; the
-    # postprocess pipeline versions curated output before replacement.
-    config.overwrite = True
+    # Preserve the saved overwrite contract.  The postprocess implementation
+    # remains responsible for its explicitly allowed atomic cluster-group
+    # update, but this worker must not broaden that authority.
     if StageName.PREPROCESS.value in spec.upstream_attempts:
         preprocess_fact = _load_upstream_result(store, spec, StageName.PREPROCESS)
         pre = preprocess_fact["outputs"]["preprocess_result"]
@@ -336,20 +337,6 @@ def _run_postprocess(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
             and "_spi" not in path.name
             and ".preserved-" not in path.name
         )
-    required_post_names = {
-        "params.py",
-        "spike_times.npy",
-        "spike_clusters.npy",
-        "cluster_group.tsv",
-        "cluster_info.tsv",
-        "quality_metrics.csv",
-    }
-    for sorting_dir in candidate_sorting_dirs:
-        run_root = sorting_dir.parent if sorting_dir.name == "sorter_output" else sorting_dir
-        post_dir = run_root.parent / f"{run_root.name}_spi"
-        if post_dir.exists() and not all((post_dir / name).exists() for name in required_post_names):
-            config.overwrite = True
-            break
     config.job_kwargs = {
         **dict(config.job_kwargs),
         "n_jobs": spec.resources.cpus,
@@ -360,12 +347,9 @@ def _run_postprocess(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
         raise RuntimeError("Postprocess completed without returning a result")
     validated: list[str] = []
     for result in results:
-        validated.extend(
-            _validate_paths(
-                [Path(result.output_folder), Path(result.metrics_csv_path)],
-                label=f"postprocess output {Path(result.output_folder).name}",
-            )
-        )
+        from .session import _validate_post_output
+
+        validated.extend(_validate_post_output(Path(result.output_folder)))
     return {
         "postprocess_results": [_serialize_dataclass(result) for result in results],
         "validated_paths": validated,
@@ -408,6 +392,28 @@ def execute(run_dir: Path, stage: StageName, attempt: int) -> int:
             raise ValueError("AttemptSpec does not match the immutable AnalysisConfig")
         _verify_analysis_artifacts(store, stage)
         outputs = run_stage(store, spec)
+        from .session import OUTPUT_INVENTORY_SCHEMA, PRODUCER_SCHEMAS
+
+        # Stages that already supply a richer inventory (preprocess) retain
+        # it.  Sorting/postprocess inventories derive from their deep
+        # validation list, so completion always records all validated files.
+        inventory = outputs.get("output_inventory")
+        if inventory is None:
+            inventory = {
+                "schema": OUTPUT_INVENTORY_SCHEMA,
+                "producer_schema": PRODUCER_SCHEMAS[stage.value],
+                "entries": [
+                    {"path": str(Path(path).resolve()), "role": "validated_output"}
+                    for path in outputs.get("validated_paths", [])
+                    if Path(path).is_file()
+                ],
+            }
+            outputs["output_inventory"] = inventory
+        allowed_schemas = {PRODUCER_SCHEMAS[stage.value]}
+        if stage == StageName.PREPROCESS:
+            allowed_schemas.add("preprocess-output-validated-legacy-resume-v1")
+        if inventory.get("producer_schema") not in allowed_schemas:
+            raise RuntimeError(f"{stage.value} output inventory has an incompatible producer schema")
         finished_at = _utc_now()
         atomic_write_json(
             attempt_dir / "result.json",
@@ -420,9 +426,11 @@ def execute(run_dir: Path, stage: StageName, attempt: int) -> int:
                 "started_at": started_at,
                 "finished_at": finished_at,
                 "outputs": _json_safe(outputs),
+                "producer_schema": inventory["producer_schema"],
                 "validation": {
                     "passed": True,
                     "validated_paths": list(outputs.get("validated_paths", [])),
+                    "output_inventory": _json_safe(inventory),
                 },
             },
         )

@@ -17,3 +17,4 @@
 - [2026-07-19 mixed Intan/Open Ephys ADC handling](2026-07-19-mixed-source-pipeline-bridge.md)
 - [2026-07-31 staged metadata same-file copy guard](2026-07-31-xml-samefile-guard.md)
 - [2026-08-07 persistent Local and Slurm execution framework](2026-08-07-persistent-local-slurm-execution.md)
+- [2026-08-10 per-subepoch ADC identity and layout](2026-08-10-subepoch-adc-layout.md)

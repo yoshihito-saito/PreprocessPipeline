@@ -7,6 +7,7 @@ import warnings
 
 import numpy as np
 from scipy.io import savemat
+from .io import atomic_savemat, validate_mat_output
 
 from .metafile import MergePointsData, SessionXmlMeta
 
@@ -388,10 +389,35 @@ def _coerce_numeric_to_float64(value: Any) -> Any:
     return value
 
 
-def save_session_mat(path: Path, session_struct: dict[str, Any]) -> Path:
+def save_session_mat(path: Path, session_struct: dict[str, Any], *, overwrite: bool = True) -> Path:
+    if Path(path).exists() and not overwrite:
+        existing = validate_mat_output(Path(path), "session")["session"]
+        try:
+            general = existing["general"]
+            extracellular = existing["extracellular"]
+            expected_general = session_struct["general"]
+            expected_extra = session_struct["extracellular"]
+            same_identity = str(general["name"]) == str(expected_general["name"])
+            same_extra = all(
+                np.isclose(float(np.asarray(extracellular[key]).reshape(-1)[0]), float(np.asarray(expected_extra[key]).reshape(-1)[0]))
+                for key in ("nChannels", "sr", "srLfp", "nSamples")
+            )
+            raw_epochs = existing["epochs"]
+            existing_epochs = [raw_epochs] if isinstance(raw_epochs, dict) else list(np.asarray(raw_epochs, dtype=object).reshape(-1))
+            expected_epochs = list(np.asarray(session_struct["epochs"], dtype=object).reshape(-1))
+            same_epochs = len(existing_epochs) == len(expected_epochs) and all(
+                str(actual["name"]) == str(expected["name"])
+                and np.isclose(float(actual["startTime"]), float(expected["startTime"]))
+                and ("stopTime" not in expected or np.isclose(float(actual["stopTime"]), float(expected["stopTime"])))
+                for actual, expected in zip(existing_epochs, expected_epochs)
+            )
+        except Exception as exc:
+            raise ValueError(f"Invalid existing session output: {path}") from exc
+        if not (same_identity and same_extra and same_epochs):
+            raise ValueError(f"Existing session output is incompatible with current session inputs: {path}")
+        return Path(path)
     session_to_save = copy.deepcopy(session_struct)
     extracellular = session_to_save.get("extracellular")
     if isinstance(extracellular, dict):
         session_to_save["extracellular"] = _coerce_numeric_to_float64(extracellular)
-    savemat(path, {"session": session_to_save}, do_compression=True)
-    return path
+    return atomic_savemat(Path(path), {"session": session_to_save}, required_key="session")

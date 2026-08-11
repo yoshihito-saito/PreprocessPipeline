@@ -7,6 +7,7 @@ from scipy.io import loadmat, savemat
 import spikeinterface.extractors as se
 
 from .artifact_removal import detect_high_amplitude_artifacts, remove_artifacts
+from .io import atomic_savemat
 from .events import export_analog_digital_events, materialize_intermediate_dat
 from .io import (
     build_acquisition_catalog,
@@ -45,20 +46,10 @@ from .state_scoring import run_state_scoring
 
 
 def _make_tree_world_rw(root: Path) -> None:
-    if not root.exists():
-        return
-    paths = [root, *root.rglob("*")]
-    for p in paths:
-        try:
-            if p.is_symlink():
-                continue
-            mode = p.stat().st_mode
-            if p.is_dir():
-                p.chmod(mode | 0o777)
-            elif p.is_file():
-                p.chmod(mode | 0o666)
-        except Exception as exc:
-            print(f"Warning: failed to update permissions for {p}: {exc}")
+    # Persistent runs may adopt pre-existing outputs.  Recursive chmod would
+    # mutate those immutable artifacts (and potentially a linked acquisition
+    # tree), so permissions are left to the creator's umask/ACL policy.
+    del root
 
 
 def _normalize_artifact_ttl_channel(channel: int) -> int:
@@ -145,6 +136,46 @@ def _catalog_analogin_channel_indices(catalog, source_types: list[str]) -> list[
         [int(ch) for ch in indices[idx]] if source_type == "openephys" and indices[idx] else None
         for idx, source_type in enumerate(source_types)
     ]
+
+
+def _catalog_analogin_destination_indices(catalog) -> list[list[int] | None] | None:
+    mappings = getattr(catalog, "adc_output_indices_by_subsession", None)
+    if not mappings:
+        return None
+    n_subsessions = len(catalog.amplifier_paths)
+    if len(mappings) != n_subsessions:
+        raise ValueError("catalog.adc_output_indices_by_subsession must align with catalog.amplifier_paths")
+    source_adc_channels = getattr(catalog, "source_adc_channels", None)
+    source_indices = getattr(catalog, "adc_channel_indices_by_subsession", None)
+    if not source_adc_channels or len(source_adc_channels) != n_subsessions:
+        raise ValueError(
+            "catalog.source_adc_channels must align with populated ADC destination mappings"
+        )
+    if not source_indices or len(source_indices) != n_subsessions:
+        raise ValueError(
+            "catalog.adc_channel_indices_by_subsession must align with populated ADC destination mappings"
+        )
+
+    output_channels = int(catalog.board_adc_channels)
+    normalized: list[list[int] | None] = []
+    for idx, raw_mapping in enumerate(mappings):
+        source_count = int(source_adc_channels[idx])
+        mapping = [] if raw_mapping is None else [int(ch) for ch in raw_mapping]
+        raw_indices = source_indices[idx]
+        indices = [] if raw_indices is None else [int(ch) for ch in raw_indices]
+        if len(indices) != source_count or len(mapping) != source_count:
+            raise ValueError(
+                "ADC source indices and destination mappings must match source_adc_channels "
+                f"for subsession {idx}: count={source_count}, source_indices={indices}, "
+                f"destinations={mapping}"
+            )
+        if len(set(mapping)) != len(mapping) or any(ch < 0 or ch >= output_channels for ch in mapping):
+            raise ValueError(
+                f"ADC destination mappings must be unique indices in [0, {output_channels - 1}] "
+                f"for subsession {idx}: {mapping}"
+            )
+        normalized.append(mapping if source_count > 0 else None)
+    return normalized
 
 
 def _catalog_openephys_ttl_inputs(
@@ -351,8 +382,7 @@ def _save_artifact_events_mat(
     }
     if extra_fields:
         payload.update(extra_fields)
-    savemat(output_path, {struct_name: payload}, do_compression=True)
-    return output_path
+    return atomic_savemat(output_path, {struct_name: payload}, required_key=struct_name)
 
 
 def _artifact_windows_from_peaks(
@@ -465,12 +495,14 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         output_dir,
         basename,
         explicit_xml_path=config.xml_path,
+        overwrite=config.overwrite,
     )
     rhd_path = ensure_rhd(
         basepath,
         output_dir,
         basename,
         use_first_child_match=bool(config.rhd_use_first_child_match),
+        overwrite=config.overwrite,
     )
     xml_meta = load_xml_metadata(xml_path)
     session_xml_meta = load_session_xml_metadata(xml_path)
@@ -546,7 +578,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         sample_counts=catalog.sample_counts,
     )
     mergepoints_path = output_dir / f"{basename}.MergePoints.events.mat"
-    save_mergepoints_events_mat(mergepoints_path, merge_data)
+    save_mergepoints_events_mat(mergepoints_path, merge_data, overwrite=config.overwrite)
 
     ttl_channel_0based: int | None = None
     if ttl_artifact_enabled:
@@ -576,6 +608,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         analog_sidecar_paths = _catalog_analogin_source_paths(catalog)
         analog_source_num_channels = _catalog_analogin_source_num_channels(catalog, catalog_source_types)
         analog_source_channel_indices = _catalog_analogin_channel_indices(catalog, catalog_source_types)
+        analog_destination_channel_indices = _catalog_analogin_destination_indices(catalog)
         digital_sidecar_paths = [
             (p.parent / "digitalin.dat") if (p.parent / "digitalin.dat").exists() else None
             for p in catalog.amplifier_paths
@@ -591,6 +624,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             sample_counts=catalog.sample_counts,
             source_num_channels=analog_source_num_channels,
             source_channel_indices=analog_source_channel_indices,
+            destination_channel_indices=analog_destination_channel_indices,
         )
         if analog_concat is not None:
             intermediate_dat_paths["analogin"] = analog_concat
@@ -1052,7 +1086,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         xml_meta=session_xml_meta,
     )
     session_mat_path = output_dir / f"{basename}.session.mat"
-    save_session_mat(session_mat_path, session_struct)
+    save_session_mat(session_mat_path, session_struct, overwrite=config.overwrite)
 
     def _load_pulses_struct(paths: list[Path], basename_local: str) -> dict | None:
         pulses_candidates = [

@@ -68,6 +68,7 @@ from scipy.io import loadmat, savemat
 from scipy import signal
 
 from .metafile import PreprocessConfig
+from .io import atomic_save_figure, atomic_savemat, validate_mat_output
 
 
 @dataclass
@@ -1012,10 +1013,11 @@ def _compute_emg_from_lfp(
     sampling_frequency: float = 2.0,
 ) -> tuple[dict[str, Any], Path]:
     out_path = basepath / f"{basename}.EMGFromLFP.LFP.mat"
+    # A persisted SleepScoreLFP is not an input when this Run deliberately
+    # disables that product.  Recompute the transient features instead of
+    # silently consuming a stale optional MAT.
     if out_path.exists() and not overwrite:
-        loaded = loadmat(out_path, simplify_cells=True)
-        if "EMGFromLFP" in loaded:
-            return loaded["EMGFromLFP"], out_path
+        return validate_mat_output(out_path, "EMGFromLFP")["EMGFromLFP"], out_path
 
     n_channels = int(session_struct["extracellular"]["nChannels"])
     fs = float(session_struct["extracellular"]["srLfp"])
@@ -1053,7 +1055,7 @@ def _compute_emg_from_lfp(
         "detectorName": "getEMGFromLFP",
         "samplingFrequency": np.asarray([[int(np.rint(sampling_frequency))]], dtype=np.uint8),
     }
-    savemat(out_path, {"EMGFromLFP": emg}, do_compression=True)
+    atomic_savemat(out_path, {"EMGFromLFP": emg}, required_key="EMGFromLFP")
     return emg, out_path
 
 
@@ -1411,7 +1413,7 @@ def _save_swth_figure(
     ax_th_spec.set_title(f"Theta Channel: {int(th_chan_id)}")
     ax_th_spec.set_xlabel("t (s)")
 
-    fig.savefig(out_path, dpi=120)
+    atomic_save_figure(out_path, fig, dpi=120)
     fig.clear()
     return out_path
 
@@ -1435,10 +1437,9 @@ def _compute_sleepscore_lfp(
 ) -> tuple[dict[str, Any], Path, Path]:
     out_path = basepath / f"{basename}.SleepScoreLFP.LFP.mat"
     if out_path.exists() and not overwrite:
-        loaded = loadmat(out_path, simplify_cells=True)
-        if "SleepScoreLFP" in loaded:
-            fig_path = basepath / "StateScoreFigures" / f"{basename}_SWTHChannels.jpg"
-            return loaded["SleepScoreLFP"], out_path, fig_path
+        loaded = validate_mat_output(out_path, "SleepScoreLFP")
+        fig_path = basepath / "StateScoreFigures" / f"{basename}_SWTHChannels.jpg"
+        return loaded["SleepScoreLFP"], out_path, fig_path
 
     n_channels = int(session_struct["extracellular"]["nChannels"])
     fs = float(session_struct["extracellular"]["srLfp"])
@@ -1577,7 +1578,7 @@ def _compute_sleepscore_lfp(
         "params": params,
     }
     if save_files:
-        savemat(out_path, {"SleepScoreLFP": sleepscore_lfp}, do_compression=True)
+        atomic_savemat(out_path, {"SleepScoreLFP": sleepscore_lfp}, required_key="SleepScoreLFP")
     sw_plot = _build_sw_plot_payload(
         lfp_ch=lfp_ds[:, channel_to_col[sw_ch]],
         fs=fs_ds,
@@ -1824,9 +1825,7 @@ def _compute_sleep_state(
 ) -> tuple[dict[str, Any], Path]:
     out_path = basepath / f"{basename}.SleepState.states.mat"
     if out_path.exists() and not overwrite:
-        loaded = loadmat(out_path, simplify_cells=True)
-        if "SleepState" in loaded:
-            return loaded["SleepState"], out_path
+        return validate_mat_output(out_path, "SleepState")["SleepState"], out_path
 
     sw_lfp = np.asarray(sleepscore_lfp["swLFP"], dtype=np.float64).reshape(-1)
     th_lfp = np.asarray(sleepscore_lfp["thLFP"], dtype=np.float64).reshape(-1)
@@ -2156,7 +2155,7 @@ def _compute_sleep_state(
         "idx": idx_struct,
         "detectorinfo": detectorinfo,
     }
-    savemat(out_path, {"SleepState": sleep_state}, do_compression=True)
+    atomic_savemat(out_path, {"SleepState": sleep_state}, required_key="SleepState")
     return sleep_state, out_path
 
 
@@ -2169,12 +2168,17 @@ def _state_colors(idx: np.ndarray) -> np.ndarray:
     return colors
 
 
-def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, Any]) -> list[Path]:
+def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, Any], *, overwrite: bool) -> list[Path]:
     fig_dir = basepath / "StateScoreFigures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     p_results = fig_dir / f"{basename}_SSResults.jpg"
     p_2d = fig_dir / f"{basename}_SSCluster2D.jpg"
     p_3d = fig_dir / f"{basename}_SSCluster3D.jpg"
+    existing = {p for p in (p_results, p_2d, p_3d) if p.exists()}
+    if not overwrite:
+        invalid = [p for p in existing if not p.is_file() or p.stat().st_size == 0]
+        if invalid:
+            raise ValueError(f"Invalid existing state-score figure with overwrite=False: {invalid[0]}")
 
     metrics = sleep_state["detectorinfo"]["detectionparms"]["SleepScoreMetrics"]
     t = np.asarray(metrics["t_clus"], dtype=np.float64).reshape(-1)
@@ -2210,10 +2214,8 @@ def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, An
 
     try:
         fig = _new_saved_figure(figsize=(12, 11))
-    except Exception:
-        for p in (p_results, p_2d, p_3d):
-            p.touch()
-        return [p_results, p_2d, p_3d]
+    except Exception as exc:
+        raise RuntimeError("Could not create state-score figures; no placeholder outputs were published.") from exc
 
     # Figure 1: SSResults (spectrograms + state bars + metrics)
     gs = fig.add_gridspec(8, 1, hspace=0.18)
@@ -2302,7 +2304,8 @@ def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, An
     ax_emg.set_xlim(viewwin)
     ax_emg.set_xlabel("t (s)")
 
-    fig.savefig(p_results, dpi=120)
+    if overwrite or p_results not in existing:
+        atomic_save_figure(p_results, fig, dpi=120)
     fig.clear()
 
     # Figure 2: SSCluster2D
@@ -2361,7 +2364,8 @@ def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, An
     ax22.set_xlabel("Narrowband Theta")
     ax22.set_ylabel("EMG")
 
-    fig.savefig(p_2d, dpi=120)
+    if overwrite or p_2d not in existing:
+        atomic_save_figure(p_2d, fig, dpi=120)
     fig.clear()
 
     # Figure 3: SSCluster3D
@@ -2394,7 +2398,8 @@ def _save_state_figures(basepath: Path, basename: str, sleep_state: dict[str, An
     ax3d.set_ylabel("Narrowband Theta")
     ax3d.set_zlabel("EMG")
 
-    fig.savefig(p_3d, dpi=120)
+    if overwrite or p_3d not in existing:
+        atomic_save_figure(p_3d, fig, dpi=120)
     fig.clear()
 
     return [p_results, p_2d, p_3d]
@@ -2406,7 +2411,11 @@ def _states_to_episodes(
     basename: str,
     *,
     microarousal_sec: float = 100.0,
+    overwrite: bool = True,
 ) -> tuple[dict[str, Any], Path]:
+    out_path = basepath / f"{basename}.SleepStateEpisodes.states.mat"
+    if out_path.exists() and not overwrite:
+        return validate_mat_output(out_path, "SleepStateEpisodes")["SleepStateEpisodes"], out_path
     ints = sleep_state.get("ints", {})
     nrem = np.asarray(ints.get("NREMstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
     wake = np.asarray(ints.get("WAKEstate", np.empty((0, 2))), dtype=np.float64).reshape(-1, 2)
@@ -2492,8 +2501,7 @@ def _states_to_episodes(
         },
         "detectorinfo": det,
     }
-    out_path = basepath / f"{basename}.SleepStateEpisodes.states.mat"
-    savemat(out_path, {"SleepStateEpisodes": episodes}, do_compression=True)
+    atomic_savemat(out_path, {"SleepStateEpisodes": episodes}, required_key="SleepStateEpisodes")
     return episodes, out_path
 
 
@@ -2534,7 +2542,7 @@ def _append_theta_epochs(sleep_state: dict[str, Any], basepath: Path, basename: 
     ).reshape(-1, 2)
 
     out_path = basepath / f"{basename}.SleepState.states.mat"
-    savemat(out_path, {"SleepState": sleep_state}, do_compression=True)
+    atomic_savemat(out_path, {"SleepState": sleep_state}, required_key="SleepState")
     return sleep_state, out_path
 
 
@@ -2580,15 +2588,32 @@ def run_state_scoring(
         basepath / "StateScoreFigures" / f"{basename}_SSCluster2D.jpg",
         basepath / "StateScoreFigures" / f"{basename}_SSCluster3D.jpg",
     ]
-    if not config.overwrite and all(path.exists() for path in required_outputs):
-        print("Skipping state scoring: existing outputs found and overwrite=False")
-        return StateScoreResult(
-            emg_mat_path=emg_path,
-            sleepscore_lfp_mat_path=sleep_lfp_path,
-            sleep_state_mat_path=sleep_state_path,
-            sleep_state_episodes_mat_path=episodes_path,
-            figure_paths=fig_paths,
+    # Under overwrite=False, downstream outputs are immutable.  If an
+    # ancestor is absent (or is intentionally unrequested), do not regenerate
+    # it and then reuse stale SleepState/episodes/figures.  Fail before any
+    # producer mutation; a user can explicitly overwrite or remove/version
+    # the incompatible descendants.  The complementary case—valid ancestors
+    # with missing descendants—continues through the normal repair path.
+    emg_available = emg_path.exists()
+    sleep_lfp_available = bool(config.state_save_lfp_mat) and sleep_lfp_path.exists()
+    downstream_exists = any(path.exists() for path in [sleep_state_path, episodes_path, *fig_paths])
+    if not config.overwrite and (not emg_available or not sleep_lfp_available) and downstream_exists:
+        missing = "EMGFromLFP" if not emg_available else "SleepScoreLFP"
+        raise RuntimeError(
+            "Refusing to reuse immutable state-scoring descendants because required "
+            f"ancestor {missing} is missing or unrequested with overwrite=False"
         )
+    if not config.overwrite and all(path.exists() for path in required_outputs):
+        validate_mat_output(emg_path, "EMGFromLFP")
+        validate_mat_output(sleep_state_path, "SleepState")
+        validate_mat_output(episodes_path, "SleepStateEpisodes")
+        if config.state_save_lfp_mat:
+            validate_mat_output(sleep_lfp_path, "SleepScoreLFP")
+        invalid_figure = next((p for p in fig_paths if not p.is_file() or p.stat().st_size == 0), None)
+        if invalid_figure is not None:
+            raise ValueError(f"Invalid existing state-score figure with overwrite=False: {invalid_figure}")
+        print("Skipping state scoring: validated existing outputs found and overwrite=False")
+        return StateScoreResult(emg_path, sleep_lfp_path, sleep_state_path, episodes_path, fig_paths)
 
     ignoretime = _extract_ignoretime_from_pulses(pulses)
     reject_channels_1based = _extract_bad_channels_1based(session_struct)
@@ -2631,6 +2656,27 @@ def run_state_scoring(
         parallel_jobs=parallel_jobs,
         pss_cache=pss_cache,
     )
+    # SleepScoreLFP is a valid immutable ancestor, but its channel-selection
+    # figure may have been lost in an interrupted attempt.  Rebuild only that
+    # missing descendant; never rewrite the canonical MAT in this repair path.
+    if not config.overwrite and not swth_fig.exists() and sleep_lfp_path.exists():
+        _, _, swth_fig = _compute_sleepscore_lfp(
+            basepath=basepath,
+            basename=basename,
+            lfp_path=lfp_path,
+            session_struct=session_struct,
+            reject_channels_1based=reject_channels_1based,
+            sw_channels_1based=sw_channels_1based,
+            th_channels_1based=th_channels_1based,
+            ignoretime=ignoretime,
+            window_sec=float(config.state_winparms[0]),
+            smoothfact=float(config.state_winparms[1]),
+            overwrite=True,
+            save_files=False,
+            parallel_jobs=parallel_jobs,
+            pss_cache=pss_cache,
+        )
+    state_preexisted = sleep_state_path.exists() and not config.overwrite
     sleep_state, sleep_state_path = _compute_sleep_state(
         basepath=basepath,
         basename=basename,
@@ -2653,16 +2699,21 @@ def run_state_scoring(
         overwrite=config.overwrite,
         pss_cache=pss_cache,
     )
-    fig_paths = _save_state_figures(basepath, basename, sleep_state)
+    fig_paths = _save_state_figures(basepath, basename, sleep_state, overwrite=config.overwrite)
     episodes, episodes_path = _states_to_episodes(
         sleep_state,
         basepath,
         basename,
         microarousal_sec=float(config.state_microarousal_sec),
+        overwrite=config.overwrite,
     )
     if not episodes:
         warnings.warn("Failed to build SleepStateEpisodes.", RuntimeWarning, stacklevel=2)
-    sleep_state, sleep_state_path = _append_theta_epochs(sleep_state, basepath, basename)
+    # A validated canonical state output is immutable under overwrite=False.
+    # It already represents a completed producer output, so do not append theta
+    # epochs in-place merely because a descendant (for example a figure) was missing.
+    if not state_preexisted:
+        sleep_state, sleep_state_path = _append_theta_epochs(sleep_state, basepath, basename)
 
     all_fig_paths = [swth_fig, *fig_paths]
     return StateScoreResult(

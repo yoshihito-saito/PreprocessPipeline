@@ -70,6 +70,7 @@ def prepare_preprocess_settings(settings: Any) -> dict[str, Any]:
         probe_assignments=settings.preprocess.probe_assignments,
         reject_channels=settings.preprocess.reject_channels,
         xml_path=xml_path,
+        overwrite=settings.preprocess.overwrite,
     )
     print(f"Prepared chanMap: {chanmap_path}", flush=True)
     print(f"Bad channels: {bad_channels}", flush=True)

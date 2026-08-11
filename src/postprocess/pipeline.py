@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 import gc
+import hashlib
 import json
 import os
 import re
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Callable
@@ -68,6 +70,19 @@ def _find_sorting_output_dirs_from_manifest(root: Path) -> list[Path]:
         if not folder_text:
             continue
         folder = Path(folder_text).expanduser().resolve()
+        try:
+            relative_folder = folder.relative_to(root.resolve())
+        except ValueError:
+            # A manifest is an input, not authority to read arbitrary folders.
+            continue
+        # Partition manifests are allowed to select only direct Kilosort run
+        # directories below the session root.  Do not let a malformed manifest
+        # turn the session root itself (or a nested arbitrary folder) into a
+        # Phy input.
+        if len(relative_folder.parts) != 1 or not any(
+            folder.match(pattern) for pattern in _SORTING_OUTPUT_PATTERNS
+        ):
+            continue
         if (
             not folder.exists()
             or not folder.is_dir()
@@ -112,6 +127,112 @@ def _should_skip_postprocess_target(
 ) -> bool:
     overwrite = _postprocess_overwrite_enabled(config)
     return (not overwrite) and metrics_csv_path.exists() and _phy_export_outputs_exist(output_folder)
+
+
+def _create_postprocess_staging_folder(output_folder: Path) -> Path:
+    """Allocate a same-filesystem attempt directory beside the canonical output."""
+    output_folder.parent.mkdir(parents=True, exist_ok=True)
+    return Path(
+        tempfile.mkdtemp(prefix=f".{output_folder.name}.attempt-", dir=output_folder.parent)
+    )
+
+
+def _validate_postprocess_output(output_folder: Path, metrics_csv_name: str) -> None:
+    """Reject incomplete or unreadable exports before they can become canonical."""
+    required = (
+        metrics_csv_name,
+        "params.py",
+        "spike_times.npy",
+        "spike_clusters.npy",
+        "cluster_group.tsv",
+        "cluster_info.tsv",
+    )
+    missing = [name for name in required if not (output_folder / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            "Postprocess attempt did not produce a complete Phy output: "
+            f"{output_folder} (missing: {', '.join(missing)})"
+        )
+    try:
+        params_text = (output_folder / "params.py").read_text(encoding="utf-8")
+        if not params_text.strip():
+            raise ValueError("params.py is empty")
+
+        spike_times = np.load(output_folder / "spike_times.npy", allow_pickle=False)
+        spike_clusters = np.load(output_folder / "spike_clusters.npy", allow_pickle=False)
+        if spike_times.reshape(-1).shape[0] != spike_clusters.reshape(-1).shape[0]:
+            raise ValueError(
+                "spike_times.npy and spike_clusters.npy have mismatched lengths: "
+                f"{spike_times.reshape(-1).shape[0]} vs {spike_clusters.reshape(-1).shape[0]}"
+            )
+
+        for name, separator in (
+            ("cluster_group.tsv", "\t"),
+            ("cluster_info.tsv", "\t"),
+            (metrics_csv_name, ","),
+        ):
+            table = pd.read_csv(output_folder / name, sep=separator)
+            if table.empty and len(table.columns) == 0:
+                raise ValueError(f"{name} has no columns")
+    except Exception as exc:
+        raise RuntimeError(
+            "Postprocess attempt validation failed; canonical output was not modified. "
+            f"Staging directory: {output_folder}. Cause: {exc}"
+        ) from exc
+
+
+def _publish_postprocess_attempt(
+    *, output_folder: Path, staging_folder: Path, metrics_csv_name: str
+) -> Path | None:
+    """Atomically replace a canonical output only after validating the attempt.
+
+    The previous canonical directory is first renamed to a versioned sibling.
+    If publication of the attempt fails, that immediate prior directory is
+    restored before the exception is propagated.
+    """
+    _validate_postprocess_output(staging_folder, metrics_csv_name)
+    preserved: Path | None = None
+    if output_folder.exists():
+        preserved = _preserve_or_remove_postprocess_output(output_folder)
+    try:
+        staging_folder.rename(output_folder)
+    except Exception:
+        if preserved is not None and not output_folder.exists():
+            preserved.rename(output_folder)
+        raise
+    return preserved
+
+
+def _assert_postprocess_output_is_writable(
+    config: PostprocessConfig,
+    *,
+    output_folder: Path,
+    metrics_csv_path: Path,
+) -> None:
+    """Fail closed rather than merging a partial export into an immutable output."""
+    if _postprocess_overwrite_enabled(config) or not output_folder.exists():
+        return
+    if _should_skip_postprocess_target(
+        config, output_folder=output_folder, metrics_csv_path=metrics_csv_path
+    ):
+        return
+    missing = [
+        name
+        for name in (
+            config.metrics_csv_name,
+            "params.py",
+            "spike_times.npy",
+            "spike_clusters.npy",
+            "cluster_group.tsv",
+            "cluster_info.tsv",
+        )
+        if not (output_folder / name).exists()
+    ]
+    detail = ", ".join(missing) if missing else "incompatible postprocess contents"
+    raise FileExistsError(
+        "Refusing to modify existing postprocess output with overwrite=False: "
+        f"{output_folder} (missing/invalid: {detail}). Enable overwrite to rebuild it."
+    )
 
 
 def _resolve_postprocess_search_root(config: PostprocessConfig) -> Path:
@@ -258,7 +379,61 @@ def _mark_low_firing_rate_clusters_as_noise(
             out_df.loc[out_df["cluster_id"].isin(low_set), "group"] = "noise"
         out_df = out_df.sort_values("cluster_id").reset_index(drop=True)
 
-    out_df.to_csv(cg_path, sep="\t", index=False)
+    # This is the one deliberate mutation of the input Kilosort result. Retain
+    # the immediate pre-mutation table on every call, so recovery never points
+    # at an old or already-relabelled version.
+    backup_path = cg_path.with_name(f"{cg_path.name}.pre-low-rate-backup")
+    backup_sha256: str | None = None
+    if cg_path.exists():
+        source_bytes = cg_path.read_bytes()
+        backup_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        fd, backup_tmp_name = tempfile.mkstemp(
+            prefix=f".{backup_path.name}.", suffix=".tmp", dir=backup_path.parent
+        )
+        backup_tmp = Path(backup_tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(source_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if backup_tmp.read_bytes() != source_bytes:
+                raise RuntimeError(f"Failed to validate low-rate recovery backup: {backup_path}")
+            os.replace(backup_tmp, backup_path)
+        finally:
+            backup_tmp.unlink(missing_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{cg_path.name}.", suffix=".tmp", dir=cg_path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            out_df.to_csv(handle, sep="\t", index=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, cg_path)
+        provenance_path = cg_path.with_name(f"{cg_path.name}.pre-low-rate-provenance.json")
+        fd, provenance_tmp_name = tempfile.mkstemp(
+            prefix=f".{provenance_path.name}.", suffix=".tmp", dir=provenance_path.parent
+        )
+        provenance_tmp = Path(provenance_tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "operation": "mark_low_firing_rate_clusters_as_noise",
+                        "backup": str(backup_path) if backup_path.exists() else None,
+                        "backup_sha256": backup_sha256,
+                        "threshold_hz": float(threshold_hz),
+                        "updated_at_unix": time.time(),
+                    },
+                    handle,
+                    indent=2,
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(provenance_tmp, provenance_path)
+        finally:
+            provenance_tmp.unlink(missing_ok=True)
+    finally:
+        tmp_path.unlink(missing_ok=True)
     return int(out_df.shape[0]), int(low_rate_clusters.size)
 
 
@@ -761,10 +936,11 @@ def _config_for_sorting_target(
     )
 
 
-def _run_postprocess_single_session(
+def _run_postprocess_single_session_impl(
     config: PostprocessConfig,
     *,
     sorting_phy_folder: Path,
+    attempt_state: dict[str, Path],
 ) -> PostprocessResult:
     def _log(message: str) -> None:
         if config.verbose:
@@ -801,15 +977,23 @@ def _run_postprocess_single_session(
             preprocessed_dat_path=preprocessed_dat_path,
         )
 
+    _assert_postprocess_output_is_writable(
+        config, output_folder=output_folder, metrics_csv_path=metrics_csv_path
+    )
+
     _log(f"sorting_phy_folder={sorting_phy_folder}")
-    if output_folder.exists() and overwrite:
-        preserved = _preserve_or_remove_postprocess_output(output_folder)
-        if preserved is not None:
-            _log(f"versioned prior output before overwrite: {preserved}")
-    output_folder.mkdir(parents=True, exist_ok=True)
-    _log(f"output_folder={output_folder}")
+    canonical_output_folder = output_folder
+    output_folder = _create_postprocess_staging_folder(canonical_output_folder)
+    attempt_state["staging_folder"] = output_folder
+    metrics_csv_path = output_folder / config.metrics_csv_name
+    # All derived Phy files, metrics, and classification tables are written
+    # inside this attempt directory. The canonical *_spi directory remains
+    # untouched until a complete attempt has been validated and published.
+    _log(f"staging_output_folder={output_folder}")
     if analyzer_cache_root is not None:
-        if analyzer_cache_root.exists() and overwrite and not config.skip_curation:
+        if config.analyzer_cache_dir is None:
+            analyzer_cache_root = output_folder / "analyzer_cache"
+        elif analyzer_cache_root.exists() and overwrite and not config.skip_curation:
             _safe_rmtree(analyzer_cache_root)
         analyzer_cache_root.mkdir(parents=True, exist_ok=True)
         _log(f"analyzer_cache_dir={analyzer_cache_root}")
@@ -1103,11 +1287,21 @@ def _run_postprocess_single_session(
         f"done: n_units_final={n_units_final}, total_spikes_final={total_spikes_final}, "
         f"n_noise_clusters={n_noise_clusters}"
     )
+    preserved = _publish_postprocess_attempt(
+        output_folder=canonical_output_folder,
+        staging_folder=output_folder,
+        metrics_csv_name=config.metrics_csv_name,
+    )
+    attempt_state.pop("staging_folder", None)
+    if preserved is not None:
+        _log(f"versioned prior output after successful replacement: {preserved}")
+    if config.analyzer_cache_dir is None and analyzer_cache_for_result is not None:
+        analyzer_cache_for_result = canonical_output_folder / analyzer_cache_for_result.name
     return PostprocessResult(
         sorting_phy_folder=sorting_phy_folder,
-        output_folder=output_folder,
+        output_folder=canonical_output_folder,
         preprocessed_dat_path=preprocessed_dat_path,
-        metrics_csv_path=metrics_csv_path,
+        metrics_csv_path=canonical_output_folder / config.metrics_csv_name,
         analyzer_cache_dir=analyzer_cache_for_result,
         n_units_initial=n_units_initial,
         n_units_final=n_units_final,
@@ -1115,6 +1309,26 @@ def _run_postprocess_single_session(
         total_spikes_final=total_spikes_final,
         n_noise_clusters=n_noise_clusters,
     )
+
+
+def _run_postprocess_single_session(
+    config: PostprocessConfig,
+    *,
+    sorting_phy_folder: Path,
+) -> PostprocessResult:
+    """Run one target, removing failed attempt artifacts without touching canonical output."""
+    attempt_state: dict[str, Path] = {}
+    try:
+        return _run_postprocess_single_session_impl(
+            config,
+            sorting_phy_folder=sorting_phy_folder,
+            attempt_state=attempt_state,
+        )
+    except Exception:
+        staging_folder = attempt_state.get("staging_folder")
+        if staging_folder is not None and staging_folder.exists():
+            _safe_rmtree(staging_folder)
+        raise
 
 
 def run_postprocess_session(config: PostprocessConfig) -> list[PostprocessResult]:

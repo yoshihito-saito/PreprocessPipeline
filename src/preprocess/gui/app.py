@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from typing import Any
 
 import numpy as np
@@ -87,6 +89,7 @@ from .config_model import (
     parse_int_list,
     postprocess_output_folder_for_sorting,
     resolve_existing_session_settings,
+    load_local_session_resume,
 )
 from .anatomical_map import (
     AnatomicalChannelGroup,
@@ -100,6 +103,7 @@ from .run_pipeline import ERROR_PREFIX, RESULT_PREFIX
 
 
 REPO_ROOT = find_project_root()
+CONFIG_DIR = REPO_ROOT / "config"
 PUBLIC_DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "preprocess_gui_default_config.json"
 LOCAL_DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "preprocess_gui_default_config.local.json"
 VENDORED_CELLEXPLORER_ROOT = REPO_ROOT / "external" / "CellExplorer"
@@ -239,6 +243,28 @@ def _move_local_output_to_storage(
         )
     if src_root == dst_root:
         raise ValueError(f"Local output and storage destination are identical: {src_root}")
+    try:
+        src_root.relative_to(dst_root)
+    except ValueError:
+        try:
+            dst_root.relative_to(src_root)
+        except ValueError:
+            pass
+        else:
+            raise ValueError(f"Storage destination cannot be inside local output: {dst_root}")
+    else:
+        raise ValueError(f"Local output cannot be inside storage destination: {src_root}")
+
+    # A persistent Run marker associates this output folder with immutable Run
+    # records, which can live in an external workspace.  Relocating only the
+    # session tree would leave those records inconsistent, so reject before
+    # staging or changing either tree rather than mutating the Run in place.
+    claim_path = src_root / ".pipeline-active-run.json"
+    if claim_path.exists():
+        raise ValueError(
+            "Cannot move an output folder with .pipeline-active-run.json. "
+            "Resume or resolve the persistent Run before moving its outputs."
+        )
 
     excluded: dict[str, str] = {
         f"{basename}.xml": "input metadata already belongs in basepath",
@@ -268,21 +294,199 @@ def _move_local_output_to_storage(
             f"{shown}{suffix}"
         )
 
-    moved: list[dict[str, str]] = []
-    for src, dst in move_items:
-        if dst.exists() or dst.is_symlink():
-            if dst.is_dir() and not dst.is_symlink():
-                shutil.rmtree(dst)
+    def _path_size(path: Path) -> int:
+        if path.is_file():
+            return path.stat().st_size
+        return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+    def _content_signature(path: Path) -> tuple[tuple[str, str, str], ...]:
+        """Return a content-aware, symlink-safe inventory rooted at *path*."""
+        entries: list[tuple[str, str, str]] = []
+
+        def digest(file_path: Path) -> str:
+            hasher = hashlib.sha256()
+            with file_path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    hasher.update(block)
+            return hasher.hexdigest()
+
+        def visit(item: Path, relative: Path) -> None:
+            if item.is_symlink():
+                entries.append((relative.as_posix(), "symlink", os.readlink(item)))
+            elif item.is_dir():
+                entries.append((relative.as_posix(), "directory", ""))
+                for child in sorted(item.iterdir(), key=lambda candidate: candidate.name):
+                    visit(child, relative / child.name)
+            elif item.is_file():
+                entries.append((relative.as_posix(), "file", digest(item)))
             else:
-                dst.unlink()
-        shutil.move(str(src), str(dst))
-        set_tree_world_rw(dst)
-        moved.append({"name": dst.name, "path": str(dst)})
+                raise ValueError(f"Unsupported output item for transactional move: {item}")
+
+        visit(path, Path("."))
+        return tuple(entries)
+
+    def _rewrite_relocated_paths(path: Path) -> None:
+        if not path.is_file() or path.suffix.lower() not in {".yaml", ".yml", ".json", ".py"}:
+            return
+        if path.name == "preprocess_run.yaml":
+            # The completed-record execution workspace may be a valid external
+            # Run workspace.  It is not relocated with this session tree and
+            # must stay usable after recovery; update only session-referencing
+            # values in the completed record.
+            import yaml
+
+            payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+            def rewrite(value: Any, *, key: str | None = None) -> Any:
+                if isinstance(value, dict):
+                    return {name: rewrite(item, key=str(name)) for name, item in value.items()}
+                if isinstance(value, list):
+                    return [rewrite(item) for item in value]
+                if isinstance(value, str) and key != "workspace":
+                    return value.replace(str(src_root), str(dst_root))
+                return value
+
+            rewritten = rewrite(payload)
+            if rewritten != payload:
+                tmp = path.with_name(f".{path.name}.move-rewrite-{uuid.uuid4().hex}")
+                tmp.write_text(yaml.safe_dump(rewritten, sort_keys=False), encoding="utf-8")
+                os.replace(tmp, path)
+            # Validate that the rewritten file is parseable before publication.
+            if not isinstance(yaml.safe_load(path.read_text(encoding="utf-8")), (dict, list, type(None))):
+                raise ValueError(f"Rewritten YAML metadata has an invalid root: {path}")
+            return
+        if path.suffix.lower() == ".json":
+            text = path.read_text(encoding="utf-8", errors="surrogateescape")
+            rewritten = text.replace(str(src_root), str(dst_root))
+            if rewritten != text:
+                tmp = path.with_name(f".{path.name}.move-rewrite-{uuid.uuid4().hex}")
+                tmp.write_text(rewritten, encoding="utf-8", errors="surrogateescape")
+                os.replace(tmp, path)
+            json.loads(path.read_text(encoding="utf-8"))
+            return
+        text = path.read_text(encoding="utf-8", errors="surrogateescape")
+        rewritten = text.replace(str(src_root), str(dst_root))
+        if rewritten != text:
+            tmp = path.with_name(f".{path.name}.move-rewrite-{uuid.uuid4().hex}")
+            tmp.write_text(rewritten, encoding="utf-8", errors="surrogateescape")
+            os.replace(tmp, path)
+
+    inventory_move = [{"name": src.name, "bytes": _path_size(src)} for src, _dst in move_items]
+
+    # A custom storage location must retain the minimal raw metadata required to
+    # reopen a session after local cleanup.  It is copied, not counted as a moved
+    # analysis output, because the established UI semantics leave it in place.
+    metadata_copies: list[tuple[Path, Path]] = []
+    if destination_dir is not None and clean_after_move:
+        for name in (f"{basename}.xml", f"{basename}.rhd"):
+            src = src_root / name
+            dst = dst_root / name
+            if not dst.exists():
+                if not src.exists():
+                    raise FileNotFoundError(
+                        f"Custom storage needs {name} before local cleanup, but it is absent from both "
+                        f"the source and destination: {dst_root}"
+                    )
+                metadata_copies.append((src, dst))
+
+    staging: Path | None = None
+    for _attempt in range(10):
+        candidate = dst_root / f".{basename}.move-staging-{uuid.uuid4().hex}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        staging = candidate
+        break
+    if staging is None:
+        raise FileExistsError(f"Could not allocate a unique move staging directory under {dst_root}")
+    backups = staging / "backups"
+    published: list[tuple[Path, Path | None]] = []
+    moved: list[dict[str, str]] = []
+    staged_signatures: dict[Path, tuple[tuple[str, str, str], ...]] = {}
+    try:
+        # Stage a byte-for-byte copy before modifying either canonical tree.
+        for src, dst in move_items + metadata_copies:
+            staged = staging / src.name
+            if src.is_dir() and not src.is_symlink():
+                shutil.copytree(src, staged, symlinks=True)
+            else:
+                shutil.copy2(src, staged, follow_symlinks=False)
+            # First prove that the raw copy is exact.  Metadata rewriting below
+            # is intentional and therefore validated separately.
+            if _content_signature(src) != _content_signature(staged):
+                raise IOError(f"Staged transfer validation failed for {src}")
+            for candidate in [staged, *staged.rglob("*")] if staged.is_dir() else [staged]:
+                _rewrite_relocated_paths(candidate)
+            staged_signatures[dst] = _content_signature(staged)
+
+        # Publish only after every item has been copied and validated.  Existing
+        # destinations are held in the staging tree so a later failure restores
+        # the exact prior destination rather than leaving a partial move behind.
+        for src, dst in move_items + metadata_copies:
+            staged = staging / src.name
+            backup: Path | None = None
+            if dst.exists() or dst.is_symlink():
+                if not overwrite:
+                    # Metadata can coexist only when it already existed; output
+                    # conflicts were rejected above.
+                    if (src, dst) in metadata_copies:
+                        continue
+                    raise FileExistsError(f"Destination appeared during move: {dst}")
+                backups.mkdir(exist_ok=True)
+                backup = backups / dst.name
+                os.replace(dst, backup)
+            os.replace(staged, dst)
+            published.append((dst, backup))
+            if (src, dst) in move_items:
+                set_tree_world_rw(dst)
+                moved.append({"name": dst.name, "path": str(dst), "bytes": _path_size(dst)})
+
+        # Verify the canonical destination after publication before deleting the
+        # source.  This makes injected copy/publish failures recoverable.
+        for src, dst in move_items + metadata_copies:
+            if _content_signature(dst) != staged_signatures[dst]:
+                raise IOError(f"Published transfer validation failed for {dst}")
+    except Exception:
+        for dst, backup in reversed(published):
+            if dst.exists() or dst.is_symlink():
+                if dst.is_dir() and not dst.is_symlink():
+                    shutil.rmtree(dst)
+                else:
+                    dst.unlink()
+            if backup is not None and backup.exists():
+                os.replace(backup, dst)
+        raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
 
     cleaned = False
-    if clean_after_move and src_root.exists():
-        shutil.rmtree(src_root)
-        cleaned = True
+    if clean_after_move:
+        try:
+            if src_root.exists():
+                shutil.rmtree(src_root)
+            cleaned = True
+        except Exception as exc:
+            raise OSError(
+                "Destination publication succeeded, but local source cleanup failed; "
+                f"the destination remains valid at {dst_root}: {exc}"
+            ) from exc
+    else:
+        deletion_errors: list[str] = []
+        for src, _dst in move_items:
+            try:
+                if src.is_dir() and not src.is_symlink():
+                    shutil.rmtree(src)
+                else:
+                    src.unlink(missing_ok=True)
+            except Exception as exc:
+                deletion_errors.append(f"{src}: {exc}")
+        if deletion_errors:
+            raise OSError(
+                "Destination publication succeeded, but some moved local source items could not be removed; "
+                f"the destination remains valid at {dst_root}: " + "; ".join(deletion_errors)
+            )
 
     return {
         "basepath": str(dst_root),
@@ -290,6 +494,11 @@ def _move_local_output_to_storage(
         "local_output_dir": str(src_root),
         "moved": moved,
         "skipped": skipped,
+        "inventory": {
+            "move": inventory_move,
+            "retain": skipped,
+            "delete_local": clean_after_move,
+        },
         "overwrite": overwrite,
         "move_dat": move_dat,
         "clean_after_move": clean_after_move,
@@ -1877,6 +2086,11 @@ class MainWindow(QMainWindow):
         self._process_error: dict[str, Any] | None = None
         self._process_tail = ""
         self._process_stop_escalated = False
+        self._legacy_process_session_claim: tuple[Path, str] | None = None
+        # The QProcess can report that its direct child exited while a legacy
+        # noise-label worker it spawned is still alive.  Keep the process-group
+        # leader separately because QProcess.processId() becomes zero on exit.
+        self._legacy_process_group_pid: int | None = None
         self._move_storage_override: Path | None = None
         self._move_source_snapshot: tuple[Path, str] | None = None
         self._active_run_dir: Path | None = None
@@ -1944,7 +2158,7 @@ class MainWindow(QMainWindow):
             }
             QWidget {
                 color: #e5e5e5;
-                font-size: 12px;
+                font-size: 11px;
             }
             QWidget#rootWidget {
                 background: #252525;
@@ -1956,8 +2170,8 @@ class MainWindow(QMainWindow):
                 background: #2f2f2f;
                 border: 0;
                 border-radius: 5px;
-                margin-top: 18px;
-                padding: 12px;
+                margin-top: 16px;
+                padding: 10px;
                 font-weight: 650;
                 color: #f5f5f5;
             }
@@ -1973,7 +2187,7 @@ class MainWindow(QMainWindow):
             }
             QLabel#hintLabel {
                 color: #a8a8a8;
-                font-size: 11px;
+                font-size: 10px;
                 font-weight: 400;
             }
             QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
@@ -1981,12 +2195,12 @@ class MainWindow(QMainWindow):
                 color: #f0f0f0;
                 border: 1px solid #555555;
                 border-radius: 5px;
-                padding: 5px 7px;
+                padding: 4px 6px;
                 selection-background-color: #606060;
             }
             QPlainTextEdit {
                 font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-                font-size: 12px;
+                font-size: 11px;
             }
             QComboBox::drop-down {
                 border: 0;
@@ -2009,7 +2223,7 @@ class MainWindow(QMainWindow):
                 color: #f0f0f0;
                 border: 1px solid #555555;
                 border-radius: 5px;
-                padding: 7px 11px;
+                padding: 6px 9px;
             }
             QPushButton:hover {
                 background: #464646;
@@ -2068,7 +2282,7 @@ class MainWindow(QMainWindow):
                 background: #1f1f1f;
                 color: #a3a3a3;
                 border: 1px solid #444444;
-                padding: 8px 12px;
+                padding: 7px 10px;
             }
             QTabBar::tab:selected {
                 background: #111111;
@@ -2161,7 +2375,7 @@ class MainWindow(QMainWindow):
             QMessageBox QLabel {
                 color: #e8e8e8;
                 background: transparent;
-                font-size: 12px;
+                font-size: 11px;
             }
             QMessageBox QPushButton {
                 background: #3a3a3a;
@@ -2169,7 +2383,7 @@ class MainWindow(QMainWindow):
                 border: 1px solid #5f5f5f;
                 border-radius: 5px;
                 min-width: 72px;
-                padding: 7px 12px;
+                padding: 6px 10px;
             }
             QMessageBox QPushButton:hover {
                 background: #464646;
@@ -2187,19 +2401,19 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._build_top_bar())
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._build_settings_tabs())
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.addWidget(self._build_settings_tabs())
         self.center_scroll_area = HorizontalOnlyScrollArea()
         self.center_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         self.center_scroll_area.setWidget(self._build_center_panel())
         self.center_scroll_area.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        splitter.addWidget(self.center_scroll_area)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([520, 780])
-        layout.addWidget(splitter, 1)
+        self.main_splitter.addWidget(self.center_scroll_area)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([440, 880])
+        layout.addWidget(self.main_splitter, 1)
 
         layout.addWidget(self._build_run_bar())
 
@@ -2249,6 +2463,16 @@ class MainWindow(QMainWindow):
         save_config = QPushButton("Save config")
         save_config.clicked.connect(self._save_config)
 
+        self.browse_local_session_resume = QPushButton("Browse local session to resume")
+        self.browse_local_session_resume.clicked.connect(
+            self._browse_local_session_to_resume
+        )
+        resume_hint = QLabel(
+            "Select an existing local single- or multi-day output folder."
+        )
+        resume_hint.setObjectName("hintLabel")
+        resume_hint.setWordWrap(True)
+
         layout.addWidget(browse_basepath, 0, 0)
         layout.addWidget(self.basepath, 0, 1)
         layout.addWidget(browse_local, 0, 2)
@@ -2261,6 +2485,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(view_multiday, 1, 3)
         layout.addWidget(QLabel("Multi-day name"), 1, 4)
         layout.addWidget(self.multi_day_name, 1, 5, 1, 2)
+        layout.addWidget(self.browse_local_session_resume, 2, 0)
+        layout.addWidget(resume_hint, 2, 1, 1, 6)
         layout.setColumnStretch(1, 4)
         layout.setColumnStretch(4, 0)
         layout.setColumnStretch(5, 3)
@@ -2279,7 +2505,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_ephys_tab(), "Ephys")
         self.tabs.addTab(self._scroll_area(self._build_behavior_tab()), "Behavior")
-        self.tabs.setMinimumWidth(340)
+        self.tabs.setMinimumWidth(300)
         self.tabs.currentChanged.connect(lambda _index: self._schedule_refresh())
         return self.tabs
 
@@ -2382,7 +2608,8 @@ class MainWindow(QMainWindow):
     def _build_stage_resource_group(self, stage: StageName, *, gpu_count: int) -> QGroupBox:
         box = QGroupBox(stage.value.capitalize())
         grid = QGridLayout(box)
-        grid.setHorizontalSpacing(8)
+        grid.setContentsMargins(6, 8, 6, 6)
+        grid.setHorizontalSpacing(5)
         grid.setVerticalSpacing(6)
         cpus = self._spin(1, 4096, default_worker_count())
         memory_gib = self._spin(1, 65536, 512 if stage == StageName.SORTING else 256)
@@ -3889,6 +4116,50 @@ class MainWindow(QMainWindow):
         self._auto_load_existing_chanmap()
         self._schedule_refresh()
 
+    def _browse_local_session_to_resume(self) -> None:
+        start = self.local_root.text().strip() or str(Path.cwd())
+        path = self._select_directory(
+            "Select local session output to resume",
+            start,
+        )
+        if not path:
+            return
+        session_dir = Path(path).expanduser().resolve()
+        try:
+            recovered = load_local_session_resume(session_dir)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Cannot resume local session",
+                str(exc),
+            )
+            return
+
+        self._apply_settings(recovered.settings, preserve_missing_paths=True)
+        self._clear_move_storage_override()
+        if recovered.run_dir is not None:
+            self._set_active_run(recovered.run_dir, session_dir=session_dir)
+            self._request_run_reconcile()
+            detail = f" and reconnected to Run {recovered.run_dir.name}"
+        else:
+            self._active_run_dir = None
+            self._active_run_session_dir = None
+            self._persistent_log_offsets.clear()
+            self._persistent_log_announced.clear()
+            self._last_persistent_status_signature = ""
+            self.execution_run_status.setText("No active Run")
+            self.execution_run_status.setToolTip("")
+            for stage in StageName:
+                self.execution_stage_status_labels[stage.value].setText("—")
+                self.execution_stage_job_labels[stage.value].setText("—")
+            self.force_stop.setEnabled(False)
+            self._refresh_persistent_run_monitor()
+            detail = " from its completed Run record"
+        self._append_log(
+            f"Loaded local session {session_dir}{detail}. No job was started or retried.\n"
+        )
+        self._schedule_refresh()
+
     def _browse_local_root(self) -> None:
         path = self._select_directory("Select local output root", self.local_root.text() or str(Path.cwd()))
         if path:
@@ -5015,7 +5286,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Behavior export failed", str(exc))
 
     def _load_config(self) -> None:
-        path = self._select_open_file("Load GUI config", str(Path.cwd()), "JSON files (*.json);;All files (*)")
+        path = self._select_open_file(
+            "Load GUI config",
+            str(CONFIG_DIR),
+            "JSON files (*.json);;All files (*)",
+        )
         if not path:
             return
         try:
@@ -5256,7 +5531,12 @@ class MainWindow(QMainWindow):
         if self._slurm_capabilities is not None:
             self._apply_environment_backend_default(self._slurm_capabilities)
 
-    def _apply_settings(self, settings: PipelineGuiSettings) -> None:
+    def _apply_settings(
+        self,
+        settings: PipelineGuiSettings,
+        *,
+        preserve_missing_paths: bool = False,
+    ) -> None:
         self._move_storage_override = None
         self._move_source_snapshot = None
         self._refresh_suspended = True
@@ -5264,7 +5544,11 @@ class MainWindow(QMainWindow):
             self.basepath.setText(settings.basepath)
             self.local_root.setText(settings.local_root or str(settings.local_root_path))
             xml_text = settings.xml_path.strip()
-            if xml_text and not Path(xml_text).expanduser().exists():
+            if (
+                xml_text
+                and not preserve_missing_paths
+                and not Path(xml_text).expanduser().exists()
+            ):
                 xml_text = ""
             self.xml_path.setText(xml_text)
             self._set_multi_day_session_paths(
@@ -5608,13 +5892,31 @@ class MainWindow(QMainWindow):
             destination = self._move_storage_override or _default_output_storage_dir(settings)
             source_dir = self._move_source_snapshot[0] if self._move_source_snapshot else None
             source_basename = self._move_source_snapshot[1] if self._move_source_snapshot else None
+            inventory_text = "Inventory will be resolved during staged transfer."
+            preview_root = source_dir or settings.local_output_dir
+            preview_basename = source_basename or settings.basename
+            if preview_root is not None and Path(preview_root).is_dir():
+                excluded = {f"{preview_basename}.xml", f"{preview_basename}.rhd", "@eaDir"}
+                if not self.move_dat_to_basepath.isChecked():
+                    excluded.add(f"{preview_basename}.dat")
+                selected = [p for p in Path(preview_root).iterdir() if p.name not in excluded]
+                total_bytes = sum(
+                    p.stat().st_size if p.is_file() else sum(q.stat().st_size for q in p.rglob("*") if q.is_file())
+                    for p in selected
+                )
+                inventory_text = (
+                    f"Inventory: move {len(selected)} item(s), {total_bytes:,} bytes; "
+                    f"retain {len(excluded)} metadata/unchecked item(s); "
+                    f"delete local source: {'yes' if self.move_clean_local.isChecked() else 'no'}."
+                )
             message = (
                 "Move local output files to storage?\n\n"
                 f"Storage destination: {destination or '-'}\n"
                 f"Local output: {source_dir or settings.local_output_dir or '-'}\n"
                 f"Move basename.dat: {'yes' if self.move_dat_to_basepath.isChecked() else 'no'}\n"
                 f"Overwrite existing files: {'yes' if self.move_overwrite.isChecked() else 'no'}\n"
-                f"Clean local after move: {'yes' if self.move_clean_local.isChecked() else 'no'}"
+                f"Clean local after move: {'yes' if self.move_clean_local.isChecked() else 'no'}\n\n"
+                f"{inventory_text}"
             )
             answer = QMessageBox.question(self, "Move outputs to storage", message)
             if answer != QMessageBox.StandardButton.Yes:
@@ -6219,6 +6521,50 @@ class MainWindow(QMainWindow):
         self._kill_process_tree()
         QTimer.singleShot(2500, self._escalate_force_stop)
 
+    def _legacy_mutating_session_dir(
+        self, settings: PipelineGuiSettings, mode: RunMode
+    ) -> Path | None:
+        """Resolve the canonical output session touched by a legacy GUI process."""
+        if mode != "noise_label":
+            return None
+        sorting_folder = settings.postprocess_sorting_folder()
+        if sorting_folder is not None:
+            run_root = sorting_folder.parent if sorting_folder.name == "sorter_output" else sorting_folder
+            return run_root.parent.resolve()
+        local_output_dir = settings.local_output_dir
+        return local_output_dir.resolve() if local_output_dir is not None else None
+
+    def _legacy_process_group_is_stopped(self) -> bool:
+        pid = self._legacy_process_group_pid
+        if pid is None or pid <= 0:
+            return True
+        if os.name == "nt":
+            # Windows taskkill / QProcess do not expose an equivalent safe
+            # process-group probe.  Do not infer worker termination from a
+            # generic error; the finished callback is the conclusive signal.
+            return self._process is None
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+
+    def _release_legacy_process_session_claim(self) -> bool:
+        claim = self._legacy_process_session_claim
+        if claim is None:
+            return True
+        if not self._legacy_process_group_is_stopped():
+            QTimer.singleShot(250, self._release_legacy_process_session_claim)
+            return False
+        self._legacy_process_session_claim = None
+        self._legacy_process_group_pid = None
+        from src.execution.session import release_manual_session_claim
+
+        release_manual_session_claim(session_dir=claim[0], token=claim[1])
+        return True
+
     def _start_run(self, mode: RunMode) -> None:
         if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
             QMessageBox.warning(self, "Run already active", "A pipeline job is already running.")
@@ -6249,12 +6595,34 @@ class MainWindow(QMainWindow):
         if mode in {"all", "preprocess", "postprocess"}:
             self._start_persistent_run(settings, mode)
             return
+        session_dir = self._legacy_mutating_session_dir(settings, mode)
+        if session_dir is not None:
+            try:
+                from src.execution.session import acquire_manual_session_claim
+
+                claim_token = acquire_manual_session_claim(
+                    session_dir=session_dir, owner="Legacy noise labeling"
+                )
+                self._legacy_process_session_claim = (session_dir, claim_token)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Session is active",
+                    f"Cannot start noise labeling because this session is active: {exc}",
+                )
+                return
         self._set_running(True)
         self._append_log(f"\n=== Running {mode} ===\n")
-        fd, config_name = tempfile.mkstemp(prefix="preprocess_gui_", suffix=".json")
-        os.close(fd)
-        config_path = Path(config_name)
-        settings.save(config_path)
+        try:
+            fd, config_name = tempfile.mkstemp(prefix="preprocess_gui_", suffix=".json")
+            os.close(fd)
+            config_path = Path(config_name)
+            settings.save(config_path)
+        except Exception as exc:
+            self._set_running(False)
+            self._release_legacy_process_session_claim()
+            QMessageBox.critical(self, "Run failed", f"Could not prepare legacy run: {exc}")
+            return
         process = QProcess(self)
         process.setProgram(sys.executable)
         process.setArguments([
@@ -6281,6 +6649,33 @@ class MainWindow(QMainWindow):
         process.start()
         if not process.waitForStarted(3000):
             self._process_error_occurred(process.error())
+            return
+        claim = self._legacy_process_session_claim
+        if claim is not None:
+            try:
+                from src.execution.session import update_manual_session_claim_pid
+
+                update_manual_session_claim_pid(
+                    session_dir=claim[0], token=claim[1], child_pid=int(process.processId())
+                )
+                self._legacy_process_group_pid = int(process.processId())
+            except Exception:
+                process.kill()
+                process.waitForFinished(3000)
+                self._release_legacy_process_session_claim()
+                if self._process is process:
+                    self._process = None
+                if self._process_config_path == config_path:
+                    config_path.unlink(missing_ok=True)
+                    self._process_config_path = None
+                self._set_running(False)
+                QMessageBox.critical(
+                    self,
+                    "Run failed",
+                    "Noise labeling started, but its session claim could not be updated. "
+                    "The process was stopped before continuing.",
+                )
+                return
 
     def _start_persistent_run(self, settings: PipelineGuiSettings, mode: RunMode) -> None:
         try:
@@ -6373,6 +6768,7 @@ class MainWindow(QMainWindow):
             self._process_config_path.unlink(missing_ok=True)
             self._process_config_path = None
         self._process = None
+        self._release_legacy_process_session_claim()
         if stopped:
             self._append_log("=== Force stop complete ===\n")
             return
@@ -6409,24 +6805,11 @@ class MainWindow(QMainWindow):
         self._refresh_preview()
 
     def _cleanup_postprocess_caches_from_result(self, result: dict[str, Any]) -> None:
-        post_result = result.get("postprocess_results") or {}
-        cache_dirs = post_result.get("analyzer_cache_dirs") or []
-        if not cache_dirs:
-            return
-        for cache_dir in cache_dirs:
-            path = Path(str(cache_dir))
-            if not path.exists():
-                continue
-            try:
-                self._append_log(f"Cleaning analyzer cache after process exit: {path}\n")
-                self._remove_tree_with_retry(path)
-                self._append_log(f"Analyzer cache removed: {path}\n")
-            except Exception as exc:
-                self._append_log(
-                    "[WARN] Analyzer cache could not be removed after process exit: "
-                    f"{path}. Close Python/Phy/MATLAB handles and delete it manually. "
-                    f"Original error: {exc}\n"
-                )
+        # The worker is the cache owner: a returned directory means the saved
+        # postprocess configuration intentionally retained it.  Deleting it here
+        # used to override delete_analyzer_cache=False after an otherwise
+        # successful run.
+        del result
 
     def _remove_tree_with_retry(self, path: Path, *, retries: int = 8, delay: float = 1.0) -> None:
         for attempt in range(retries):
@@ -6537,6 +6920,9 @@ class MainWindow(QMainWindow):
             self._process_config_path.unlink(missing_ok=True)
             self._process_config_path = None
         self._process = None
+        # A generic QProcess error is not evidence that descendants are gone.
+        # Retain the manual claim until the process group probe proves it.
+        self._release_legacy_process_session_claim()
         QMessageBox.critical(self, "Run failed", f"Pipeline process failed to start: {error.name}")
 
     def closeEvent(self, event: Any) -> None:

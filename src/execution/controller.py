@@ -205,23 +205,33 @@ def _file_metadata_identity(path: Path | None) -> str:
     ).hexdigest()
 
 
-def _input_provenance(settings: Any) -> dict[str, Any]:
-    paths = [
-        settings.basepath_path,
-        settings.preprocess_source_path,
-        settings.resolved_xml_path(),
-        settings.resolved_chanmap_path(),
-    ]
-    paths.extend(
-        Path(value).expanduser()
-        for value in getattr(settings, "multi_day_session_paths", [])
-        if str(value).strip()
-    )
-    paths.extend(
+def _recursive_input_roots(settings: Any) -> list[Path]:
+    selected = [
         Path(value).expanduser()
         for value in getattr(settings, "multi_day_selected_subepoch_paths", [])
         if str(value).strip()
-    )
+    ]
+    sessions = [
+        Path(value).expanduser()
+        for value in getattr(settings, "multi_day_session_paths", [])
+        if str(value).strip()
+    ]
+    if bool(getattr(settings, "multi_day_enabled", False)):
+        return selected or sessions
+    source = getattr(settings, "preprocess_source_path", None)
+    return [Path(source).expanduser()] if source is not None else []
+
+
+def _input_provenance(settings: Any) -> dict[str, Any]:
+    scan_started_at = utc_now()
+    recursive_roots = _recursive_input_roots(settings)
+    paths: list[Path | None] = [
+        settings.resolved_xml_path(),
+        settings.resolved_chanmap_path(),
+        *recursive_roots,
+    ]
+    if not bool(getattr(settings, "multi_day_enabled", False)):
+        paths[:0] = [settings.basepath_path, settings.preprocess_source_path]
     values: list[dict[str, Any]] = []
     seen: set[str] = set()
     for path in paths:
@@ -234,22 +244,38 @@ def _input_provenance(settings: Any) -> dict[str, Any]:
         item: dict[str, Any] = {"path": resolved_text, "exists": Path(path).exists()}
         if Path(path).exists():
             stat = Path(path).stat()
-            item.update({"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "is_dir": Path(path).is_dir()})
+            item.update(
+                {
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "ctime_ns": stat.st_ctime_ns,
+                    "is_dir": Path(path).is_dir(),
+                }
+            )
         values.append(item)
-    expandable_roots = [settings.preprocess_source_path]
-    expandable_roots.extend(
-        Path(value).expanduser()
-        for value in getattr(settings, "multi_day_session_paths", [])
-        if str(value).strip()
-    )
-    expandable_roots.extend(
-        Path(value).expanduser()
-        for value in getattr(settings, "multi_day_selected_subepoch_paths", [])
-        if str(value).strip()
-    )
-    input_names = {"structure.oebin", "amplifier.dat", "continuous.dat"}
+    # Acquisition sidecars affect event extraction, artifact removal and time
+    # alignment just as materially as amplifier samples.  Record their
+    # metadata so a changed TTL/analog/time input cannot silently reuse a
+    # preprocess result.
+    input_names = {
+        "structure.oebin",
+        "amplifier.dat",
+        "continuous.dat",
+        "analogin.dat",
+        "digitalin.dat",
+        "auxiliary.dat",
+        "supply.dat",
+        "time.dat",
+        "timestamps.npy",
+        "sample_numbers.npy",
+        "states.npy",
+        "full_words.npy",
+        "sync_messages.txt",
+        "events.json",
+        "settings.xml",
+    }
     input_suffixes = {".rhd", ".xml"}
-    for root in expandable_roots:
+    for root in recursive_roots:
         if root is None or not Path(root).is_dir():
             continue
         try:
@@ -257,7 +283,11 @@ def _input_provenance(settings: Any) -> dict[str, Any]:
                 child
                 for child in Path(root).rglob("*")
                 if child.is_file()
-                and (child.name in input_names or child.suffix.lower() in input_suffixes)
+                and (
+                    child.name.lower() in input_names
+                    or "ttl" in child.name.lower()
+                    or child.suffix.lower() in input_suffixes
+                )
             )
             for child in children:
                 resolved_text = str(child.resolve())
@@ -271,12 +301,17 @@ def _input_provenance(settings: Any) -> dict[str, Any]:
                         "exists": True,
                         "size": stat.st_size,
                         "mtime_ns": stat.st_mtime_ns,
+                        "ctime_ns": stat.st_ctime_ns,
                         "is_dir": False,
                     }
                 )
         except OSError:
             continue
-    return {"recorded_at": utc_now(), "inputs": values}
+    return {
+        "scan_started_at": scan_started_at,
+        "recorded_at": utc_now(),
+        "inputs": values,
+    }
 
 
 def enabled_stages_for(settings: Any, mode: str) -> list[StageName]:
@@ -358,6 +393,7 @@ def create_run(
         run_dir=run_dir,
     )
     try:
+        claim = read_json(claim_path)
         sorter_source = _resolve_sorter_config_source(settings)
         sorter_source_bytes = sorter_source.read_bytes() if sorter_source is not None else None
     except BaseException:
@@ -403,6 +439,8 @@ def create_run(
         "repository_root": str(REPO_ROOT.resolve()),
         "session_output_dir": str(session_output_dir(settings)),
         "session_claim_path": str(claim_path),
+        "previous_run_dir": str(claim.get("previous_run_dir") or ""),
+        "previous_run_dirs": list(claim.get("previous_run_dirs") or []),
     }
     store = RunStore(run_dir)
     try:

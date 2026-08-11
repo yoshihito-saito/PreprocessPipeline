@@ -14,6 +14,8 @@ import spikeinterface as si
 import spikeinterface.extractors as se
 import spikeinterface.preprocessing as spre
 
+from .io import atomic_write_json
+
 
 def _set_channel_property_compat(recording: Any, channel_ids: list[int], key: str, values: list[Any]) -> None:
     if hasattr(recording, "set_channel_property"):
@@ -400,6 +402,7 @@ def _write_concatenated_sidecar_dat(
     sample_counts: list[int] | None = None,
     source_num_channels: list[int | None] | None = None,
     source_channel_indices: list[list[int] | None] | None = None,
+    destination_channel_indices: list[list[int] | None] | None = None,
     source_dtype: str = "int16",
 ) -> Path | None:
     del sampling_frequency, job_kwargs
@@ -407,7 +410,36 @@ def _write_concatenated_sidecar_dat(
         return None
     if not any(p is not None and Path(p).exists() for p in dat_paths):
         return None
+    layout_path = output_dat_path.with_name(f"{output_dat_path.name}.layout.json")
+    layout_payload = {
+        "schema_version": 1,
+        "dtype": str(np.dtype(dtype)),
+        "num_channels": int(num_channels),
+        "sample_counts": None if sample_counts is None else [int(n) for n in sample_counts],
+        "source_num_channels": None if source_num_channels is None else [None if n is None else int(n) for n in source_num_channels],
+        "source_channel_indices": source_channel_indices,
+        "destination_channel_indices": destination_channel_indices,
+    }
     if output_dat_path.exists() and not overwrite:
+        nonlegacy_destinations = destination_channel_indices is not None and any(
+            mapping is not None
+            and len(mapping) > 0
+            and [int(ch) for ch in mapping] != list(range(len(mapping)))
+            for mapping in destination_channel_indices
+        )
+        if nonlegacy_destinations:
+            if not layout_path.exists():
+                raise FileExistsError(
+                    "Cannot safely reuse an existing sidecar dat with non-left-packed destination channel mappings: "
+                    f"{output_dat_path}. Its layout fingerprint is absent; Set overwrite=True to rebuild it."
+                )
+            import json
+            existing_layout = json.loads(layout_path.read_text(encoding="utf-8"))
+            if existing_layout != layout_payload:
+                raise FileExistsError(
+                    "Existing sidecar dat has an incompatible layout fingerprint: "
+                    f"{output_dat_path}. Set overwrite=True to rebuild it."
+                )
         expected_frames = int(sum(int(n) for n in sample_counts)) if sample_counts is not None else None
         _validate_existing_binary_size(
             path=output_dat_path,
@@ -416,6 +448,11 @@ def _write_concatenated_sidecar_dat(
             expected_frames=expected_frames,
             label="sidecar dat",
         )
+        # Dense identity/left-packed legacy outputs are unambiguous once the
+        # current source/sample geometry has validated their exact byte size.
+        # Materialize that proof for subsequent persistent inventory checks.
+        if not layout_path.exists():
+            atomic_write_json(layout_path, layout_payload)
         return output_dat_path
 
     if num_channels <= 0:
@@ -436,6 +473,11 @@ def _write_concatenated_sidecar_dat(
             "source_channel_indices must have the same length as sidecar dat_paths: "
             f"{len(source_channel_indices)} != {len(dat_paths)}"
         )
+    if destination_channel_indices is not None and len(destination_channel_indices) != len(dat_paths):
+        raise ValueError(
+            "destination_channel_indices must have the same length as sidecar dat_paths: "
+            f"{len(destination_channel_indices)} != {len(dat_paths)}"
+        )
 
     dtype_np = np.dtype(dtype)
     frame_bytes = int(dtype_np.itemsize) * int(num_channels)
@@ -446,63 +488,105 @@ def _write_concatenated_sidecar_dat(
     # Direct binary concatenation preserves exact uint16 sidecar words and lets us
     # fill missing epochs with zeros so sidecar timestamps stay on the merged timebase.
     output_dat_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_dat_path, "wb") as fout:
-        for idx, path in enumerate(dat_paths):
-            expected_samples = None if sample_counts is None else int(sample_counts[idx])
-            src_channels = None if source_num_channels is None else source_num_channels[idx]
-            selected_channels = None if source_channel_indices is None else source_channel_indices[idx]
-            if path is None or not Path(path).exists():
-                if expected_samples is None:
-                    continue
-                _write_zero_sidecar_frames(
+    partial_path = output_dat_path.with_name(f".{output_dat_path.name}.partial-{uuid.uuid4().hex}")
+    try:
+        with open(partial_path, "wb") as fout:
+            for idx, path in enumerate(dat_paths):
+                expected_samples = None if sample_counts is None else int(sample_counts[idx])
+                src_channels = None if source_num_channels is None else source_num_channels[idx]
+                selected_channels = None if source_channel_indices is None else source_channel_indices[idx]
+                destination_channels = (
+                None if destination_channel_indices is None else destination_channel_indices[idx]
+                )
+                if path is None or not Path(path).exists():
+                    if expected_samples is None:
+                        continue
+                    _write_zero_sidecar_frames(
                     fout,
                     n_samples=expected_samples,
                     num_channels=int(num_channels),
                     dtype=dtype_np,
-                )
-                continue
+                    )
+                    continue
 
-            p = Path(path)
-            if selected_channels is not None or (
+                p = Path(path)
+                if selected_channels is not None or destination_channels is not None or (
                 src_channels is not None and int(src_channels) != int(num_channels)
-            ):
-                if src_channels is None:
-                    raise ValueError(f"source_num_channels is required for selected sidecar extraction: {p}")
-                channels_to_copy = (
+                ):
+                    if src_channels is None:
+                        raise ValueError(f"source_num_channels is required for selected sidecar extraction: {p}")
+                    channels_to_copy = (
                     [int(ch) for ch in selected_channels]
                     if selected_channels is not None
                     else list(range(int(src_channels)))
-                )
-                _write_selected_sidecar_frames(
+                    )
+                    _write_selected_sidecar_frames(
                     fout,
                     path=p,
                     source_num_channels=int(src_channels),
                     selected_channel_indices=channels_to_copy,
+                    destination_channel_indices=destination_channels,
                     output_num_channels=int(num_channels),
                     source_dtype=source_dtype_np,
                     output_dtype=dtype_np,
                     expected_samples=expected_samples,
-                )
-                continue
+                    )
+                    continue
 
-            size = p.stat().st_size
-            if size % frame_bytes != 0:
-                raise ValueError(
+                size = p.stat().st_size
+                if size % frame_bytes != 0:
+                    raise ValueError(
                     f"{p} size is not divisible by sidecar frame size: "
                     f"size={size}, frame_bytes={frame_bytes}"
-                )
-            actual_samples = size // frame_bytes
-            if expected_samples is not None and int(actual_samples) != int(expected_samples):
-                raise ValueError(
+                    )
+                actual_samples = size // frame_bytes
+                if expected_samples is not None and int(actual_samples) != int(expected_samples):
+                    raise ValueError(
                     f"{p} sample count does not match amplifier epoch length: "
                     f"{actual_samples} != {expected_samples}"
-                )
-            with open(p, "rb") as fin:
-                while True:
-                    chunk = fin.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    fout.write(chunk)
+                    )
+                with open(p, "rb") as fin:
+                    while True:
+                        chunk = fin.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        fout.write(chunk)
+        expected_frames = int(sum(int(n) for n in sample_counts)) if sample_counts is not None else None
+        _validate_existing_binary_size(path=partial_path, dtype=dtype_np, num_channels=num_channels,
+                                       expected_frames=expected_frames, label="new sidecar dat")
+        # A sidecar and its layout fingerprint form one logical output.  Keep
+        # recoverable same-directory backups until both publications succeed,
+        # so an injected layout failure cannot strand a new binary with stale
+        # provenance or destroy the previous compatible pair.
+        backup_binary = output_dat_path.with_name(f".{output_dat_path.name}.backup-{uuid.uuid4().hex}")
+        backup_layout = layout_path.with_name(f".{layout_path.name}.backup-{uuid.uuid4().hex}")
+        had_binary = output_dat_path.exists()
+        had_layout = layout_path.exists()
+        try:
+            if had_binary:
+                os.replace(output_dat_path, backup_binary)
+            if had_layout:
+                os.replace(layout_path, backup_layout)
+            os.replace(partial_path, output_dat_path)
+            atomic_write_json(layout_path, layout_payload)
+        except Exception:
+            if output_dat_path.exists():
+                output_dat_path.unlink()
+            if layout_path.exists():
+                layout_path.unlink()
+            if had_binary and backup_binary.exists():
+                os.replace(backup_binary, output_dat_path)
+            if had_layout and backup_layout.exists():
+                os.replace(backup_layout, layout_path)
+            raise
+        finally:
+            if backup_binary.exists():
+                backup_binary.unlink()
+            if backup_layout.exists():
+                backup_layout.unlink()
+    finally:
+        if partial_path.exists():
+            partial_path.unlink()
     return output_dat_path
 
 
@@ -512,6 +596,7 @@ def _write_selected_sidecar_frames(
     path: Path,
     source_num_channels: int,
     selected_channel_indices: list[int],
+    destination_channel_indices: list[int] | None,
     output_num_channels: int,
     source_dtype: np.dtype,
     output_dtype: np.dtype,
@@ -532,6 +617,12 @@ def _write_selected_sidecar_frames(
             f"Selected sidecar channels are outside source range [0, {source_num_channels - 1}]: "
             f"{sorted(set(invalid))}"
         )
+    if destination_channel_indices is not None:
+        if len(destination_channel_indices) != len(selected_channel_indices):
+            raise ValueError("Selected sidecar and destination channel mappings must have equal lengths")
+        invalid_destinations = [ch for ch in destination_channel_indices if ch < 0 or ch >= output_num_channels]
+        if invalid_destinations or len(set(destination_channel_indices)) != len(destination_channel_indices):
+            raise ValueError("Destination sidecar channels must be unique output indices in range")
 
     source_frame_bytes = int(source_dtype.itemsize) * int(source_num_channels)
     size = path.stat().st_size
@@ -558,12 +649,13 @@ def _write_selected_sidecar_frames(
                 raise ValueError(f"Partial sidecar frame encountered while reading {path}")
             source = raw.reshape(-1, source_num_channels)
             selected = source[:, selected_channel_indices]
-            if selected.shape[1] == output_num_channels:
+            if selected.shape[1] == output_num_channels and destination_channel_indices is None:
                 output = selected.astype(output_dtype, copy=False)
             else:
                 output = np.zeros((selected.shape[0], output_num_channels), dtype=output_dtype)
                 if selected.shape[1] > 0:
-                    output[:, : selected.shape[1]] = selected.astype(output_dtype, copy=False)
+                    destinations = destination_channel_indices or list(range(selected.shape[1]))
+                    output[:, destinations] = selected.astype(output_dtype, copy=False)
             fout.write(output.tobytes(order="C"))
 
 
@@ -619,6 +711,7 @@ def write_concatenated_dat_analogin(
     sample_counts: list[int] | None = None,
     source_num_channels: list[int | None] | None = None,
     source_channel_indices: list[list[int] | None] | None = None,
+    destination_channel_indices: list[list[int] | None] | None = None,
 ) -> Path | None:
     return _write_concatenated_sidecar_dat(
         dat_paths=dat_paths,
@@ -631,6 +724,7 @@ def write_concatenated_dat_analogin(
         sample_counts=sample_counts,
         source_num_channels=source_num_channels,
         source_channel_indices=source_channel_indices,
+        destination_channel_indices=destination_channel_indices,
         source_dtype="int16",
     )
 

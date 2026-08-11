@@ -10,7 +10,15 @@ from src.preprocess import PreprocessConfig
 from src.preprocess.io import load_xml_metadata
 from src.preprocess.paths import find_project_root, resolve_project_path
 from src.worker_defaults import default_worker_count, normalize_worker_count
-from src.execution.models import BackendName, ExecutionConfig, RequestedBackend, ResourceSpec
+from src.execution.models import (
+    AnalysisConfig,
+    BackendName,
+    ExecutionConfig,
+    RequestedBackend,
+    ResourceSpec,
+    StageName,
+)
+from src.execution.store import RunStore
 
 
 RunMode = Literal["all", "preprocess", "postprocess", "noise_label"]
@@ -693,3 +701,139 @@ class PipelineGuiSettings:
     @classmethod
     def load(cls, path: Path) -> "PipelineGuiSettings":
         return cls.from_json(path.read_text(encoding="utf-8"))
+
+
+@dataclass(frozen=True)
+class LocalSessionResume:
+    settings: PipelineGuiSettings
+    run_dir: Path | None
+    metadata_source: str
+
+
+def _gui_execution_from_snapshot(execution: ExecutionConfig) -> ExecutionGuiSettings:
+    def _resource(stage: StageName) -> StageResourceGuiSettings:
+        return StageResourceGuiSettings(**execution.resource_for(stage).to_dict())
+
+    return ExecutionGuiSettings(
+        requested_backend=execution.requested_backend.value,
+        workspace=execution.workspace,
+        matlab_path=execution.matlab_path,
+        shared_workspace_acknowledged=execution.shared_workspace_acknowledged,
+        require_sacct=execution.require_sacct,
+        preprocess=_resource(StageName.PREPROCESS),
+        sorting=_resource(StageName.SORTING),
+        postprocess=_resource(StageName.POSTPROCESS),
+    )
+
+
+def _settings_from_resume_snapshots(
+    *,
+    session_dir: Path,
+    analysis: AnalysisConfig,
+    execution: ExecutionConfig,
+) -> PipelineGuiSettings:
+    settings = PipelineGuiSettings.from_json(json.dumps(analysis.settings))
+    settings.execution = _gui_execution_from_snapshot(execution)
+    settings.preprocess.preprocess_worker_count = normalize_worker_count(
+        execution.resource_for(StageName.PREPROCESS).cpus
+    )
+    settings.preprocess.sorter_worker_count = normalize_worker_count(
+        execution.resource_for(StageName.SORTING).cpus
+    )
+    settings.postprocess.worker_count = normalize_worker_count(
+        execution.resource_for(StageName.POSTPROCESS).cpus
+    )
+    settings.local_root = str(session_dir.parent)
+    # The selected output directory is authoritative for recovery.  In
+    # particular, a completed session may have been moved to user-selected
+    # storage whose directory name is unrelated to its recording or multi-day
+    # basename.  Keep the scientific basename from the immutable analysis
+    # snapshot, while pinning output discovery to the selected directory.
+    settings.existing_session_dir = str(session_dir)
+
+    if settings.multi_day_enabled:
+        if not settings.multi_day_name.strip() or not settings.multi_day_session_paths:
+            raise ValueError("Saved multi-day settings are incomplete")
+    if settings.local_output_dir != session_dir:
+        raise ValueError(
+            "Recovered settings do not resolve to the selected local session: "
+            f"{settings.local_output_dir} != {session_dir}"
+        )
+    return settings
+
+
+def load_local_session_resume(session_dir: Path) -> LocalSessionResume:
+    """Load validated GUI settings from one local persistent session output."""
+    session_dir = Path(session_dir).expanduser().resolve()
+    if not session_dir.is_dir():
+        raise NotADirectoryError(f"Local session folder does not exist: {session_dir}")
+
+    claim_path = session_dir / ".pipeline-active-run.json"
+    if claim_path.exists():
+        try:
+            claim = json.loads(claim_path.read_text(encoding="utf-8"))
+            if claim.get("kind", "run") != "run":
+                raise ValueError("the active-session marker is not a persistent Run")
+            run_text = str(claim.get("run_dir") or "").strip()
+            if not run_text:
+                raise ValueError("the active-session marker has no Run directory")
+            run_dir = Path(run_text).expanduser().resolve()
+            store = RunStore(run_dir)
+            run = store.load_run()
+            claim_session = str(claim.get("session_dir") or "").strip()
+            if claim_session and Path(claim_session).expanduser().resolve() != session_dir:
+                raise ValueError(
+                    "Active-session marker belongs to a different output folder"
+                )
+            claim_run_id = str(claim.get("run_id") or "").strip()
+            recorded_run_id = str(run.get("run_id") or "").strip()
+            if claim_run_id and claim_run_id != recorded_run_id:
+                raise ValueError("Active-session marker Run ID does not match run.json")
+            recorded_output = Path(str(run.get("session_output_dir") or "")).expanduser().resolve()
+            if recorded_output != session_dir:
+                raise ValueError(
+                    "Run output folder does not match the selected local session: "
+                    f"{recorded_output} != {session_dir}"
+                )
+            analysis = store.load_analysis()
+            recorded_hash = str(run.get("analysis_sha256") or "").strip()
+            if recorded_hash and recorded_hash != analysis.sha256:
+                raise ValueError(
+                    "Run analysis hash does not match its immutable settings snapshot"
+                )
+            settings = _settings_from_resume_snapshots(
+                session_dir=session_dir,
+                analysis=analysis,
+                execution=store.load_execution(),
+            )
+            return LocalSessionResume(settings, run_dir, "persistent_run")
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot recover the persistent Run referenced by {claim_path}: {exc}"
+            ) from exc
+
+    final_record = session_dir / "preprocess_run.yaml"
+    if final_record.exists():
+        try:
+            import yaml
+
+            record = yaml.safe_load(final_record.read_text(encoding="utf-8")) or {}
+            recorded_output = Path(str(record.get("session_output_dir") or "")).expanduser().resolve()
+            if recorded_output != session_dir:
+                raise ValueError(
+                    "Completed Run output folder does not match the selected local session: "
+                    f"{recorded_output} != {session_dir}"
+                )
+            settings = _settings_from_resume_snapshots(
+                session_dir=session_dir,
+                analysis=AnalysisConfig.from_dict(dict(record["analysis"])),
+                execution=ExecutionConfig.from_dict(dict(record["execution"])),
+            )
+            return LocalSessionResume(settings, None, "preprocess_run.yaml")
+        except Exception as exc:
+            raise ValueError(f"Cannot recover completed Run metadata from {final_record}: {exc}") from exc
+
+    raise FileNotFoundError(
+        "The selected folder has neither .pipeline-active-run.json nor preprocess_run.yaml: "
+        f"{session_dir}"
+    )
