@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 from scipy.io import savemat
+from .io import atomic_save_figure, atomic_savemat, atomic_write_path, validate_mat_output
 
 
 ANALOG_BEHAVIOR_DEFAULT_FS = 1250.0
@@ -17,17 +18,24 @@ def _concat_binary_files(paths: list[Path], out_path: Path, overwrite: bool) -> 
     if not paths:
         return None
     if out_path.exists() and not overwrite:
+        if not out_path.is_file() or out_path.stat().st_size == 0:
+            raise ValueError(f"Invalid existing intermediate binary with overwrite=False: {out_path}")
         return out_path
 
-    with open(out_path, "wb") as fout:
-        for p in paths:
-            with open(p, "rb") as fin:
-                while True:
-                    chunk = fin.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    fout.write(chunk)
-    return out_path
+    expected_size = sum(int(p.stat().st_size) for p in paths)
+    def _write(temporary: Path) -> None:
+        with open(temporary, "wb") as fout:
+            for p in paths:
+                with open(p, "rb") as fin:
+                    while True:
+                        chunk = fin.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        fout.write(chunk)
+    def _validate(temporary: Path) -> None:
+        if temporary.stat().st_size != expected_size:
+            raise ValueError(f"Incomplete intermediate binary: {temporary}")
+    return atomic_write_path(out_path, _write, validator=_validate)
 
 
 def materialize_intermediate_dat(
@@ -490,19 +498,21 @@ def _build_digital_in_struct(
     )
 
 
-def _save_analog_plot(output_dir: Path, analog_data_u16: np.ndarray, channel_ids_1based: list[int], sr: float) -> None:
+def _save_analog_plot(output_dir: Path, analog_data_u16: np.ndarray, channel_ids_1based: list[int], sr: float, *, overwrite: bool) -> None:
     out_dir = output_dir / "pulses"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "analogPulsesDetection.png"
+    if out_path.exists() and not overwrite:
+        if out_path.is_file() and out_path.stat().st_size > 0:
+            return
+        raise ValueError(f"Invalid existing analog plot with overwrite=False: {out_path}")
     try:
         import matplotlib.pyplot as plt
-    except Exception:
-        out_path.touch()
-        return
+    except Exception as exc:
+        raise RuntimeError("Could not create analog pulse plot; no placeholder was published.") from exc
 
     n_samples = int(analog_data_u16.shape[0])
     if n_samples == 0:
-        out_path.touch()
         return
     step = max(1, n_samples // 5000)
     xt = np.arange(0, n_samples, step, dtype=np.float64) / float(sr)
@@ -517,19 +527,22 @@ def _save_analog_plot(output_dir: Path, analog_data_u16: np.ndarray, channel_ids
         axes[i].set_ylabel(f"Ch{channel_ids_1based[i] if i < len(channel_ids_1based) else i + 1}")
     axes[-1].set_xlabel("s")
     fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
+    atomic_save_figure(out_path, fig, dpi=120)
     plt.close(fig)
 
 
-def _save_digital_plot(output_dir: Path, digital_in: dict[str, Any]) -> None:
+def _save_digital_plot(output_dir: Path, digital_in: dict[str, Any], *, overwrite: bool) -> None:
     out_dir = output_dir / "Pulses"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "digitalIn.png"
+    if out_path.exists() and not overwrite:
+        if out_path.is_file() and out_path.stat().st_size > 0:
+            return
+        raise ValueError(f"Invalid existing digital plot with overwrite=False: {out_path}")
     try:
         import matplotlib.pyplot as plt
-    except Exception:
-        out_path.touch()
-        return
+    except Exception as exc:
+        raise RuntimeError("Could not create digital input plot; no placeholder was published.") from exc
 
     ints_periods = digital_in["intsPeriods"]
     fig, ax = plt.subplots(figsize=(12, 4))
@@ -546,7 +559,7 @@ def _save_digital_plot(output_dir: Path, digital_in: dict[str, Any]) -> None:
     ax.set_xlabel("s")
     ax.set_ylabel("Digital channel")
     fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
+    atomic_save_figure(out_path, fig, dpi=120)
     plt.close(fig)
 
 
@@ -597,9 +610,14 @@ def export_analog_digital_events(
     if analog_inputs and analog_dat_path is not None and analog_dat_path.exists():
         behavior_out = output_dir / f"{basename}.analogInput.behavior.mat"
         pulses_out = output_dir / f"{basename}.pulses.events.mat"
-        recompute = overwrite or not behavior_out.exists() or not pulses_out.exists()
+        if not overwrite and behavior_out.exists():
+            validate_mat_output(behavior_out, "analogInp")
+        if not overwrite and pulses_out.exists():
+            validate_mat_output(pulses_out, "pulses")
+        need_behavior = overwrite or not behavior_out.exists()
+        need_pulses = overwrite or not pulses_out.exists()
 
-        if recompute:
+        if need_behavior or need_pulses:
             raw = np.fromfile(analog_dat_path, dtype=np.uint16)
             n_ch = int(analog_num_channels) if int(analog_num_channels) > 0 else 1
             if raw.size % n_ch != 0:
@@ -618,8 +636,9 @@ def export_analog_digital_events(
                 active_channels_1based=active_channels_1based,
                 sampling_rate=ANALOG_BEHAVIOR_DEFAULT_FS,
             )
-            savemat(behavior_out, {"analogInp": analog_inp}, do_compression=True)
-            _save_analog_plot(output_dir, analog_data, active_channels_1based, analog_sr_eff)
+            if need_behavior:
+                atomic_savemat(behavior_out, {"analogInp": analog_inp}, required_key="analogInp")
+            _save_analog_plot(output_dir, analog_data, active_channels_1based, analog_sr_eff, overwrite=overwrite)
 
             pulses = _detect_analog_pulses(
                 analog_data_u16=analog_data,
@@ -630,10 +649,10 @@ def export_analog_digital_events(
                 sess_epochs_1based=pulse_sess_epochs_1based,
             )
             if pulses is None:
-                if pulses_out.exists():
+                if overwrite and pulses_out.exists():
                     pulses_out.unlink()
-            else:
-                savemat(pulses_out, {"pulses": pulses}, do_compression=True)
+            elif need_pulses:
+                atomic_savemat(pulses_out, {"pulses": pulses}, required_key="pulses")
 
         if behavior_out.exists():
             analog_paths.append(behavior_out)
@@ -643,6 +662,7 @@ def export_analog_digital_events(
     if digital_inputs and digital_dat_path is not None and digital_dat_path.exists():
         existing_digital = _find_existing_digital_events_file(output_dir)
         if (not overwrite) and existing_digital is not None:
+            validate_mat_output(existing_digital, "digitalIn")
             digital_paths.append(existing_digital)
         else:
             digital_out = output_dir / "digitalIn.events.mat"
@@ -663,14 +683,15 @@ def export_analog_digital_events(
                 word_channels=word_ch,
             )
             if has_any:
-                savemat(digital_out, {"digitalIn": digital_in}, do_compression=True)
-                _save_digital_plot(output_dir, digital_in)
+                atomic_savemat(digital_out, {"digitalIn": digital_in}, required_key="digitalIn")
+                _save_digital_plot(output_dir, digital_in, overwrite=overwrite)
                 digital_paths.append(digital_out)
             elif digital_out.exists():
                 digital_out.unlink()
     elif digital_inputs and openephys_ttl_paths is not None and openephys_sample_counts is not None:
         existing_digital = _find_existing_digital_events_file(output_dir)
         if (not overwrite) and existing_digital is not None:
+            validate_mat_output(existing_digital, "digitalIn")
             digital_paths.append(existing_digital)
         else:
             digital_out = output_dir / "digitalIn.events.mat"
@@ -689,8 +710,8 @@ def export_analog_digital_events(
                     word_channels=1,
                 )
                 if has_any:
-                    savemat(digital_out, {"digitalIn": digital_in}, do_compression=True)
-                    _save_digital_plot(output_dir, digital_in)
+                    atomic_savemat(digital_out, {"digitalIn": digital_in}, required_key="digitalIn")
+                    _save_digital_plot(output_dir, digital_in, overwrite=overwrite)
                     digital_paths.append(digital_out)
                 elif digital_out.exists():
                     digital_out.unlink()

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 from scipy.io import savemat
+from .io import atomic_savemat, validate_mat_output
 
 from .metafile import MergePointsData
 
@@ -55,7 +56,28 @@ def compute_mergepoints(
     )
 
 
-def save_mergepoints_events_mat(path: Path, data: MergePointsData) -> Path:
+def save_mergepoints_events_mat(path: Path, data: MergePointsData, *, overwrite: bool = True) -> Path:
+    if Path(path).exists() and not overwrite:
+        existing = validate_mat_output(Path(path), "MergePoints")["MergePoints"]
+        try:
+            timestamps = np.asarray(existing["timestamps"], dtype=float)
+            timestamps_samples = np.asarray(existing["timestamps_samples"], dtype=float)
+            firstlast = np.asarray(existing["firstlasttimpoints_samples"], dtype=float)
+            foldernames = [str(item) for item in np.asarray(existing["foldernames"], dtype=object).reshape(-1)]
+        except Exception as exc:
+            raise ValueError(f"Invalid existing MergePoints output: {path}") from exc
+        same = (
+            timestamps.shape == np.asarray(data.timestamps_sec).shape
+            and np.allclose(timestamps, data.timestamps_sec, equal_nan=True)
+            and timestamps_samples.shape == np.asarray(data.timestamps_samples).shape
+            and np.allclose(timestamps_samples, data.timestamps_samples, equal_nan=True)
+            and firstlast.shape == np.asarray(data.firstlasttimepoints_samples).shape
+            and np.allclose(firstlast, data.firstlasttimepoints_samples, equal_nan=True)
+            and foldernames == [str(item) for item in data.foldernames]
+        )
+        if not same:
+            raise ValueError(f"Existing MergePoints output is incompatible with current inputs: {path}")
+        return Path(path)
     merge_points = {
         "timestamps": data.timestamps_sec,
         # neurocode MAT output stores these as MATLAB double
@@ -67,5 +89,4 @@ def save_mergepoints_events_mat(path: Path, data: MergePointsData) -> Path:
             "detectiondate": datetime.now().strftime("%Y-%m-%d"),
         },
     }
-    savemat(path, {"MergePoints": merge_points}, do_compression=True)
-    return path
+    return atomic_savemat(Path(path), {"MergePoints": merge_points}, required_key="MergePoints")

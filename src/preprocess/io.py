@@ -4,18 +4,22 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 import os
 import shutil
+import uuid
+import filecmp
 from pathlib import Path
 from shutil import copy2
 import json
 import re
+import warnings
 import tkinter as tk
 from tkinter import filedialog
 import xml.etree.ElementTree as ET
 
 import numpy as np
 from scipy.io import loadmat, savemat
+from scipy.io.matlab import MatWriteError
 
-from .intan_rhd import IntanRhdHeader
+from .intan_rhd import IntanRhdHeader, read_intan_rhd_header
 from .metafile import (
     AcquisitionCatalog,
     PreprocessConfig,
@@ -31,6 +35,303 @@ _OPENEPHYS_RECORD_NODE_NAME = "Record Node 101"
 _DAY_PREFIX_PATTERN = re.compile(r"^(?:day|d)(\d+)", re.IGNORECASE)
 _OPENEPHYS_EPHYS_CHANNEL_PATTERN = re.compile(r"^CH\d+$", re.IGNORECASE)
 _OPENEPHYS_ADC_CHANNEL_PATTERN = re.compile(r"^ADC\d+$", re.IGNORECASE)
+
+
+def atomic_write_path(
+    target: Path,
+    writer,
+    *,
+    validator=None,
+) -> Path:
+    """Publish a file only after its same-directory temporary output validates.
+
+    The canonical target is never opened for writing.  A writer receives the
+    temporary path and may raise; in that case an earlier canonical output is
+    deliberately left untouched.
+    """
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.stem}.partial-{uuid.uuid4().hex}{target.suffix}")
+    try:
+        writer(temporary)
+        if validator is not None:
+            validation_result = validator(temporary)
+            if validation_result is False:
+                raise ValueError(f"New output failed validation: {temporary}")
+        elif not temporary.is_file() or temporary.stat().st_size == 0:
+            raise ValueError(f"New output is missing or empty: {temporary}")
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
+_MAT_V5_SAFE_PAYLOAD_BYTES = (2**31) - (64 * 1024**2)
+
+
+def _mat_payload_nbytes(value: object) -> int:
+    if isinstance(value, dict):
+        return sum(_mat_payload_nbytes(item) for item in value.values())
+    if isinstance(value, str):
+        return len(value.encode("utf-16-le"))
+    try:
+        return int(np.asarray(value).nbytes)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _matlab_class_for_dtype(dtype: np.dtype) -> str:
+    dtype = np.dtype(dtype)
+    if dtype.kind == "b":
+        return "logical"
+    if dtype.kind == "f":
+        return "single" if dtype.itemsize == 4 else "double"
+    if dtype.kind in {"i", "u"}:
+        return dtype.name
+    raise TypeError(f"Unsupported MATLAB v7.3 numeric dtype: {dtype}")
+
+
+def _write_mat73_fields_attribute(group, field_names: list[str]) -> None:
+    import h5py
+
+    field_dtype = h5py.vlen_dtype(np.dtype("S1"))
+    fields = np.empty((len(field_names),), dtype=object)
+    for index, name in enumerate(field_names):
+        fields[index] = np.frombuffer(name.encode("ascii"), dtype="S1")
+    group.attrs.create("MATLAB_fields", fields, dtype=field_dtype)
+
+
+def _write_mat73_value(parent, name: str, value: object) -> None:
+    if isinstance(value, dict):
+        group = parent.create_group(name)
+        group.attrs["MATLAB_class"] = np.bytes_("struct")
+        group.attrs["H5PATH"] = np.bytes_(parent.name)
+        field_names = list(value)
+        _write_mat73_fields_attribute(group, field_names)
+        for field_name in field_names:
+            _write_mat73_value(group, field_name, value[field_name])
+        return
+
+    if isinstance(value, str):
+        array = np.fromiter((ord(char) for char in value), dtype=np.uint16).reshape(1, -1)
+        dataset = parent.create_dataset(name, data=array.T)
+        dataset.attrs["MATLAB_class"] = np.bytes_("char")
+        dataset.attrs["MATLAB_int_decode"] = np.int64(2)
+        dataset.attrs["H5PATH"] = np.bytes_(parent.name)
+        return
+
+    array = np.asarray(value)
+    if array.ndim == 0:
+        array = array.reshape(1, 1)
+    matlab_class = _matlab_class_for_dtype(array.dtype)
+    if matlab_class == "logical":
+        array = array.astype(np.uint8, copy=False)
+    if array.size == 0:
+        dataset = parent.create_dataset(
+            name,
+            data=np.asarray(array.shape, dtype=np.uint64),
+        )
+        dataset.attrs["MATLAB_empty"] = np.uint8(1)
+    else:
+        stored = np.transpose(array, axes=tuple(reversed(range(array.ndim))))
+        options: dict[str, object] = {}
+        if array.nbytes >= 1024**2:
+            options.update(compression="gzip", compression_opts=4, shuffle=True)
+        dataset = parent.create_dataset(name, data=stored, **options)
+    dataset.attrs["MATLAB_class"] = np.bytes_(matlab_class)
+    dataset.attrs["H5PATH"] = np.bytes_(parent.name)
+
+
+def _write_mat73(path: Path, payload: dict) -> None:
+    import h5py
+
+    with h5py.File(path, "w", userblock_size=512) as handle:
+        for name, value in payload.items():
+            _write_mat73_value(handle, str(name), value)
+        handle.flush()
+    description = (
+        "MATLAB 7.3 MAT-file, Platform: GLNXA64, Created on: "
+        f"{datetime.now().strftime('%a %b %d %H:%M:%S %Y')} HDF5 schema 1.00 ."
+    )
+    header = description.encode("ascii")[:116].ljust(116, b" ")
+    header += b"\x00" * 8 + b"\x00\x02IM"
+    with Path(path).open("r+b") as stream:
+        stream.write(header)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _read_mat73_value(node) -> object:
+    import h5py
+
+    if isinstance(node, h5py.Group):
+        return {name: _read_mat73_value(child) for name, child in node.items()}
+    matlab_class = node.attrs.get("MATLAB_class", b"")
+    if isinstance(matlab_class, bytes):
+        matlab_class = matlab_class.decode("ascii", errors="replace")
+    if int(node.attrs.get("MATLAB_empty", 0)):
+        shape = tuple(int(value) for value in np.asarray(node).reshape(-1))
+        dtype = np.float64 if matlab_class == "double" else np.dtype(str(matlab_class))
+        return np.empty(shape, dtype=dtype)
+    array = np.asarray(node)
+    if array.ndim:
+        array = np.transpose(array, axes=tuple(reversed(range(array.ndim))))
+    if matlab_class == "char":
+        return "".join(chr(int(value)) for value in array.reshape(-1))
+    if matlab_class == "logical":
+        return array.astype(bool, copy=False)
+    return array
+
+
+def _decode_mat73_class(node) -> str:
+    value = node.attrs.get("MATLAB_class", b"")
+    if isinstance(value, bytes):
+        return value.decode("ascii", errors="replace")
+    return str(value)
+
+
+def _decode_mat73_fields(value: object) -> list[str]:
+    fields: list[str] = []
+    for item in np.asarray(value, dtype=object).reshape(-1):
+        chars = np.asarray(item).reshape(-1)
+        fields.append(b"".join(bytes(char) for char in chars).decode("ascii"))
+    return fields
+
+
+def _validate_mat73_node(node) -> None:
+    import h5py
+
+    matlab_class = _decode_mat73_class(node)
+    if isinstance(node, h5py.Group):
+        if matlab_class != "struct":
+            raise ValueError(f"group {node.name} is not a MATLAB struct")
+        if "MATLAB_fields" not in node.attrs:
+            raise ValueError(f"struct {node.name} has no MATLAB_fields metadata")
+        fields = _decode_mat73_fields(node.attrs["MATLAB_fields"])
+        if fields != list(node.keys()):
+            # HDF5 iterates children lexically while MATLAB_fields preserves
+            # struct order, so compare membership separately from ordering.
+            if set(fields) != set(node.keys()):
+                raise ValueError(f"struct {node.name} field metadata do not match datasets")
+        for child in node.values():
+            _validate_mat73_node(child)
+        return
+
+    supported = {
+        "char", "logical", "double", "single",
+        "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64",
+    }
+    if matlab_class not in supported:
+        raise ValueError(f"dataset {node.name} has unsupported MATLAB_class {matlab_class!r}")
+    if int(node.attrs.get("MATLAB_empty", 0)):
+        dimensions = np.asarray(node).reshape(-1)
+        if node.dtype != np.dtype(np.uint64) or np.any(dimensions < 0):
+            raise ValueError(f"dataset {node.name} has invalid MATLAB empty dimensions")
+        return
+    if matlab_class == "char" and node.dtype != np.dtype(np.uint16):
+        raise ValueError(f"dataset {node.name} has invalid MATLAB char dtype")
+    if matlab_class == "logical" and node.dtype not in {np.dtype(np.uint8), np.dtype(bool)}:
+        raise ValueError(f"dataset {node.name} has invalid MATLAB logical dtype")
+    if matlab_class not in {"char", "logical"}:
+        expected = np.dtype(matlab_class)
+        if node.dtype.kind != expected.kind or node.dtype.itemsize != expected.itemsize:
+            raise ValueError(f"dataset {node.name} dtype does not match MATLAB_class")
+    if node.size:
+        first = tuple(0 for _ in node.shape)
+        node[first]
+        last = tuple(size - 1 for size in node.shape)
+        if last != first:
+            node[last]
+
+
+def validate_mat_output(
+    path: Path, required_key: str, *, load_payload: bool = True
+) -> dict:
+    """Load a MATLAB output and require its producer's top-level payload."""
+    try:
+        import h5py
+
+        is_hdf5 = h5py.is_hdf5(path)
+    except (ImportError, OSError):
+        is_hdf5 = False
+    if is_hdf5:
+        try:
+            with h5py.File(path, "r") as handle:
+                if required_key not in handle:
+                    raise ValueError(
+                        f"MAT output {path} does not contain required "
+                        f"{required_key!r} payload"
+                    )
+                _validate_mat73_node(handle[required_key])
+                value = (
+                    _read_mat73_value(handle[required_key])
+                    if load_payload
+                    else None
+                )
+        except Exception as exc:
+            if isinstance(exc, ValueError) and "does not contain required" in str(exc):
+                raise
+            raise ValueError(f"Invalid MATLAB v7.3 output {path}: {exc}") from exc
+        return {required_key: value}
+    try:
+        loaded = loadmat(path, simplify_cells=True)
+    except Exception as exc:
+        raise ValueError(f"Invalid MAT output {path}: {exc}") from exc
+    if required_key not in loaded:
+        raise ValueError(f"MAT output {path} does not contain required {required_key!r} payload")
+    return loaded
+
+
+def atomic_savemat(path: Path, payload: dict, *, required_key: str) -> Path:
+    use_v73 = _mat_payload_nbytes(payload) > _MAT_V5_SAFE_PAYLOAD_BYTES
+
+    def writer(temporary: Path) -> None:
+        if use_v73:
+            _write_mat73(temporary, payload)
+            return
+        try:
+            savemat(temporary, payload, do_compression=True)
+        except MatWriteError as exc:
+            if "too large" not in str(exc).lower():
+                raise
+            _write_mat73(temporary, payload)
+
+    return atomic_write_path(
+        path,
+        writer,
+        validator=lambda temporary: validate_mat_output(
+            temporary,
+            required_key,
+            load_payload=not h5py_is_hdf5(temporary),
+        ),
+    )
+
+
+def h5py_is_hdf5(path: Path) -> bool:
+    try:
+        import h5py
+
+        return bool(h5py.is_hdf5(path))
+    except (ImportError, OSError):
+        return False
+
+
+def atomic_write_json(path: Path, payload: object) -> Path:
+    return atomic_write_path(
+        path,
+        lambda temporary: temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"),
+        validator=lambda temporary: json.loads(temporary.read_text(encoding="utf-8")),
+    )
+
+
+def atomic_save_figure(path: Path, figure, **kwargs) -> Path:
+    return atomic_write_path(
+        path,
+        lambda temporary: figure.savefig(temporary, **kwargs),
+        validator=lambda temporary: temporary.is_file() and temporary.stat().st_size > 0
+        or (_ for _ in ()).throw(ValueError(f"Invalid figure output: {temporary}")),
+    )
 
 
 @dataclass(frozen=True)
@@ -736,6 +1037,7 @@ def create_channel_map(
     reject_channels: list[int] | None = None,
     probe_assignments: list[dict] | None = None,
     xml_path: Path | str | None = None,
+    overwrite: bool = True,
 ) -> Path | None:
     save_dict = build_channel_map_data(
         basepath=basepath,
@@ -749,7 +1051,16 @@ def create_channel_map(
         return None
 
     out_file = Path(outputDir) / "chanMap.mat"
-    savemat(out_file, save_dict)
+    if out_file.exists() and not overwrite:
+        existing = validate_mat_output(out_file, "chanMap")
+        required = ("chanMap", "connected", "xcoords", "ycoords", "kcoords")
+        if any(key not in existing for key in required):
+            raise ValueError(f"Existing chanMap is incompatible with current output schema: {out_file}")
+        for key in required:
+            if not _nan_equal(np.asarray(existing[key]), np.asarray(save_dict[key])):
+                raise ValueError(f"Existing chanMap is incompatible with current configuration: {out_file}")
+        return out_file
+    atomic_savemat(out_file, save_dict, required_key="chanMap")
     print(f"Successfully saved chanMap.mat to {out_file}")
     return out_file
 
@@ -760,6 +1071,7 @@ def save_cell_explorer_chan_coords(
     output_dir: Path | str,
     basename: str,
     source: str = "PreprocessPipeline chanMap.mat",
+    overwrite: bool = True,
 ) -> Path:
     chan_map = np.asarray(chanmap_data["chanMap"]).reshape(-1).astype(int)
     xcoords = np.asarray(chanmap_data["xcoords"]).reshape(-1).astype(float)
@@ -786,8 +1098,27 @@ def save_cell_explorer_chan_coords(
         "verticalSpacing": np.asarray([[np.nan]], dtype=float),
     }
     output_path = Path(output_dir) / f"{basename}.chanCoords.channelInfo.mat"
-    savemat(output_path, {"chanCoords": chan_coords}, do_compression=True)
-    return output_path
+    if output_path.exists() and not overwrite:
+        existing = validate_mat_output(output_path, "chanCoords")["chanCoords"]
+        try:
+            compatible = _nan_equal(np.asarray(existing["x"]), x) and _nan_equal(np.asarray(existing["y"]), y)
+        except Exception as exc:
+            raise ValueError(f"Invalid existing chanCoords output: {output_path}") from exc
+        if not compatible:
+            raise ValueError(f"Existing chanCoords is incompatible with current chanMap: {output_path}")
+        return output_path
+    return atomic_savemat(output_path, {"chanCoords": chan_coords}, required_key="chanCoords")
+
+
+def _nan_equal(left: np.ndarray, right: np.ndarray) -> bool:
+    """MATLAB geometry equality that treats matching NaNs as compatible."""
+    left = np.asarray(left).squeeze()
+    right = np.asarray(right).squeeze()
+    if left.shape != right.shape:
+        return False
+    if np.issubdtype(left.dtype, np.number) and np.issubdtype(right.dtype, np.number):
+        return bool(np.allclose(left, right, equal_nan=True))
+    return bool(np.array_equal(left, right))
 
 
 def prepare_chanmap(
@@ -798,6 +1129,7 @@ def prepare_chanmap(
     probe_assignments: list[dict],
     reject_channels: list[int] | None = None,
     xml_path: Path | None = None,
+    overwrite: bool = True,
 ) -> tuple[Path, list[int]]:
     chanmap_path = create_channel_map(
         basepath=basepath,
@@ -806,6 +1138,7 @@ def prepare_chanmap(
         probe_assignments=probe_assignments,
         reject_channels=reject_channels or [],
         xml_path=xml_path,
+        overwrite=overwrite,
     )
     if chanmap_path is None:
         raise RuntimeError("Failed to create chanMap.mat")
@@ -815,6 +1148,7 @@ def prepare_chanmap(
         chanmap_data=chan,
         output_dir=local_output_dir,
         basename=basename,
+        overwrite=overwrite,
     )
     connected = np.asarray(chan["connected"]).flatten().astype(int)
     device_ch_inds = np.asarray(chan.get("chanMap0ind", np.asarray(chan["chanMap"]).flatten() - 1)).flatten().astype(int)
@@ -1036,7 +1370,10 @@ def _resolve_openephys_stream_info(recording_root: Path) -> OpenEphysStreamInfo:
                     ephys_names.append(channel_name or f"CH{index + 1}")
                 elif _is_openephys_adc_channel(channel):
                     adc_indices.append(index)
-                    adc_names.append(channel_name or f"ADC{len(adc_indices)}")
+                    # Preserve raw names for identity resolution and diagnostics.
+                    # Synthesizing ADC<number> here would turn an unnamed layout
+                    # into falsely authoritative metadata.
+                    adc_names.append(channel_name)
         elif total_channels > 0:
             ephys_indices = list(range(total_channels))
             ephys_names = [f"CH{index + 1}" for index in ephys_indices]
@@ -1078,9 +1415,100 @@ def _resolve_openephys_stream_info(recording_root: Path) -> OpenEphysStreamInfo:
     )
 
 
-def _copy_if_different(source: Path, target: Path) -> Path:
-    if source.resolve() != target.resolve():
-        copy2(source, target)
+def _resolve_openephys_adc_native_orders(info: OpenEphysStreamInfo, recording_root: Path) -> tuple[list[int], str]:
+    """Resolve physical ADC identities from an OE stream's channel names."""
+    parsed: list[int | None] = []
+    for name in info.adc_channel_names:
+        match = re.fullmatch(r"\s*adc(\d+)\s*", str(name), flags=re.IGNORECASE)
+        parsed.append(int(match.group(1)) - 1 if match is not None else None)
+    if not parsed:
+        return [], "none"
+    if all(order is None for order in parsed):
+        warnings.warn(
+            "Open Ephys ADC identities are unavailable; using positional identities for "
+            f"{recording_root} stream {info.stream_name}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return list(range(len(parsed))), "inferred_positional"
+    if any(order is None for order in parsed):
+        raise ValueError(
+            "Ambiguous Open Ephys ADC identities (only some channel names are ADC<number>) "
+            f"for {recording_root} stream {info.stream_name}: {info.adc_channel_names}"
+        )
+    orders = [int(order) for order in parsed]
+    if any(order < 0 for order in orders) or len(set(orders)) != len(orders):
+        raise ValueError(
+            "Ambiguous Open Ephys ADC identities (duplicate or invalid ADC<number> names) "
+            f"for {recording_root} stream {info.stream_name}: {info.adc_channel_names}"
+        )
+    return orders, "openephys_name"
+
+
+def _find_local_intan_rhd(recording_dir: Path) -> Path | None:
+    """Return only an RHD adjacent to one selected Intan recording."""
+    preferred = recording_dir / "info.rhd"
+    if preferred.exists():
+        return preferred
+    matches = sorted(recording_dir.glob("*.rhd"))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _resolve_intan_adc_layout(
+    *, analog_path: Path | None, sample_count: int, recording_dir: Path
+) -> tuple[int, list[int], str]:
+    """Resolve one Intan sidecar width and identity layout without root-RHD fallback."""
+    if analog_path is None or not analog_path.exists():
+        return 0, [], "none"
+    width = _infer_channels_from_file(analog_path, sample_count)
+    if width <= 0:
+        return 0, [], "none"
+    rhd_path = _find_local_intan_rhd(recording_dir)
+    header: IntanRhdHeader | None = None
+    if rhd_path is not None:
+        try:
+            header = read_intan_rhd_header(rhd_path)
+        except Exception as exc:
+            warnings.warn(
+                f"Could not read local Intan ADC layout metadata for {recording_dir} ({rhd_path}): {exc}; "
+                "using positional identities.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    if header is not None and header.num_board_adc_channels > 0:
+        orders = [int(order) for order in header.board_adc_native_orders]
+        if header.num_board_adc_channels != width or len(orders) != width:
+            raise ValueError(
+                "Contradictory local Intan ADC metadata for "
+                f"{recording_dir}: inferred width={width}, reported count="
+                f"{header.num_board_adc_channels}, reported identities={orders}"
+            )
+        if any(order < 0 for order in orders) or len(set(orders)) != len(orders):
+            raise ValueError(f"Invalid local Intan ADC identities for {recording_dir}: {orders}")
+        return width, orders, "intan_rhd"
+    warnings.warn(
+        "Local Intan ADC layout metadata are missing, unreadable, or report zero channels; "
+        f"using positional identities for {recording_dir}.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return width, list(range(width)), "inferred_positional"
+
+
+def _copy_if_different(source: Path, target: Path, *, overwrite: bool = False) -> Path:
+    if source.resolve() == target.resolve():
+        return target
+    if target.exists() and not overwrite:
+        if target.is_file() and filecmp.cmp(source, target, shallow=False):
+            return target
+        raise FileExistsError(
+            f"Existing metadata output conflicts with selected source: {target}. Set overwrite=True to replace it."
+        )
+    atomic_write_path(
+        target,
+        lambda temporary: copy2(source, temporary),
+        validator=lambda temporary: temporary.is_file() and temporary.stat().st_size == source.stat().st_size,
+    )
     return target
 
 
@@ -1090,6 +1518,7 @@ def ensure_xml(
     basename: str,
     *,
     explicit_xml_path: Path | None = None,
+    overwrite: bool = False,
 ) -> Path:
     target = local_output_dir / f"{basename}.xml"
 
@@ -1097,11 +1526,11 @@ def ensure_xml(
         explicit = Path(explicit_xml_path).expanduser().resolve()
         if not explicit.exists() or not explicit.is_file():
             raise FileNotFoundError(f"Selected XML file does not exist: {explicit}")
-        return _copy_if_different(explicit, target)
+        return _copy_if_different(explicit, target, overwrite=overwrite)
 
     base_xml = basepath / f"{basename}.xml"
     if base_xml.exists():
-        return _copy_if_different(base_xml, target)
+        return _copy_if_different(base_xml, target, overwrite=overwrite)
 
     raise FileNotFoundError(
         f"No XML file selected and no basename XML found. Expected {base_xml}; "
@@ -1142,11 +1571,12 @@ def ensure_rhd(
     basename: str,
     *,
     use_first_child_match: bool = False,
+    overwrite: bool = False,
 ) -> Path | None:
     target = local_output_dir / f"{basename}.rhd"
     src = find_rhd_source(basepath, basename, use_first_child_match=use_first_child_match)
     if src is not None:
-        return _copy_if_different(src, target)
+        return _copy_if_different(src, target, overwrite=overwrite)
 
     if target.exists():
         return target
@@ -1330,6 +1760,9 @@ def build_acquisition_catalog(
     ephys_channel_indices_by_subsession: list[list[int] | None] = []
     adc_channel_indices_by_subsession: list[list[int]] = []
     adc_channel_names_by_subsession: list[list[str]] = []
+    adc_native_orders_by_subsession: list[list[int]] = []
+    adc_output_indices_by_subsession: list[list[int]] = []
+    adc_layout_sources_by_subsession: list[str] = []
     analogin_source_paths: list[Path | None] = []
     analogin_paths: list[Path] = []
     digitalin_paths: list[Path] = []
@@ -1337,8 +1770,6 @@ def build_acquisition_catalog(
     supply_paths: list[Path] = []
     time_paths: list[Path] = []
     openephys_sampling_frequency: float | None = None
-    openephys_adc_channel_max = 0
-
     intan_paths: list[Path] = []
     intan_sample_counts: list[int] = []
 
@@ -1374,8 +1805,11 @@ def build_acquisition_catalog(
             ephys_channel_indices_by_subsession.append(list(info.ephys_channel_indices))
             adc_channel_indices_by_subsession.append(list(info.adc_channel_indices))
             adc_channel_names_by_subsession.append(list(info.adc_channel_names))
+            adc_orders, adc_layout_source = _resolve_openephys_adc_native_orders(info, path)
+            adc_native_orders_by_subsession.append(adc_orders)
+            adc_output_indices_by_subsession.append([])
+            adc_layout_sources_by_subsession.append(adc_layout_source)
             analogin_source_paths.append(info.continuous_dat if info.adc_channel_indices else None)
-            openephys_adc_channel_max = max(openephys_adc_channel_max, len(info.adc_channel_indices))
             continue
 
         sample_count = _infer_sample_count_from_binary(
@@ -1393,9 +1827,11 @@ def build_acquisition_catalog(
         intan_adc_channels = 0
         if analog.exists():
             analogin_paths.append(analog)
-            intan_adc_channels = _infer_channels_from_file(analog, sample_count)
-        if intan_header is not None and analog.exists() and intan_header.num_board_adc_channels > 0:
-            intan_adc_channels = int(intan_header.num_board_adc_channels)
+        intan_adc_channels, intan_adc_orders, intan_adc_layout_source = _resolve_intan_adc_layout(
+            analog_path=analog if analog.exists() else None,
+            sample_count=sample_count,
+            recording_dir=d,
+        )
         if digital.exists():
             digitalin_paths.append(digital)
         if aux.exists():
@@ -1418,6 +1854,9 @@ def build_acquisition_catalog(
         ephys_channel_indices_by_subsession.append(None)
         adc_channel_indices_by_subsession.append(list(range(intan_adc_channels)))
         adc_channel_names_by_subsession.append([f"ADC{i + 1}" for i in range(intan_adc_channels)])
+        adc_native_orders_by_subsession.append(intan_adc_orders)
+        adc_output_indices_by_subsession.append([])
+        adc_layout_sources_by_subsession.append(intan_adc_layout_source)
         analogin_source_paths.append(analog if analog.exists() else None)
         intan_paths.append(path)
         intan_sample_counts.append(sample_count)
@@ -1440,15 +1879,18 @@ def build_acquisition_catalog(
             aux_ch = int(intan_header.num_aux_input_channels)
         if intan_header.num_supply_voltage_channels > 0:
             supply_ch = int(intan_header.num_supply_voltage_channels)
-        if intan_header.num_board_adc_channels > 0:
-            adc_ch = int(intan_header.num_board_adc_channels)
-        if intan_header.board_adc_native_orders:
-            adc_native_orders = [int(ch) for ch in intan_header.board_adc_native_orders]
-    if not adc_native_orders and adc_ch > 0:
-        adc_native_orders = list(range(int(adc_ch)))
-    if openephys_adc_channel_max > adc_ch:
-        adc_ch = openephys_adc_channel_max
-        adc_native_orders = list(range(int(adc_ch)))
+    canonical_adc_orders = sorted({
+        int(order)
+        for orders in adc_native_orders_by_subsession
+        for order in orders
+    })
+    for idx, orders in enumerate(adc_native_orders_by_subsession):
+        destinations = [canonical_adc_orders.index(order) for order in orders]
+        if len(destinations) != len(orders) or len(set(destinations)) != len(destinations):
+            raise ValueError(f"Invalid ADC output mapping for {subsession_names[idx]}: {orders}")
+        adc_output_indices_by_subsession[idx] = destinations
+    adc_ch = len(canonical_adc_orders)
+    adc_native_orders = canonical_adc_orders
 
     dig_ch = 0
     dig_word_ch = 0
@@ -1531,6 +1973,9 @@ def build_acquisition_catalog(
         ephys_channel_indices_by_subsession=ephys_channel_indices_by_subsession,
         adc_channel_indices_by_subsession=adc_channel_indices_by_subsession,
         adc_channel_names_by_subsession=adc_channel_names_by_subsession,
+        adc_native_orders_by_subsession=adc_native_orders_by_subsession,
+        adc_output_indices_by_subsession=adc_output_indices_by_subsession,
+        adc_layout_sources_by_subsession=adc_layout_sources_by_subsession,
         analogin_source_paths=analogin_source_paths,
     )
 

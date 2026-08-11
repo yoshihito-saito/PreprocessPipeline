@@ -10,6 +10,15 @@ from src.preprocess import PreprocessConfig
 from src.preprocess.io import load_xml_metadata
 from src.preprocess.paths import find_project_root, resolve_project_path
 from src.worker_defaults import default_worker_count, normalize_worker_count
+from src.execution.models import (
+    AnalysisConfig,
+    BackendName,
+    ExecutionConfig,
+    RequestedBackend,
+    ResourceSpec,
+    StageName,
+)
+from src.execution.store import RunStore
 
 
 RunMode = Literal["all", "preprocess", "postprocess", "noise_label"]
@@ -87,7 +96,7 @@ def latest_sorting_folder(root: Path | None) -> Path | None:
         p.resolve()
         for pattern in SORTING_OUTPUT_PATTERNS
         for p in root.glob(pattern)
-        if p.is_dir() and not p.name.endswith("_spi")
+        if p.is_dir() and "_spi" not in p.name and ".preserved-" not in p.name
     ]
     return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
 
@@ -118,6 +127,117 @@ def _postprocess_xml_metadata(basepath: Path | None, basename: str) -> tuple[flo
         return None, None
     meta = load_xml_metadata(xml_path)
     return float(meta.sr), int(meta.n_channels)
+
+
+def _xml_metadata_from_path(xml_path: Path | None) -> tuple[float | None, int | None]:
+    if xml_path is None or not xml_path.exists():
+        return None, None
+    meta = load_xml_metadata(xml_path)
+    return float(meta.sr), int(meta.n_channels)
+
+
+def _looks_like_processed_session(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    basename = path.name
+    primary = path / f"{basename}.dat"
+    supporting = (
+        path / f"{basename}.session.mat",
+        path / "preprocess_run.yaml",
+        path / "preprocessSession_manifest.json",
+        path / "sorter_partition_manifest.json",
+    )
+    has_sorting = any(
+        item.is_dir()
+        for pattern in SORTING_OUTPUT_PATTERNS
+        for item in path.glob(pattern)
+    )
+    return primary.exists() and (any(item.exists() for item in supporting) or has_sorting)
+
+
+def _raw_recording_is_present(path: Path) -> bool:
+    if (path / "structure.oebin").exists():
+        return True
+    if (path / "amplifier.dat").exists() or (path / "continuous.dat").exists():
+        return True
+    return any(
+        child.is_dir()
+        and (
+            (child / "amplifier.dat").exists()
+            or (child / "continuous.dat").exists()
+            or (child / "structure.oebin").exists()
+        )
+        for child in path.iterdir()
+    )
+
+
+def _source_from_existing_session(path: Path) -> Path | None:
+    final_record = path / "preprocess_run.yaml"
+    if final_record.exists():
+        try:
+            import yaml
+
+            payload = yaml.safe_load(final_record.read_text(encoding="utf-8")) or {}
+            candidates = (
+                payload.get("source_basepath"),
+                (payload.get("inputs") or {}).get("source_basepath"),
+                (payload.get("analysis") or {}).get("source_basepath"),
+            )
+            for value in candidates:
+                if value and Path(str(value)).expanduser().is_dir():
+                    return Path(str(value)).expanduser().resolve()
+        except (OSError, TypeError, ValueError):
+            pass
+
+    active_record = path / ".pipeline-active-run.json"
+    if active_record.exists():
+        try:
+            claim = json.loads(active_record.read_text(encoding="utf-8"))
+            run_dir = Path(str(claim.get("run_dir") or ""))
+            analysis_path = run_dir / "analysis_config.json"
+            analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+            saved = analysis.get("settings") or {}
+            value = str(saved.get("source_basepath") or saved.get("basepath") or "").strip()
+            if value and Path(value).expanduser().is_dir():
+                return Path(value).expanduser().resolve()
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    legacy_manifest = path / "preprocessSession_manifest.json"
+    if legacy_manifest.exists():
+        try:
+            payload = json.loads(legacy_manifest.read_text(encoding="utf-8"))
+            value = str(payload.get("basepath") or "").strip()
+            if value and Path(value).expanduser().is_dir():
+                return Path(value).expanduser().resolve()
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    legacy_params = path / "preprocessSession_params.json"
+    if legacy_params.exists():
+        try:
+            payload = json.loads(legacy_params.read_text(encoding="utf-8"))
+            value = str(payload.get("basepath") or "").strip()
+            if value and Path(value).expanduser().is_dir():
+                return Path(value).expanduser().resolve()
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    if _raw_recording_is_present(path):
+        return path.resolve()
+    return None
+
+
+def resolve_existing_session_settings(settings: "PipelineGuiSettings") -> bool:
+    """Resolve a processed folder selected through the existing Basepath field."""
+
+    selected = settings.basepath_path
+    if settings.multi_day_enabled or selected is None or not _looks_like_processed_session(selected):
+        settings.existing_session_dir = ""
+        settings.source_basepath = ""
+        return False
+    settings.existing_session_dir = str(selected.resolve())
+    source = _source_from_existing_session(selected)
+    settings.source_basepath = str(source) if source is not None else ""
+    return True
 
 
 @dataclass
@@ -221,9 +341,83 @@ class BehaviorGuiSettings:
 
 
 @dataclass
+class StageResourceGuiSettings:
+    cpus: int = field(default_factory=default_worker_count)
+    memory_mb: int = 256 * 1024
+    walltime_minutes: int | None = None
+    gpu_count: int = 0
+    gpu_gres_type: str = ""
+    gpu_constraint: str = ""
+    partition: str = ""
+    account: str = ""
+    qos: str = ""
+    reservation: str = ""
+
+    def to_resource_spec(self) -> ResourceSpec:
+        spec = ResourceSpec(
+            cpus=int(self.cpus),
+            memory_mb=int(self.memory_mb),
+            walltime_minutes=(
+                None
+                if self.walltime_minutes is None
+                else int(self.walltime_minutes)
+            ),
+            gpu_count=int(self.gpu_count),
+            gpu_gres_type=self.gpu_gres_type.strip(),
+            gpu_constraint=self.gpu_constraint.strip(),
+            partition=self.partition.strip(),
+            account=self.account.strip(),
+            qos=self.qos.strip(),
+            reservation=self.reservation.strip(),
+        )
+        return spec
+
+
+def _sorting_resource_defaults() -> StageResourceGuiSettings:
+    return StageResourceGuiSettings(memory_mb=512 * 1024, gpu_count=1)
+
+
+@dataclass
+class ExecutionGuiSettings:
+    requested_backend: str = RequestedBackend.AUTO.value
+    workspace: str = ""
+    matlab_path: str = ""
+    shared_workspace_acknowledged: bool = False
+    require_sacct: bool = True
+    preprocess: StageResourceGuiSettings = field(default_factory=StageResourceGuiSettings)
+    sorting: StageResourceGuiSettings = field(default_factory=_sorting_resource_defaults)
+    postprocess: StageResourceGuiSettings = field(default_factory=StageResourceGuiSettings)
+
+    def to_execution_config(self, *, resolved_backend: BackendName) -> ExecutionConfig:
+        workspace = self.workspace.strip()
+        if not workspace:
+            raise ValueError("A persistent Run workspace is required")
+        config = ExecutionConfig(
+            requested_backend=RequestedBackend(self.requested_backend.lower()),
+            resolved_backend=resolved_backend,
+            workspace=str(Path(workspace).expanduser().resolve()),
+            matlab_path=self.matlab_path.strip(),
+            shared_workspace_acknowledged=bool(self.shared_workspace_acknowledged),
+            require_sacct=bool(self.require_sacct),
+            resources={
+                "preprocess": self.preprocess.to_resource_spec(),
+                "sorting": self.sorting.to_resource_spec(),
+                "postprocess": self.postprocess.to_resource_spec(),
+            },
+        )
+        config.validate()
+        return config
+
+
+@dataclass
 class PipelineGuiSettings:
     basepath: str = ""
     local_root: str = ""
+    # Runtime-resolved paths for an existing processed session selected in the
+    # unchanged Basepath field. They are persisted in a Run snapshot but are
+    # not additional GUI controls.
+    source_basepath: str = ""
+    existing_session_dir: str = ""
     xml_path: str = ""
     chanmap_path: str = ""
     multi_day_enabled: bool = False
@@ -233,10 +427,20 @@ class PipelineGuiSettings:
     preprocess: PreprocessGuiSettings = field(default_factory=PreprocessGuiSettings)
     behavior: BehaviorGuiSettings = field(default_factory=BehaviorGuiSettings)
     postprocess: PostprocessGuiSettings = field(default_factory=PostprocessGuiSettings)
+    execution: ExecutionGuiSettings = field(default_factory=ExecutionGuiSettings)
 
     @property
     def basepath_path(self) -> Path | None:
         return _path_or_none(self.basepath)
+
+    @property
+    def preprocess_source_path(self) -> Path | None:
+        source = _path_or_none(self.source_basepath)
+        if source is not None:
+            return source
+        if self.existing_session_dir:
+            return None
+        return self.basepath_path
 
     @property
     def local_root_path(self) -> Path:
@@ -251,6 +455,9 @@ class PipelineGuiSettings:
 
     @property
     def local_output_dir(self) -> Path | None:
+        existing = _path_or_none(self.existing_session_dir)
+        if existing is not None:
+            return existing.resolve()
         if not self.basename:
             return None
         return (self.local_root_path / self.basename).resolve()
@@ -301,15 +508,19 @@ class PipelineGuiSettings:
         explicit = _path_or_none(self.xml_path)
         if explicit is not None:
             return explicit
-        basepath = self.basepath_path
         basename = self.basename
-        if basepath is None or not basename:
+        if not basename:
             return None
-        candidate = basepath / f"{basename}.xml"
-        return candidate if candidate.exists() else None
+        for root in (self.local_output_dir, self.preprocess_source_path, self.basepath_path):
+            if root is None:
+                continue
+            candidate = root / f"{basename}.xml"
+            if candidate.exists():
+                return candidate
+        return None
 
     def to_preprocess_config(self) -> PreprocessConfig:
-        basepath = self.basepath_path
+        basepath = self.preprocess_source_path
         if basepath is None:
             raise ValueError("basepath is required.")
 
@@ -319,7 +530,11 @@ class PipelineGuiSettings:
         highamp_group_mode = p.artifact_highamp_group_mode if p.remove_highamp_artifacts else "none"
         return PreprocessConfig(
             basepath=basepath,
-            localpath=self.local_root_path,
+            localpath=(
+                self.local_output_dir.parent
+                if self.existing_session_dir and self.local_output_dir is not None
+                else self.local_root_path
+            ),
             save_raw=p.save_raw,
             analog_inputs=p.analog_inputs,
             digital_inputs=p.digital_inputs,
@@ -381,10 +596,9 @@ class PipelineGuiSettings:
     def to_postprocess_config(self) -> PostprocessConfig:
         pp = self.postprocess
         basename = self.basename
-        basepath = self.basepath_path
         dat_path = self.postprocess_dat_path()
         chanmap_path = self.resolved_chanmap_path()
-        sampling_frequency, num_channels = _postprocess_xml_metadata(basepath, basename)
+        sampling_frequency, num_channels = _xml_metadata_from_path(self.resolved_xml_path())
         sorting_phy_folder = self.postprocess_sorting_folder()
         sorting_search_root = _path_or_none(pp.sorting_search_root)
         local_output_dir = self.local_output_dir
@@ -437,6 +651,12 @@ class PipelineGuiSettings:
             legacy_worker_count = preprocess_data.pop("worker_count")
             preprocess_data.setdefault("preprocess_worker_count", legacy_worker_count)
             preprocess_data.setdefault("sorter_worker_count", legacy_worker_count)
+        requested_preprocess_cpus = int(
+            preprocess_data.get("preprocess_worker_count", default_worker_count())
+        )
+        requested_sorting_cpus = int(
+            preprocess_data.get("sorter_worker_count", default_worker_count())
+        )
         preprocess = PreprocessGuiSettings(**preprocess_data)
         preprocess.preprocess_worker_count = normalize_worker_count(preprocess.preprocess_worker_count)
         preprocess.sorter_worker_count = normalize_worker_count(preprocess.sorter_worker_count)
@@ -445,9 +665,35 @@ class PipelineGuiSettings:
         behavior = BehaviorGuiSettings(
             **{key: value for key, value in behavior_data.items() if key in behavior_fields}
         )
-        postprocess = PostprocessGuiSettings(**data.pop("postprocess", {}))
+        postprocess_data = data.pop("postprocess", {})
+        requested_postprocess_cpus = int(postprocess_data.get("worker_count", default_worker_count()))
+        postprocess = PostprocessGuiSettings(**postprocess_data)
         postprocess.worker_count = normalize_worker_count(postprocess.worker_count)
-        return cls(**data, preprocess=preprocess, behavior=behavior, postprocess=postprocess)
+        has_execution = "execution" in data
+        execution_data = data.pop("execution", {})
+        execution = ExecutionGuiSettings(
+            requested_backend=str(execution_data.pop("requested_backend", RequestedBackend.AUTO.value)),
+            workspace=str(execution_data.pop("workspace", "")),
+            matlab_path=str(execution_data.pop("matlab_path", preprocess.matlab_path)),
+            shared_workspace_acknowledged=bool(
+                execution_data.pop("shared_workspace_acknowledged", False)
+            ),
+            require_sacct=bool(execution_data.pop("require_sacct", True)),
+            preprocess=StageResourceGuiSettings(**execution_data.pop("preprocess", {})),
+            sorting=StageResourceGuiSettings(**execution_data.pop("sorting", {"memory_mb": 512 * 1024, "gpu_count": 1})),
+            postprocess=StageResourceGuiSettings(**execution_data.pop("postprocess", {})),
+        )
+        if not has_execution:
+            execution.preprocess.cpus = max(1, requested_preprocess_cpus)
+            execution.sorting.cpus = max(1, requested_sorting_cpus)
+            execution.postprocess.cpus = max(1, requested_postprocess_cpus)
+        return cls(
+            **data,
+            preprocess=preprocess,
+            behavior=behavior,
+            postprocess=postprocess,
+            execution=execution,
+        )
 
     def save(self, path: Path) -> None:
         path.write_text(self.to_json(), encoding="utf-8")
@@ -455,3 +701,139 @@ class PipelineGuiSettings:
     @classmethod
     def load(cls, path: Path) -> "PipelineGuiSettings":
         return cls.from_json(path.read_text(encoding="utf-8"))
+
+
+@dataclass(frozen=True)
+class LocalSessionResume:
+    settings: PipelineGuiSettings
+    run_dir: Path | None
+    metadata_source: str
+
+
+def _gui_execution_from_snapshot(execution: ExecutionConfig) -> ExecutionGuiSettings:
+    def _resource(stage: StageName) -> StageResourceGuiSettings:
+        return StageResourceGuiSettings(**execution.resource_for(stage).to_dict())
+
+    return ExecutionGuiSettings(
+        requested_backend=execution.requested_backend.value,
+        workspace=execution.workspace,
+        matlab_path=execution.matlab_path,
+        shared_workspace_acknowledged=execution.shared_workspace_acknowledged,
+        require_sacct=execution.require_sacct,
+        preprocess=_resource(StageName.PREPROCESS),
+        sorting=_resource(StageName.SORTING),
+        postprocess=_resource(StageName.POSTPROCESS),
+    )
+
+
+def _settings_from_resume_snapshots(
+    *,
+    session_dir: Path,
+    analysis: AnalysisConfig,
+    execution: ExecutionConfig,
+) -> PipelineGuiSettings:
+    settings = PipelineGuiSettings.from_json(json.dumps(analysis.settings))
+    settings.execution = _gui_execution_from_snapshot(execution)
+    settings.preprocess.preprocess_worker_count = normalize_worker_count(
+        execution.resource_for(StageName.PREPROCESS).cpus
+    )
+    settings.preprocess.sorter_worker_count = normalize_worker_count(
+        execution.resource_for(StageName.SORTING).cpus
+    )
+    settings.postprocess.worker_count = normalize_worker_count(
+        execution.resource_for(StageName.POSTPROCESS).cpus
+    )
+    settings.local_root = str(session_dir.parent)
+    # The selected output directory is authoritative for recovery.  In
+    # particular, a completed session may have been moved to user-selected
+    # storage whose directory name is unrelated to its recording or multi-day
+    # basename.  Keep the scientific basename from the immutable analysis
+    # snapshot, while pinning output discovery to the selected directory.
+    settings.existing_session_dir = str(session_dir)
+
+    if settings.multi_day_enabled:
+        if not settings.multi_day_name.strip() or not settings.multi_day_session_paths:
+            raise ValueError("Saved multi-day settings are incomplete")
+    if settings.local_output_dir != session_dir:
+        raise ValueError(
+            "Recovered settings do not resolve to the selected local session: "
+            f"{settings.local_output_dir} != {session_dir}"
+        )
+    return settings
+
+
+def load_local_session_resume(session_dir: Path) -> LocalSessionResume:
+    """Load validated GUI settings from one local persistent session output."""
+    session_dir = Path(session_dir).expanduser().resolve()
+    if not session_dir.is_dir():
+        raise NotADirectoryError(f"Local session folder does not exist: {session_dir}")
+
+    claim_path = session_dir / ".pipeline-active-run.json"
+    if claim_path.exists():
+        try:
+            claim = json.loads(claim_path.read_text(encoding="utf-8"))
+            if claim.get("kind", "run") != "run":
+                raise ValueError("the active-session marker is not a persistent Run")
+            run_text = str(claim.get("run_dir") or "").strip()
+            if not run_text:
+                raise ValueError("the active-session marker has no Run directory")
+            run_dir = Path(run_text).expanduser().resolve()
+            store = RunStore(run_dir)
+            run = store.load_run()
+            claim_session = str(claim.get("session_dir") or "").strip()
+            if claim_session and Path(claim_session).expanduser().resolve() != session_dir:
+                raise ValueError(
+                    "Active-session marker belongs to a different output folder"
+                )
+            claim_run_id = str(claim.get("run_id") or "").strip()
+            recorded_run_id = str(run.get("run_id") or "").strip()
+            if claim_run_id and claim_run_id != recorded_run_id:
+                raise ValueError("Active-session marker Run ID does not match run.json")
+            recorded_output = Path(str(run.get("session_output_dir") or "")).expanduser().resolve()
+            if recorded_output != session_dir:
+                raise ValueError(
+                    "Run output folder does not match the selected local session: "
+                    f"{recorded_output} != {session_dir}"
+                )
+            analysis = store.load_analysis()
+            recorded_hash = str(run.get("analysis_sha256") or "").strip()
+            if recorded_hash and recorded_hash != analysis.sha256:
+                raise ValueError(
+                    "Run analysis hash does not match its immutable settings snapshot"
+                )
+            settings = _settings_from_resume_snapshots(
+                session_dir=session_dir,
+                analysis=analysis,
+                execution=store.load_execution(),
+            )
+            return LocalSessionResume(settings, run_dir, "persistent_run")
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot recover the persistent Run referenced by {claim_path}: {exc}"
+            ) from exc
+
+    final_record = session_dir / "preprocess_run.yaml"
+    if final_record.exists():
+        try:
+            import yaml
+
+            record = yaml.safe_load(final_record.read_text(encoding="utf-8")) or {}
+            recorded_output = Path(str(record.get("session_output_dir") or "")).expanduser().resolve()
+            if recorded_output != session_dir:
+                raise ValueError(
+                    "Completed Run output folder does not match the selected local session: "
+                    f"{recorded_output} != {session_dir}"
+                )
+            settings = _settings_from_resume_snapshots(
+                session_dir=session_dir,
+                analysis=AnalysisConfig.from_dict(dict(record["analysis"])),
+                execution=ExecutionConfig.from_dict(dict(record["execution"])),
+            )
+            return LocalSessionResume(settings, None, "preprocess_run.yaml")
+        except Exception as exc:
+            raise ValueError(f"Cannot recover completed Run metadata from {final_record}: {exc}") from exc
+
+    raise FileNotFoundError(
+        "The selected folder has neither .pipeline-active-run.json nor preprocess_run.yaml: "
+        f"{session_dir}"
+    )

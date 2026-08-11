@@ -161,6 +161,9 @@ class AcquisitionCatalog:
     ephys_channel_indices_by_subsession: list[list[int] | None] = field(default_factory=list)
     adc_channel_indices_by_subsession: list[list[int]] = field(default_factory=list)
     adc_channel_names_by_subsession: list[list[str]] = field(default_factory=list)
+    adc_native_orders_by_subsession: list[list[int]] = field(default_factory=list)
+    adc_output_indices_by_subsession: list[list[int]] = field(default_factory=list)
+    adc_layout_sources_by_subsession: list[str] = field(default_factory=list)
     analogin_source_paths: list[Path | None] = field(default_factory=list)
 
 

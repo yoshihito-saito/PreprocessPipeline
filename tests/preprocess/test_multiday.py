@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import errno
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +13,27 @@ from src.preprocess.io import discover_subsessions
 from src.preprocess.gui.config_model import PipelineGuiSettings
 from src.preprocess.gui.run_pipeline import run_pipeline
 from src.preprocess.multiday import prepare_multi_day_basepath
+import src.preprocess.multiday as multiday
+
+
+def test_cleanup_staged_subepochs_rejects_manifest_path_escape(tmp_path: Path) -> None:
+    staging_root = tmp_path / "staging"
+    staging_root.mkdir()
+    external = tmp_path / "outside"
+    external.mkdir()
+    manifest_path = staging_root / "multi_day_manifest.json"
+    manifest_path.write_text(
+        json.dumps({"subepochs": [{"staged_subepoch_path": str(external)}]}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="outside multi-day staging root"):
+        multiday._cleanup_stale_staged_subepochs(
+            manifest_path=manifest_path,
+            active_staged_folders=set(),
+            staging_root=staging_root,
+            overwrite=True,
+        )
+    assert external.exists()
 
 
 def _write_xml(basepath: Path, *, n_channels: int = 4, sample_rate: float = 20000.0) -> None:
@@ -554,6 +577,161 @@ def test_prepare_multi_day_basepath_accepts_staged_xml_as_explicit_xml(tmp_path:
     assert (staged.server_basepath / "animal_multiday.xml").read_text(encoding="utf-8") == original_xml_text
     manifest = json.loads(staged.manifest_path.read_text(encoding="utf-8"))
     assert manifest["xml_path"] == str(staged_xml.resolve())
+
+
+def test_multiday_overwrite_false_rejects_conflicting_xml_before_link_mutation(tmp_path: Path) -> None:
+    day1 = tmp_path / "animal_day1"
+    day2 = tmp_path / "animal_day2"
+    multiday = tmp_path / "animal_multiday"
+    day1.mkdir()
+    day2.mkdir()
+    multiday.mkdir()
+    _write_xml(day1)
+    _write_xml(day2)
+    _write_epoch(day1, "ep_240101_120000")
+    _write_epoch(day2, "ep_240102_120000")
+    existing_xml = multiday / "animal_multiday.xml"
+    existing_xml.write_text("<different />", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="XML already exists"):
+        prepare_multi_day_basepath(
+            session_paths=[day1, day2],
+            local_root=tmp_path / "local",
+            name="animal_multiday",
+            xml_path=day1 / "animal_day1.xml",
+            overwrite=False,
+        )
+
+    assert existing_xml.read_text(encoding="utf-8") == "<different />"
+    assert not list(multiday.glob("001_*"))
+
+
+def test_multiday_publish_failure_rolls_back_server_and_local_views(tmp_path: Path, monkeypatch) -> None:
+    day1 = tmp_path / "animal_day1"
+    day2 = tmp_path / "animal_day2"
+    day1.mkdir()
+    day2.mkdir()
+    _write_xml(day1)
+    _write_xml(day2)
+    epoch1 = _write_epoch(day1, "ep_240101_120000")
+    _write_epoch(day2, "ep_240102_120000")
+    initial = prepare_multi_day_basepath(
+        session_paths=[day1, day2], local_root=tmp_path / "local", name="animal_multiday"
+    )
+    server_manifest_before = initial.manifest_path.read_bytes()
+    local_manifest = initial.local_basepath / "multi_day_manifest.json"
+    local_manifest_before = local_manifest.read_bytes()
+    links_before = {
+        Path(entry.staged_subepoch_path).name: os.readlink(entry.staged_subepoch_path)
+        for entry in initial.subepochs
+    }
+
+    import src.preprocess.multiday as multiday
+
+    real_replace = multiday.os.replace
+
+    def fail_local_manifest(source, destination):
+        if Path(destination) == local_manifest and ".multiday-publish-" in str(source):
+            raise OSError("injected local manifest publication failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(multiday.os, "replace", fail_local_manifest)
+    with pytest.raises(OSError, match="injected local manifest"):
+        prepare_multi_day_basepath(
+            session_paths=[day1, day2],
+            selected_subepoch_paths=[epoch1],
+            local_root=tmp_path / "local",
+            name="animal_multiday",
+            overwrite=True,
+        )
+
+    assert initial.manifest_path.read_bytes() == server_manifest_before
+    assert local_manifest.read_bytes() == local_manifest_before
+    assert {
+        Path(entry.staged_subepoch_path).name: os.readlink(entry.staged_subepoch_path)
+        for entry in initial.subepochs
+    } == links_before
+
+
+def test_multiday_interrupt_rolls_back_before_transaction_cleanup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    day1 = tmp_path / "animal_day1"
+    day2 = tmp_path / "animal_day2"
+    day1.mkdir()
+    day2.mkdir()
+    _write_xml(day1)
+    _write_xml(day2)
+    epoch1 = _write_epoch(day1, "ep_240101_120000")
+    _write_epoch(day2, "ep_240102_120000")
+    initial = prepare_multi_day_basepath(
+        session_paths=[day1, day2], local_root=tmp_path / "local", name="animal_multiday"
+    )
+    server_manifest_before = initial.manifest_path.read_bytes()
+    local_manifest = initial.local_basepath / "multi_day_manifest.json"
+    local_manifest_before = local_manifest.read_bytes()
+    links_before = {
+        Path(entry.staged_subepoch_path).name: os.readlink(entry.staged_subepoch_path)
+        for entry in initial.subepochs
+    }
+
+    import src.preprocess.multiday as multiday
+
+    real_replace = multiday.os.replace
+
+    def interrupt_local_manifest(source, destination):
+        if Path(destination) == local_manifest and ".multiday-publish-" in str(source):
+            raise KeyboardInterrupt("injected cancellation")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(multiday.os, "replace", interrupt_local_manifest)
+    with pytest.raises(KeyboardInterrupt, match="injected cancellation"):
+        prepare_multi_day_basepath(
+            session_paths=[day1, day2],
+            selected_subepoch_paths=[epoch1],
+            local_root=tmp_path / "local",
+            name="animal_multiday",
+            overwrite=True,
+        )
+
+    assert initial.manifest_path.read_bytes() == server_manifest_before
+    assert local_manifest.read_bytes() == local_manifest_before
+    assert {
+        Path(entry.staged_subepoch_path).name: os.readlink(entry.staged_subepoch_path)
+        for entry in initial.subepochs
+    } == links_before
+
+
+def test_multiday_uses_same_filesystem_staging_for_local_publication(tmp_path: Path, monkeypatch) -> None:
+    day1 = tmp_path / "animal_day1"
+    day2 = tmp_path / "animal_day2"
+    day1.mkdir()
+    day2.mkdir()
+    _write_xml(day1)
+    _write_xml(day2)
+    _write_epoch(day1, "ep_240101_120000")
+    _write_epoch(day2, "ep_240102_120000")
+    local_root = tmp_path / "local"
+    local_basepath = local_root / "animal_multiday"
+    import src.preprocess.multiday as multiday
+
+    real_replace = multiday.os.replace
+
+    def reject_cross_mount_replace(source, destination):
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if ".multiday-publish-" in str(source_path) and destination_path.parent == local_basepath:
+            if not source_path.is_relative_to(local_basepath):
+                raise OSError(errno.EXDEV, "cross-device link")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(multiday.os, "replace", reject_cross_mount_replace)
+    result = prepare_multi_day_basepath(
+        session_paths=[day1, day2], local_root=local_root, name="animal_multiday"
+    )
+
+    assert result.manifest_path.exists()
+    assert (local_basepath / "multi_day_manifest.json").exists()
 
 
 def test_run_pipeline_multi_day_requires_selected_sessions(tmp_path: Path) -> None:

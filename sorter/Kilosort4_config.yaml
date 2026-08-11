@@ -11,7 +11,7 @@ nt: 41 # 41 samples @ 20kHz = ~2.05ms
 
 # Drift-correction blocks. 0 disables drift correction.
 # KS4 default: 1
-nblocks: 1
+nblocks: 0
 
 # Samples per processing batch.
 # Larger values reduce batch boundaries but use more memory.
