@@ -69,7 +69,7 @@ from src.preprocess.behavior import (
 )
 from src.preprocess import prepare_chanmap, select_paths_with_gui
 from src.preprocess.io import build_channel_map_data, save_cell_explorer_chan_coords, set_tree_world_rw
-from src.preprocess.multiday import discover_multi_day_subepochs
+from src.preprocess.multiday import MULTI_DAY_MANIFEST, discover_multi_day_subepochs
 from src.preprocess.paths import find_project_root, resolve_project_path
 from src.worker_defaults import default_worker_count, normalize_worker_count
 from src.execution.backends import SlurmCapabilities, detect_slurm_capabilities
@@ -109,6 +109,82 @@ LOCAL_DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "preprocess_gui_default_confi
 VENDORED_CELLEXPLORER_ROOT = REPO_ROOT / "external" / "CellExplorer"
 MATLAB_SUPPORT_ROOT = REPO_ROOT / "external" / "matlab"
 ANATOMICAL_MAP_FILENAME = "anatomical_map.csv"
+
+
+def _resolve_cell_explorer_source_basepath(
+    settings: PipelineGuiSettings,
+    local_output_dir: Path,
+) -> Path:
+    """Resolve the raw waveform root, preferring authoritative multi-day staging."""
+    local_output_dir = Path(local_output_dir).expanduser().resolve()
+    manifest_path = local_output_dir / MULTI_DAY_MANIFEST
+    if not manifest_path.exists():
+        source = settings.preprocess_source_path or settings.basepath_path
+        if source is None:
+            raise ValueError("Cannot resolve the CellExplorer source basepath.")
+        return Path(source).expanduser().resolve()
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Cannot read the multi-day manifest for CellExplorer: {manifest_path}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Invalid multi-day manifest object: {manifest_path}")
+    if manifest.get("schema_version") != 1:
+        raise ValueError(
+            "Unsupported multi-day manifest schema for CellExplorer: "
+            f"{manifest.get('schema_version')!r} ({manifest_path})"
+        )
+
+    manifest_name = str(manifest.get("name") or "").strip()
+    if manifest_name != local_output_dir.name:
+        raise ValueError(
+            "Multi-day manifest name does not match the selected local session: "
+            f"manifest={manifest_name or '<missing>'}, session={local_output_dir.name}"
+        )
+
+    server_text = str(manifest.get("server_basepath") or "").strip()
+    if not server_text:
+        raise ValueError(
+            f"Multi-day manifest is missing server_basepath: {manifest_path}"
+        )
+    server_basepath = Path(server_text).expanduser()
+    if not server_basepath.is_dir():
+        raise FileNotFoundError(
+            f"Multi-day staging root is missing: {server_basepath}"
+        )
+
+    subepochs = manifest.get("subepochs")
+    if not isinstance(subepochs, list) or not subepochs:
+        raise ValueError(
+            f"Multi-day manifest has no subepochs: {manifest_path}"
+        )
+    missing: list[Path] = []
+    for index, entry in enumerate(subepochs, start=1):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"Invalid multi-day subepoch entry {index}: {manifest_path}"
+            )
+        staged_text = str(entry.get("staged_subepoch_path") or "").strip()
+        staged_name = Path(staged_text).name if staged_text else ""
+        if not staged_name:
+            raise ValueError(
+                f"Multi-day subepoch entry {index} is missing staged_subepoch_path: "
+                f"{manifest_path}"
+            )
+        staged_path = server_basepath / staged_name
+        if not staged_path.is_dir():
+            missing.append(staged_path)
+    if missing:
+        preview = ", ".join(str(path) for path in missing[:3])
+        suffix = "" if len(missing) <= 3 else f", ... ({len(missing)} missing)"
+        raise FileNotFoundError(
+            "Multi-day staged subepochs required by CellExplorer are missing: "
+            f"{preview}{suffix}"
+        )
+    return server_basepath.resolve()
 
 
 def _default_config_path() -> Path:
@@ -6185,13 +6261,11 @@ class MainWindow(QMainWindow):
                     "A persistent Run still owns this session. Wait for it to finish or cancel it before CellExplorer."
                 )
             basepath = settings.local_output_dir
-            source_basepath = settings.preprocess_source_path or settings.basepath_path
             if basepath is None or not settings.basename:
                 raise ValueError("Local output directory cannot be resolved.")
-            if source_basepath is None:
-                raise ValueError("Basepath is required.")
             if not basepath.exists():
                 raise FileNotFoundError(f"Local output directory does not exist: {basepath}")
+            source_basepath = _resolve_cell_explorer_source_basepath(settings, basepath)
             if not VENDORED_CELLEXPLORER_ROOT.exists():
                 raise FileNotFoundError(f"Vendored CellExplorer not found: {VENDORED_CELLEXPLORER_ROOT}")
             wrapper_path = MATLAB_SUPPORT_ROOT / "run_cell_explorer_processing.m"
@@ -6238,6 +6312,7 @@ class MainWindow(QMainWindow):
             self._append_log("\n=== Running CellExplore postprocess ===\n")
             self._append_log(f"MATLAB: {matlab_program}\n")
             self._append_log(f"Working directory: {basepath}\n")
+            self._append_log(f"Waveform source basepath: {source_basepath}\n")
             self._append_log(f"CellExplorer root: {VENDORED_CELLEXPLORER_ROOT}\n")
             self._append_log(
                 f"CellExplore sorter mode: {'multi-sorter' if len(sorting_dirs) > 1 else 'single-sorter'}\n"

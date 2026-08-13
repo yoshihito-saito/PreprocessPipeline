@@ -33,6 +33,22 @@ There are also three path risks:
   missing. The requested behavior is stricter: use the raw sub-epoch dat files
   under the source/basepath even if `basename.dat` exists in the local output.
 
+### 2026-08-13 multi-day source-resolution correction
+
+Multi-day preprocessing updates its worker-local basepath to the staged
+multi-day root, but the GUI retains the originally selected first-day basepath.
+Consequently, the CellExplorer launcher can pass `Day14` as `sourceBasepath`
+while `MergePoints.foldernames` contains staged names such as
+`001_Day14_D14_postsleep_...`. The MATLAB normalizer then cannot resolve the
+epoch below either the local output or the incorrect first-day source root.
+
+The local output already contains the authoritative `multi_day_manifest.json`,
+including the staged `server_basepath`. CellExplorer source resolution must
+prefer that manifest over mutable GUI or legacy run-record state. Invalid,
+mismatched, or incomplete multi-day staging metadata must fail before MATLAB is
+launched with an actionable error. Single-day sessions without a manifest must
+retain the existing source-basepath behavior.
+
 ## Why this is needed now
 
 Manual curation is already exposed in the GUI. The next practical step is to
@@ -59,6 +75,7 @@ fields.
 ## Affected modules/files
 
 - `src/preprocess/gui/app.py`
+- `tests/preprocess/test_gui_config_model.py`
 - new or vendored MATLAB support under a repository-owned path such as
   `external/CellExplorer` or `third_party/CellExplorer`
 - new MATLAB launcher/wrapper under repository-owned support scripts, if needed
@@ -122,6 +139,14 @@ fields.
   `spikes.processinginfo.params.WaveformsSource`, so the user can confirm
   whether waveforms came from `MergePoints amplifier.dat files`,
   `MergePoints Open Ephys continuous.dat files`, or another explicit source.
+- For a local output containing `multi_day_manifest.json`, resolve
+  `sourceBasepath` from the manifest's `server_basepath`, validate that the
+  manifest belongs to the selected local basename, and verify that every
+  manifest subepoch has a corresponding staged directory before starting
+  MATLAB.
+- Manifest-backed resolution must also apply when an existing multi-day local
+  output is reopened and its saved `source_basepath` points to the first source
+  day.
 
 ### Vendored CellExplorer
 
@@ -194,6 +219,11 @@ group-, region-, or shank-scoped sorting. That design should:
 ## Tests and checks
 
 - Compile-check changed Python GUI modules.
+- Verify that a multi-day manifest overrides a stale first-day source path.
+- Verify that malformed, mismatched, or incomplete manifests fail before
+  MATLAB launch.
+- Verify that single-day sessions without a manifest retain the existing
+  source path.
 - Add unit tests for anatomical map CSV round-tripping against channel groups.
 - Add a MATLAB path smoke check that `which CellExplorer`, `which gui_session`,
   and `which ProcessCellMetrics` resolve to the vendored CellExplorer path.
