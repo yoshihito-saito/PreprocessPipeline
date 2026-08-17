@@ -17,3 +17,5 @@
 - [2026-07-31 staged metadata same-file copy guard](2026-07-31-xml-samefile-guard.md)
 - [2026-08-07 persistent Local and Slurm execution framework](2026-08-07-persistent-local-slurm-execution.md)
 - [2026-08-12 standalone multi-day channel MAD analysis](2026-08-12-standalone-multiday-mad.md)
+- [2026-08-13 lazy startup imports and XML GUI synchronization](2026-08-13-lazy-import-and-xml-gui-sync.md)
+- [2026-08-17 CellExplorer spikes v7.3 saving](2026-08-17-cellexplorer-spikes-v73.md)

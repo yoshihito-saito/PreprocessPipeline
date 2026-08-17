@@ -1404,3 +1404,74 @@ def test_legacy_noise_label_pid_claim_failure_cleans_up_startup(tmp_path: Path, 
     finally:
         window.close()
         application.processEvents()
+
+
+def test_load_xml_updates_probe_assignments_and_chanmap_preview(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    basepath = tmp_path / "session"
+    basepath.mkdir()
+    xml = tmp_path / "selected.xml"
+    xml.write_text(
+        """
+<session>
+  <generalInfo><description>poly2</description></generalInfo>
+  <anatomicalDescription>
+    <channelGroups>
+      <group><channels><n>0</n><n>1</n></channels></group>
+      <group><channels><n>2</n><n>3</n></channels></group>
+    </channelGroups>
+  </anatomicalDescription>
+</session>
+""".strip(),
+        encoding="utf-8",
+    )
+
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    try:
+        window.basepath.setText(str(basepath))
+        window.local_root.setText(str(tmp_path / "local"))
+        monkeypatch.setattr(window, "_select_open_file", lambda *_args: str(xml))
+
+        window._load_xml()
+
+        assert window.xml_path.text() == str(xml)
+        assert window._probe_rows_to_assignments() == [
+            {"type": "poly2", "groups": [0, 1], "x_offset": 0}
+        ]
+        assert "current GUI settings" in window.chanmap_canvas.summary.text()
+        assert window._chanmap_controls_dirty is True
+    finally:
+        window.close()
+        application.processEvents()
+
+
+def test_gui_import_does_not_load_sorter_registry() -> None:
+    import os
+    import subprocess
+    import sys
+
+    environment = dict(os.environ)
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    repository = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import src.preprocess.gui.app; "
+                "assert 'spikeinterface.sorters' not in sys.modules"
+            ),
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr

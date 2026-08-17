@@ -7,9 +7,7 @@ from pathlib import Path
 import traceback
 from typing import Any
 
-from src.postprocess import PostprocessConfig, run_postprocess_session
-from src.preprocess import run_preprocess_session
-from src.preprocess.runtime_prep import prepare_preprocess_settings
+from src.postprocess import PostprocessConfig
 
 from .config_model import PipelineGuiSettings, RunMode
 
@@ -55,9 +53,15 @@ def _postprocess_config_from_preprocess_result(
 
 
 def run_pipeline(settings: PipelineGuiSettings, mode: RunMode) -> dict[str, Any]:
+    # GUI startup should not import the heavy SpikeInterface pipeline or sorter
+    # registry. These imports are needed only when a worker actually runs.
+    from src.preprocess.runtime_prep import prepare_preprocess_settings
+
     payload: dict[str, Any] = {"mode": mode}
     pre_result = None
     if mode in ("all", "preprocess"):
+        from src.preprocess import run_preprocess_session
+
         payload.update(prepare_preprocess_settings(settings))
         pre_result = run_preprocess_session(settings.to_preprocess_config())
         payload["preprocess_result"] = {
@@ -75,6 +79,8 @@ def run_pipeline(settings: PipelineGuiSettings, mode: RunMode) -> dict[str, Any]
         }
 
     if mode in ("all", "postprocess", "noise_label"):
+        from src.postprocess import run_postprocess_session
+
         if mode == "all" and pre_result is not None:
             post_config = _postprocess_config_from_preprocess_result(settings, pre_result)
         else:

@@ -554,6 +554,54 @@ def _load_xml_groups_for_chanmap(xml_path: Path):
     return anat_grps, spk_channels, has_spk_groups, skipped_channels, root
 
 
+def _electrode_type_from_xml(root: ET.Element, default: str = "staggered") -> str:
+    description = root.find("generalInfo/description")
+    if description is None or not description.text:
+        return default
+    value = description.text.strip().lower()
+    if "neuropixel" in value:
+        return "NeuroPixel"
+    if "middle_finger" in value or "middle finger" in value or "middlefinger" in value:
+        return "middle_finger"
+    if any(token in value for token in ("flex-g5", "flex_g5", "flex g5", "flex_probe", "flex probe", "flexprobe")):
+        return "flex-G5"
+    if "staggered" in value:
+        return "staggered"
+    if "neurogrid" in value or "grid" in value:
+        return "neurogrid"
+    if "poly2" in value or "poly 2" in value:
+        return "poly2"
+    if "poly3" in value:
+        return "poly3"
+    if "poly5" in value:
+        return "poly5"
+    return default
+
+
+def derive_probe_assignments_from_xml(
+    xml_path: Path | str,
+) -> tuple[list[dict[str, object]], list[int]]:
+    """Return the default GUI probe assignment and XML-skipped channels.
+
+    XML channel groups are the source of truth for group membership. The
+    optional general-info description selects the same geometry used by
+    ``build_channel_map_data`` when no explicit GUI assignment is supplied.
+    """
+    anat_grps, _spk_channels, _has_spk_groups, skipped_channels, root = (
+        _load_xml_groups_for_chanmap(Path(xml_path).expanduser())
+    )
+    if not anat_grps:
+        raise ValueError(f"No anatomical channel groups found in XML: {xml_path}")
+    electrode_type = _electrode_type_from_xml(root)
+    return [
+        {
+            "type": electrode_type,
+            "groups": list(range(len(anat_grps))),
+            "x_offset": 0,
+        }
+    ], skipped_channels
+
+
 def _normalize_chanmap_layout(layout: str | None) -> str:
     text = str(layout or "").strip()
     key = text.lower().replace("-", "_").replace(" ", "")
@@ -851,33 +899,7 @@ def build_channel_map_data(
         return None
 
     if electrode_type is None:
-        electrode_type = "staggered"
-        desc_node = root.find("generalInfo/description")
-        if desc_node is not None and desc_node.text:
-            val = desc_node.text.strip().lower()
-            if "neuropixel" in val:
-                electrode_type = "NeuroPixel"
-            elif "middle_finger" in val or "middle finger" in val or "middlefinger" in val:
-                electrode_type = "middle_finger"
-            elif (
-                "flex-g5" in val
-                or "flex_g5" in val
-                or "flex g5" in val
-                or "flex_probe" in val
-                or "flex probe" in val
-                or "flexprobe" in val
-            ):
-                electrode_type = "flex-G5"
-            elif "staggered" in val:
-                electrode_type = "staggered"
-            elif "neurogrid" in val or "grid" in val:
-                electrode_type = "neurogrid"
-            elif "poly2" in val or "poly 2" in val:
-                electrode_type = "poly2"
-            elif "poly3" in val:
-                electrode_type = "poly3"
-            elif "poly5" in val:
-                electrode_type = "poly5"
+        electrode_type = _electrode_type_from_xml(root)
 
     if not probe_assignments:
         probe_assignments = [

@@ -3,6 +3,7 @@
 import argparse
 import csv
 import hashlib
+import importlib
 import signal
 import subprocess
 from contextlib import contextmanager, nullcontext
@@ -20,7 +21,6 @@ import ast
 
 import numpy as np
 import spikeinterface.extractors as se
-import spikeinterface.sorters as ss
 import yaml
 from scipy.io import loadmat, savemat
 from spikeinterface.core.job_tools import job_keys as _SI_JOB_KEYS
@@ -29,6 +29,20 @@ from .io import atomic_write_json, load_xml_metadata
 from .paths import find_project_root
 from .recording import apply_preprocessing, attach_probe_from_chanmap, select_recording_channels
 from src.worker_defaults import default_worker_count
+
+
+class _LazySorterModule:
+    """Load SpikeInterface's complete sorter registry only when used."""
+
+    _module = None
+
+    def __getattr__(self, name: str):
+        if self._module is None:
+            self._module = importlib.import_module("spikeinterface.sorters")
+        return getattr(self._module, name)
+
+
+ss = _LazySorterModule()
 
 
 def _default_parallel_n_jobs() -> int:

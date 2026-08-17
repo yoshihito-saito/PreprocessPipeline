@@ -68,7 +68,12 @@ from src.preprocess.behavior import (
     process_dlc_behavior,
 )
 from src.preprocess import prepare_chanmap, select_paths_with_gui
-from src.preprocess.io import build_channel_map_data, save_cell_explorer_chan_coords, set_tree_world_rw
+from src.preprocess.io import (
+    build_channel_map_data,
+    derive_probe_assignments_from_xml,
+    save_cell_explorer_chan_coords,
+    set_tree_world_rw,
+)
 from src.preprocess.multiday import MULTI_DAY_MANIFEST, discover_multi_day_subepochs
 from src.preprocess.paths import find_project_root, resolve_project_path
 from src.worker_defaults import default_worker_count, normalize_worker_count
@@ -3874,8 +3879,37 @@ class MainWindow(QMainWindow):
             "XML files (*.xml);;All files (*)",
         )
         if path:
-            self.xml_path.setText(path)
-            self._schedule_refresh()
+            xml_path = Path(path).expanduser()
+            try:
+                assignments, skipped_channels = derive_probe_assignments_from_xml(xml_path)
+            except Exception as exc:
+                self.xml_path.setText(path)
+                self._chanmap_controls_dirty = True
+                self._last_chanmap_preview_key = None
+                self.chanmap_canvas.show_empty()
+                self.chanmap_canvas.summary.setText(
+                    f"XML channel groups unavailable: {xml_path}"
+                )
+                self._append_warning_log(f"Could not load XML channel groups: {xml_path}\n{exc}\n")
+                self._schedule_refresh()
+                return
+
+            self._refresh_suspended = True
+            try:
+                self.xml_path.setText(str(xml_path))
+                self._render_probe_assignments(assignments)
+                current_bad = set(parse_int_list(self.reject_channels.text()))
+                current_bad.update(int(channel) for channel in skipped_channels)
+                self.reject_channels.setText(", ".join(str(v) for v in sorted(current_bad)))
+                # An explicit XML selection invalidates a previously loaded
+                # chanMap file as the preview source until the map is regenerated.
+                self._chanmap_controls_dirty = True
+                self._last_chanmap_preview_key = None
+            finally:
+                self._refresh_suspended = False
+            self.chanmap_canvas.show_empty()
+            self._append_log(f"Loaded XML: {xml_path}\n")
+            self._refresh_preview()
 
     def _set_multi_day_session_paths(
         self,
@@ -5819,8 +5853,9 @@ class MainWindow(QMainWindow):
                 and not self._chanmap_controls_dirty
             ):
                 self._load_chanmap_preview(explicit_chanmap)
-            elif not self._load_settings_chanmap_preview(settings) and chanmap is not None and chanmap.exists():
-                self._load_chanmap_preview(chanmap)
+            elif not self._load_settings_chanmap_preview(settings):
+                if not self._chanmap_controls_dirty and chanmap is not None and chanmap.exists():
+                    self._load_chanmap_preview(chanmap)
         except Exception as exc:
             self.run_preview.setPlainText(f"Config error:\n{exc}")
 
