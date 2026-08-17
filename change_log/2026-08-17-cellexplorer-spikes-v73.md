@@ -3,8 +3,8 @@
 ## Date and state
 
 - Date: 2026-08-17
-- Base commit: `029e9236eac06aa414c7964872083c63dafcebb3`
-- State: uncommitted
+- Implementation commit: `4fcd9a0620a7acb2f6eead21fbe1d79e2edf7b0a`
+- Recovery verification update: uncommitted
 - Plan: [2026-08-17 CellExplorer spikes v7.3 saving](../implementation_plan/2026-08-17-cellexplorer-spikes-v73.md)
 
 ## What changed
@@ -30,7 +30,14 @@ checkcode: ok
 v7.3 save/load: ok
 ```
 
+The affected multi-day session was then recovered from the non-drift sorter
+`Kilosort4_2026-08-11_203942` using a temporary Python launcher and the
+vendored MATLAB `loadSpikes` implementation. Waveform extraction completed in
+29 minutes for 111 units. The installed MAT file is 889,650,843 bytes, and
+MATLAB reports one `spikes` struct with an uncompressed size of approximately
+2.3874 GB.
+
 ## Limitations
 
-- The existing empty session output was not regenerated; rerunning the
-  CellExplorer postprocess is required to replace it.
+- The full CellExplorer metric pipeline was not rerun because the existing
+  `cell_metrics` output already contains the same 111 units.
