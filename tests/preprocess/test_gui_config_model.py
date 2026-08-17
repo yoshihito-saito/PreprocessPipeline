@@ -16,6 +16,7 @@ from src.preprocess.gui.app import (
     CONFIG_DIR,
     MainWindow,
     PROBE_TYPES,
+    SubsessionOrderTable,
     _default_config_has_backend_choice,
     _has_slurm_server_commands,
     _move_local_output_to_storage,
@@ -1187,6 +1188,47 @@ def test_pipeline_settings_round_trips_multi_day_fields(tmp_path: Path) -> None:
     assert loaded.multi_day_session_paths == [str(day1), str(day2)]
     assert loaded.multi_day_name == "animal_multiday"
     assert loaded.basename == "animal_multiday"
+
+
+def test_pipeline_settings_round_trips_single_session_concat_order(tmp_path: Path) -> None:
+    basepath = tmp_path / "session"
+    basepath.mkdir()
+    order = ["epoch_b/amplifier.dat", "epoch_a/amplifier.dat"]
+    settings = PipelineGuiSettings(
+        basepath=str(basepath),
+        local_root=str(tmp_path / "local"),
+        subsession_order=order,
+    )
+
+    loaded = PipelineGuiSettings.from_json(settings.to_json())
+    config = loaded.to_preprocess_config()
+
+    assert loaded.subsession_order == order
+    assert config.subsession_order == order
+
+
+def test_single_session_order_table_moves_rows_and_returns_relative_paths(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    application = QApplication.instance() or QApplication([])
+    paths = [tmp_path / name / "amplifier.dat" for name in ("first", "second", "third")]
+    for path in paths:
+        path.parent.mkdir()
+        path.touch()
+    table = SubsessionOrderTable(tmp_path, paths)
+    try:
+        table.item(2, 0).setText("1")
+        application.processEvents()
+        assert table.relative_paths() == [
+            "third/amplifier.dat",
+            "first/amplifier.dat",
+            "second/amplifier.dat",
+        ]
+    finally:
+        table.close()
 
 
 def test_pipeline_settings_round_trips_cell_explorer_folders(tmp_path: Path) -> None:

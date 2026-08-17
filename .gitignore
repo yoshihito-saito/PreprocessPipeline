@@ -5,6 +5,7 @@ sorting_temp/*
 preprocess_tmp/*
 # --- Python ---
 __pycache__/
+/build/
 *.pyo
 *.pyd
 *.so

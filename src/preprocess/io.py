@@ -1720,6 +1720,7 @@ def discover_subsessions(
     sort_files: bool,
     alt_sort: list[int] | None,
     ignore_folders: list[str] | None,
+    subsession_order: list[str] | None = None,
 ) -> list[Path]:
     ignore_folders = ignore_folders or []
 
@@ -1752,13 +1753,60 @@ def discover_subsessions(
     if not paths:
         return []
 
-    if alt_sort:
+    if subsession_order:
+        paths = _apply_explicit_subsession_order(
+            paths,
+            basepath=basepath,
+            subsession_order=subsession_order,
+        )
+    elif alt_sort:
         idx = _normalize_alt_sort_indices(alt_sort, len(paths))
         paths = [paths[i] for i in idx]
     else:
         paths = sorted(paths, key=_subsession_sort_key)
 
     return paths
+
+
+def _apply_explicit_subsession_order(
+    discovered_paths: list[Path],
+    *,
+    basepath: Path,
+    subsession_order: list[str],
+) -> list[Path]:
+    base = Path(basepath).expanduser().resolve()
+
+    def resolve_order_entry(value: str) -> Path:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("subsession_order must not contain empty paths")
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = base / path
+        return path.resolve()
+
+    discovered_by_path = {
+        Path(path).expanduser().resolve(): Path(path) for path in discovered_paths
+    }
+    requested = [resolve_order_entry(value) for value in subsession_order]
+    if len(set(requested)) != len(requested):
+        raise ValueError("subsession_order contains duplicate paths")
+
+    requested_set = set(requested)
+    discovered_set = set(discovered_by_path)
+    if requested_set != discovered_set:
+        missing = sorted(str(path) for path in discovered_set - requested_set)
+        unexpected = sorted(str(path) for path in requested_set - discovered_set)
+        details: list[str] = []
+        if missing:
+            details.append("missing=" + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected=" + ", ".join(unexpected))
+        raise ValueError(
+            "subsession_order must contain every discovered recording exactly once: "
+            + "; ".join(details)
+        )
+    return [discovered_by_path[path] for path in requested]
 
 
 def _normalize_alt_sort_indices(alt_sort: list[int], n: int) -> list[int]:

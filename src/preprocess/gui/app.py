@@ -73,6 +73,7 @@ from src.preprocess.io import (
     _normalize_chanmap_layout,
     build_channel_map_data,
     derive_probe_assignments_from_xml,
+    discover_subsessions,
     save_cell_explorer_chan_coords,
     set_tree_world_rw,
 )
@@ -1817,6 +1818,97 @@ class TrackerJumpDialog(QDialog):
         self._render()
 
 
+class SubsessionOrderTable(QTableWidget):
+    def __init__(
+        self,
+        basepath: Path,
+        paths: list[Path],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._basepath = Path(basepath).expanduser().resolve()
+        self._paths = [Path(path).expanduser().resolve() for path in paths]
+        self._populating = False
+        self.setColumnCount(3)
+        self.setHorizontalHeaderLabels(["Order", "Subsession", "Discovered path"])
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setDragEnabled(False)
+        self.setAcceptDrops(False)
+        self.viewport().setAcceptDrops(False)
+        self.setDropIndicatorShown(False)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+        self.verticalHeader().setVisible(False)
+        self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.setColumnWidth(0, 70)
+        self.setColumnWidth(1, 330)
+        self.itemChanged.connect(self._handle_item_changed)
+        self.refresh()
+
+    def paths(self) -> list[Path]:
+        return list(self._paths)
+
+    def relative_paths(self) -> list[str]:
+        values: list[str] = []
+        for path in self._paths:
+            try:
+                values.append(path.relative_to(self._basepath).as_posix())
+            except ValueError:
+                values.append(str(path))
+        return values
+
+    def _display_name(self, path: Path) -> str:
+        try:
+            relative = path.relative_to(self._basepath)
+        except ValueError:
+            return path.parent.name if path.is_file() else path.name
+        if not relative.parts:
+            return path.name
+        return relative.parts[0]
+
+    def refresh(self, select_row: int | None = None) -> None:
+        self._populating = True
+        try:
+            self.setRowCount(len(self._paths))
+            for row, path in enumerate(self._paths):
+                order_item = QTableWidgetItem(str(row + 1))
+                name_item = QTableWidgetItem(self._display_name(path))
+                try:
+                    path_text = path.relative_to(self._basepath).as_posix()
+                except ValueError:
+                    path_text = str(path)
+                path_item = QTableWidgetItem(path_text)
+                order_item.setFlags(order_item.flags() | Qt.ItemFlag.ItemIsEditable)
+                for item in (name_item, path_item):
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.setItem(row, 0, order_item)
+                self.setItem(row, 1, name_item)
+                self.setItem(row, 2, path_item)
+            if select_row is not None and 0 <= select_row < self.rowCount():
+                self.selectRow(select_row)
+        finally:
+            self._populating = False
+
+    def _handle_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._populating or item.column() != 0:
+            return
+        source_index = item.row()
+        try:
+            target_index = int(item.text().strip()) - 1
+        except ValueError:
+            self.refresh(source_index)
+            return
+        target_index = max(0, min(target_index, len(self._paths) - 1))
+        if target_index == source_index:
+            self.refresh(source_index)
+            return
+        path = self._paths.pop(source_index)
+        self._paths.insert(target_index, path)
+        self.refresh(target_index)
+
+
 class MultiDaySessionOrderTable(QTableWidget):
     def __init__(
         self,
@@ -2206,6 +2298,7 @@ class MainWindow(QMainWindow):
         self._last_chanmap_preview_key: tuple[Any, ...] | None = None
         self._last_xml_warning_key: tuple[Any, ...] | None = None
         self._chanmap_controls_dirty = False
+        self._subsession_order: list[str] = []
         self._multi_day_session_paths: list[str] = []
         self._multi_day_selected_subepoch_paths: list[str] = []
         self._cell_explorer_sorting_folders: list[str] = []
@@ -2524,15 +2617,21 @@ class MainWindow(QMainWindow):
         self.basepath = QLineEdit()
         self.basepath.setPlaceholderText("Select session/basepath")
         browse_basepath = QPushButton("Browse basepath")
+        browse_basepath.setMaximumWidth(190)
         browse_basepath.clicked.connect(self._browse_basepath)
+        check_basepath_order = QPushButton("Check order")
+        check_basepath_order.setMinimumWidth(100)
+        check_basepath_order.setMaximumWidth(145)
+        check_basepath_order.clicked.connect(self._view_basepath_order)
         browse_multiday = QPushButton("Browse for multi-days")
+        browse_multiday.setMaximumWidth(230)
         browse_multiday.clicked.connect(self._browse_multi_days)
         self.multi_day_sessions = QLineEdit()
         self.multi_day_sessions.setReadOnly(True)
         self.multi_day_sessions.setPlaceholderText("No multi-day sessions selected")
         view_multiday = QPushButton("Check order")
         view_multiday.setMinimumWidth(110)
-        view_multiday.setMaximumWidth(125)
+        view_multiday.setMaximumWidth(145)
         view_multiday.clicked.connect(self._view_multi_day_sessions)
         self.multi_day_name = QLineEdit()
         self.multi_day_name.setPlaceholderText("multi-day name")
@@ -2540,11 +2639,14 @@ class MainWindow(QMainWindow):
         self.local_root = QLineEdit()
         self.local_root.setPlaceholderText("Local working directory")
         browse_local = QPushButton("Browse local")
+        browse_local.setMaximumWidth(155)
         browse_local.clicked.connect(self._browse_local_root)
 
         load_config = QPushButton("Load config")
+        load_config.setMaximumWidth(145)
         load_config.clicked.connect(self._load_config)
         save_config = QPushButton("Save config")
+        save_config.setMaximumWidth(145)
         save_config.clicked.connect(self._save_config)
 
         self.browse_local_session_resume = QPushButton("Browse local session to resume")
@@ -2557,24 +2659,36 @@ class MainWindow(QMainWindow):
         resume_hint.setObjectName("hintLabel")
         resume_hint.setWordWrap(True)
 
+        local_row = QWidget()
+        local_layout = QHBoxLayout(local_row)
+        local_layout.setContentsMargins(0, 0, 0, 0)
+        local_layout.setSpacing(6)
+        local_layout.addWidget(browse_local)
+        local_layout.addWidget(self.browse_local_session_resume)
+        local_layout.addWidget(QLabel("Local working dir"))
+        local_layout.addWidget(self.local_root, 1)
+
+        config_row = QWidget()
+        config_layout = QHBoxLayout(config_row)
+        config_layout.setContentsMargins(0, 0, 0, 0)
+        config_layout.setSpacing(6)
+        config_layout.addWidget(resume_hint, 1)
+        config_layout.addWidget(load_config)
+        config_layout.addWidget(save_config)
+
         layout.addWidget(browse_basepath, 0, 0)
-        layout.addWidget(self.basepath, 0, 1)
-        layout.addWidget(browse_local, 0, 2)
-        layout.addWidget(QLabel("Local working dir"), 0, 3)
-        layout.addWidget(self.local_root, 0, 4)
-        layout.addWidget(load_config, 0, 5)
-        layout.addWidget(save_config, 0, 6)
+        layout.addWidget(check_basepath_order, 0, 1)
+        layout.addWidget(self.basepath, 0, 2, 1, 5)
         layout.addWidget(browse_multiday, 1, 0)
-        layout.addWidget(self.multi_day_sessions, 1, 1, 1, 2)
-        layout.addWidget(view_multiday, 1, 3)
+        layout.addWidget(view_multiday, 1, 1)
+        layout.addWidget(self.multi_day_sessions, 1, 2, 1, 2)
         layout.addWidget(QLabel("Multi-day name"), 1, 4)
         layout.addWidget(self.multi_day_name, 1, 5, 1, 2)
-        layout.addWidget(self.browse_local_session_resume, 2, 0)
-        layout.addWidget(resume_hint, 2, 1, 1, 6)
-        layout.setColumnStretch(1, 4)
-        layout.setColumnStretch(4, 0)
-        layout.setColumnStretch(5, 3)
-        layout.setColumnStretch(6, 1)
+        layout.addWidget(local_row, 2, 0, 1, 7)
+        layout.addWidget(config_row, 3, 0, 1, 7)
+        layout.setColumnStretch(2, 1)
+        layout.setColumnStretch(3, 4)
+        layout.setColumnStretch(4, 1)
 
         self.basepath.textChanged.connect(self._schedule_refresh)
         self.local_root.textChanged.connect(self._schedule_refresh)
@@ -2582,6 +2696,7 @@ class MainWindow(QMainWindow):
         self.basepath.textChanged.connect(self._reset_behavior_discovery_state)
         self.local_root.textChanged.connect(self._reset_behavior_discovery_state)
         self.basepath.textEdited.connect(self._clear_move_storage_override)
+        self.basepath.textEdited.connect(lambda _text: self._set_subsession_order([]))
         self.multi_day_name.textEdited.connect(self._clear_move_storage_override)
         return panel
 
@@ -2596,6 +2711,7 @@ class MainWindow(QMainWindow):
     def _build_execution_tab(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("settingsPage")
+        panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(panel)
         layout.setSpacing(8)
 
@@ -3863,6 +3979,7 @@ class MainWindow(QMainWindow):
         path = self._select_directory("Select basepath", self.basepath.text() or str(Path.cwd()))
         if path:
             self._clear_move_storage_override()
+            self._set_subsession_order([])
             self.basepath.setText(path)
             self._auto_load_existing_xml()
             self._auto_load_existing_chanmap()
@@ -3970,6 +4087,129 @@ class MainWindow(QMainWindow):
             )
         if hasattr(self, "move_storage_dir"):
             self._update_move_storage_destination()
+
+    def _set_subsession_order(self, paths: list[str]) -> None:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in paths:
+            text = str(item).strip()
+            if not text:
+                continue
+            path = Path(text).expanduser()
+            key = str(path) if path.is_absolute() else path.as_posix()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(key)
+        if cleaned != self._subsession_order and hasattr(self, "move_storage_dir"):
+            self._clear_move_storage_override()
+        self._subsession_order = cleaned
+
+    def _view_basepath_order(self) -> None:
+        if self._multi_day_session_paths:
+            QMessageBox.information(
+                self,
+                "Subsession order",
+                "Multi-day mode is active. Use the Check order button on the multi-day row.",
+            )
+            return
+        basepath_text = self.basepath.text().strip()
+        if not basepath_text:
+            QMessageBox.information(
+                self,
+                "Subsession order",
+                "Select a basepath first.",
+            )
+            return
+        basepath = Path(basepath_text).expanduser()
+        if not basepath.is_dir():
+            QMessageBox.warning(
+                self,
+                "Subsession order",
+                f"Basepath does not exist:\n{basepath}",
+            )
+            return
+        try:
+            paths = discover_subsessions(
+                basepath=basepath,
+                sort_files=True,
+                alt_sort=None,
+                ignore_folders=[],
+                subsession_order=self._subsession_order or None,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot check subsession order", str(exc))
+            return
+        if not paths:
+            QMessageBox.information(
+                self,
+                "Subsession order",
+                "No input recordings were discovered under this basepath.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Subsession concat order")
+        dialog.resize(1050, 500)
+        dialog.setStyleSheet(
+            """
+            QDialog {
+                background: #252525;
+                color: #e5e5e5;
+            }
+            QTableWidget {
+                background: #1f1f1f;
+                alternate-background-color: #272727;
+                color: #e5e5e5;
+                gridline-color: #565656;
+                selection-background-color: #2d6f9f;
+                selection-color: #ffffff;
+            }
+            QHeaderView::section {
+                background: #303030;
+                color: #f0f0f0;
+                border: 1px solid #555555;
+                padding: 5px;
+            }
+            """
+        )
+        layout = QVBoxLayout(dialog)
+        explanation = QLabel(
+            "Edit the Order value to define the exact concat order. "
+            "The saved order is validated against all discovered recordings before preprocessing."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        table = SubsessionOrderTable(basepath, paths, dialog)
+        table.setAlternatingRowColors(True)
+        layout.addWidget(table, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        update_button = buttons.addButton(
+            "Update order", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+
+        def apply_order() -> None:
+            ordered_paths = table.paths()
+            if len(ordered_paths) != len(paths) or len(set(ordered_paths)) != len(paths):
+                QMessageBox.warning(dialog, "Update order", "Subsession table is incomplete.")
+                return
+            relative_order = table.relative_paths()
+            self._set_subsession_order(relative_order)
+            self._schedule_refresh()
+            self._append_log(
+                "Updated single-session concat order:\n"
+                + "".join(
+                    f"  [{index}] {path}\n"
+                    for index, path in enumerate(relative_order, start=1)
+                )
+            )
+            dialog.accept()
+
+        update_button.clicked.connect(apply_order)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _set_cell_explorer_sorting_folders(self, paths: list[str]) -> None:
         cleaned: list[str] = []
@@ -5440,6 +5680,7 @@ class MainWindow(QMainWindow):
             loaded.multi_day_session_paths = list(current.multi_day_session_paths)
             loaded.multi_day_selected_subepoch_paths = list(current.multi_day_selected_subepoch_paths)
             loaded.multi_day_name = current.multi_day_name
+            loaded.subsession_order = list(current.subsession_order)
             loaded.chanmap_path = current.chanmap_path
             loaded.postprocess.sorting_phy_folder = current.postprocess.sorting_phy_folder
             loaded.postprocess.sorting_search_root = current.postprocess.sorting_search_root
@@ -5628,6 +5869,9 @@ class MainWindow(QMainWindow):
             multi_day_session_paths=list(self._multi_day_session_paths),
             multi_day_selected_subepoch_paths=list(self._multi_day_selected_subepoch_paths),
             multi_day_name=self.multi_day_name.text().strip(),
+            subsession_order=(
+                [] if self._multi_day_session_paths else list(self._subsession_order)
+            ),
             preprocess=preprocess,
             behavior=behavior,
             postprocess=postprocess,
@@ -5671,6 +5915,7 @@ class MainWindow(QMainWindow):
                 selected_subepoch_paths=list(settings.multi_day_selected_subepoch_paths),
             )
             self.multi_day_name.setText(settings.multi_day_name)
+            self._set_subsession_order(list(settings.subsession_order))
             self.chanmap_path.setText(settings.chanmap_path)
             p = settings.preprocess
             self.analog_inputs.setChecked(p.analog_inputs)

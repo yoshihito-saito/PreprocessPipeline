@@ -63,6 +63,59 @@ def _write_epoch(session: Path, name: str, *, n_channels: int = 4, n_samples: in
     return epoch
 
 
+def test_explicit_subsession_order_uses_portable_relative_paths(tmp_path: Path) -> None:
+    first = _write_epoch(tmp_path, "session_1") / "amplifier.dat"
+    second = _write_epoch(tmp_path, "session_2") / "amplifier.dat"
+    third = _write_epoch(tmp_path, "session_3") / "amplifier.dat"
+
+    discovered = discover_subsessions(
+        basepath=tmp_path,
+        sort_files=True,
+        alt_sort=None,
+        ignore_folders=[],
+        subsession_order=[
+            "session_3/amplifier.dat",
+            "session_1/amplifier.dat",
+            "session_2/amplifier.dat",
+        ],
+    )
+
+    assert discovered == [third, first, second]
+
+
+def test_explicit_subsession_order_rejects_stale_or_incomplete_selection(
+    tmp_path: Path,
+) -> None:
+    _write_epoch(tmp_path, "session_1")
+    _write_epoch(tmp_path, "session_2")
+
+    with pytest.raises(ValueError, match="every discovered recording exactly once"):
+        discover_subsessions(
+            basepath=tmp_path,
+            sort_files=True,
+            alt_sort=None,
+            ignore_folders=[],
+            subsession_order=["session_1/amplifier.dat"],
+        )
+
+
+def test_explicit_subsession_order_rejects_duplicates(tmp_path: Path) -> None:
+    _write_epoch(tmp_path, "session_1")
+    _write_epoch(tmp_path, "session_2")
+
+    with pytest.raises(ValueError, match="duplicate paths"):
+        discover_subsessions(
+            basepath=tmp_path,
+            sort_files=True,
+            alt_sort=None,
+            ignore_folders=[],
+            subsession_order=[
+                "session_1/amplifier.dat",
+                "session_1/amplifier.dat",
+            ],
+        )
+
+
 def _write_openephys_epoch(
     session: Path,
     name: str,

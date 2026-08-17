@@ -20,6 +20,7 @@ class PreprocessConfig:
     output_dir: Path | None = None  # backward compatibility
     sort_files: bool = True
     alt_sort: list[int] | None = None
+    subsession_order: list[str] = field(default_factory=list)
     ignore_folders: list[str] = field(default_factory=list)
 
     dtype: str = "int16"

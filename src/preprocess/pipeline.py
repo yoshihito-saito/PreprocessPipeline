@@ -519,6 +519,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         sort_files=config.sort_files,
         alt_sort=config.alt_sort,
         ignore_folders=config.ignore_folders,
+        subsession_order=config.subsession_order,
     )
     print("Subsession file order:")
     for idx, path in enumerate(subsession_paths, start=1):
