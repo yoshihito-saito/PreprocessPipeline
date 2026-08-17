@@ -24,3 +24,5 @@
 - [2026-08-17 CellExplorer spikes v7.3 saving](2026-08-17-cellexplorer-spikes-v73.md)
 - [2026-08-17 Buzsaki 5x12 probe geometry](2026-08-17-buzsaki-5x12-probe-geometry.md)
 - [2026-08-17 A5x12-16-Buz-Lin probe name](2026-08-17-a5x12-16-buz-lin-probe-name.md)
+- [2026-08-17 move missing session XML](2026-08-17-move-missing-session-xml.md)
+- [2026-08-17 Windows Force stop and restart](2026-08-17-windows-force-stop-restart.md)

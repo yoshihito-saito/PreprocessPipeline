@@ -17,6 +17,10 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
 def _linux_process_start_ticks(pid: int) -> str | None:
     stat_path = Path("/proc") / str(pid) / "stat"
     try:
@@ -28,9 +32,71 @@ def _linux_process_start_ticks(pid: int) -> str | None:
         return None
 
 
+def _windows_process_identity(pid: int) -> tuple[bool | None, str | None]:
+    """Return Windows existence and creation time without treating access errors as exit."""
+    if not _is_windows() or pid <= 0:
+        return False, None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        process_query_limited_information = 0x1000
+        handle = kernel32.OpenProcess(
+            process_query_limited_information, False, int(pid)
+        )
+        if not handle:
+            # ERROR_INVALID_PARAMETER is the documented result for a PID that
+            # does not identify a process. Access/query failures are unknown,
+            # not evidence that the worker exited.
+            return (False, None) if ctypes.get_last_error() == 87 else (None, None)
+        try:
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel_time = wintypes.FILETIME()
+            user_time = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                return None, None
+            value = (int(creation.dwHighDateTime) << 32) | int(
+                creation.dwLowDateTime
+            )
+            return True, str(value)
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None, None
+
+
+def _windows_process_creation_time(pid: int) -> str | None:
+    exists, creation_time = _windows_process_identity(pid)
+    return creation_time if exists is True else None
+
+
 def _process_exists(pid: int) -> bool:
     if pid <= 0:
         return False
+    if _is_windows():
+        exists, _creation_time = _windows_process_identity(pid)
+        return exists is not False
     stat_path = Path("/proc") / str(pid) / "stat"
     try:
         text = stat_path.read_text(encoding="utf-8", errors="replace")
@@ -49,7 +115,7 @@ def _process_exists(pid: int) -> bool:
 
 
 def _process_group_exists(process_group_id: int) -> bool:
-    if process_group_id <= 0 or os.name == "nt":
+    if process_group_id <= 0 or _is_windows():
         return False
     try:
         os.killpg(process_group_id, 0)
@@ -58,6 +124,15 @@ def _process_group_exists(process_group_id: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _taskkill_windows_process_tree(pid: int) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["taskkill", "/PID", str(pid), "/T", "/F"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
 
 class LocalBackend(ExecutionBackend):
@@ -106,17 +181,32 @@ class LocalBackend(ExecutionBackend):
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 close_fds=True,
-                start_new_session=(os.name != "nt"),
+                start_new_session=not _is_windows(),
             )
         finally:
             stdout_handle.close()
             stderr_handle.close()
+        process_creation_time = _windows_process_creation_time(process.pid)
+        if _is_windows() and process_creation_time is None:
+            result = _taskkill_windows_process_tree(process.pid)
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5.0)
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                "Could not capture a reusable Windows process identity; "
+                "the Local worker was terminated before submission"
+                + (f": {detail}" if detail else "")
+            )
         job_id = str(process.pid)
         self._children[job_id] = process
         metadata = {
             "pid": process.pid,
-            "process_group_id": process.pid if os.name != "nt" else None,
+            "process_group_id": process.pid if not _is_windows() else None,
             "process_start_ticks": _linux_process_start_ticks(process.pid),
+            "process_creation_time": process_creation_time,
             "command": command,
         }
         return [
@@ -135,6 +225,13 @@ class LocalBackend(ExecutionBackend):
         owned = self._children.get(job_ref.job_id)
         if owned is not None and owned.pid == pid and owned.poll() is None:
             return True
+        expected_creation_time = job_ref.metadata.get("process_creation_time")
+        if expected_creation_time is not None:
+            actual_creation_time = _windows_process_creation_time(pid)
+            return (
+                actual_creation_time is not None
+                and str(expected_creation_time) == str(actual_creation_time)
+            )
         expected = job_ref.metadata.get("process_start_ticks")
         actual = _linux_process_start_ticks(pid)
         # Persistent cancellation must fail closed when process identity cannot
@@ -182,14 +279,26 @@ class LocalBackend(ExecutionBackend):
                 f"Refusing to cancel Local job {job_ref.job_id}: "
                 "the live process identity cannot be verified"
             )
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                check=False,
-                capture_output=True,
-                text=True,
+        if _is_windows():
+            result = _taskkill_windows_process_tree(pid)
+            expected_creation_time = str(
+                job_ref.metadata.get("process_creation_time") or ""
             )
-            return
+            for _ in range(50):
+                exists, actual_creation_time = _windows_process_identity(pid)
+                if exists is False or (
+                    exists is True
+                    and expected_creation_time
+                    and actual_creation_time is not None
+                    and actual_creation_time != expected_creation_time
+                ):
+                    return
+                time.sleep(0.1)
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"taskkill did not terminate Local job {job_ref.job_id}"
+                + (f": {detail}" if detail else "")
+            )
         try:
             process_group_id = int(job_ref.metadata.get("process_group_id") or pid)
             os.killpg(process_group_id, signal.SIGTERM)

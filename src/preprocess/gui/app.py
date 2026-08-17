@@ -350,8 +350,10 @@ def _move_local_output_to_storage(
             "Resume or resolve the persistent Run before moving its outputs."
         )
 
+    session_xml_name = f"{basename}.xml"
+    destination_xml = dst_root / session_xml_name
+    destination_has_xml = destination_xml.exists() or destination_xml.is_symlink()
     excluded: dict[str, str] = {
-        f"{basename}.xml": "input metadata already belongs in basepath",
         f"{basename}.rhd": "input metadata already belongs in basepath",
         "@eaDir": "system metadata folder",
     }
@@ -362,7 +364,15 @@ def _move_local_output_to_storage(
     skipped: list[dict[str, str]] = []
     for child in sorted(src_root.iterdir(), key=lambda p: p.name.lower()):
         reason = excluded.get(child.name)
-        if reason is None and child.suffix.lower() in {".rhd", ".xml"}:
+        if reason is None and child.name == session_xml_name and destination_has_xml:
+            reason = "destination session XML already exists"
+        elif (
+            reason is None
+            and child.suffix.lower() == ".xml"
+            and child.name != session_xml_name
+        ):
+            reason = "input metadata XML stays local"
+        elif reason is None and child.suffix.lower() == ".rhd":
             reason = "input metadata/raw source file stays local"
         if reason is not None:
             skipped.append({"name": child.name, "reason": reason})
@@ -458,11 +468,18 @@ def _move_local_output_to_storage(
     inventory_move = [{"name": src.name, "bytes": _path_size(src)} for src, _dst in move_items]
 
     # A custom storage location must retain the minimal raw metadata required to
-    # reopen a session after local cleanup.  It is copied, not counted as a moved
-    # analysis output, because the established UI semantics leave it in place.
+    # reopen a session after local cleanup. The session XML is already either at
+    # the destination or in move_items; RHD metadata retains the established
+    # copy-without-counting semantics.
     metadata_copies: list[tuple[Path, Path]] = []
     if destination_dir is not None and clean_after_move:
-        for name in (f"{basename}.xml", f"{basename}.rhd"):
+        xml_src = src_root / session_xml_name
+        if not destination_has_xml and not xml_src.exists():
+            raise FileNotFoundError(
+                f"Custom storage needs {session_xml_name} before local cleanup, but it is absent "
+                f"from both the source and destination: {dst_root}"
+            )
+        for name in (f"{basename}.rhd",):
             src = src_root / name
             dst = dst_root / name
             if not dst.exists():
@@ -488,6 +505,7 @@ def _move_local_output_to_storage(
     published: list[tuple[Path, Path | None]] = []
     moved: list[dict[str, str]] = []
     staged_signatures: dict[Path, tuple[tuple[str, str, str], ...]] = {}
+    publication_skipped_sources: set[Path] = set()
     try:
         # Stage a byte-for-byte copy before modifying either canonical tree.
         for src, dst in move_items + metadata_copies:
@@ -510,6 +528,61 @@ def _move_local_output_to_storage(
         for src, dst in move_items + metadata_copies:
             staged = staging / src.name
             backup: Path | None = None
+            if src.name == session_xml_name:
+                try:
+                    if staged.is_symlink():
+                        os.symlink(os.readlink(staged), dst)
+                    elif staged.is_file():
+                        # Staging is inside dst_root, so this same-filesystem
+                        # hard link publishes atomically without replacing an
+                        # XML another process may have created concurrently.
+                        os.link(staged, dst)
+                    else:
+                        raise ValueError(
+                            f"Session XML must be a file or symlink: {src}"
+                        )
+                except FileExistsError:
+                    publication_skipped_sources.add(src)
+                    skipped.append(
+                        {
+                            "name": src.name,
+                            "reason": "destination session XML appeared during transfer",
+                        }
+                    )
+                    continue
+                except OSError:
+                    if staged.is_symlink():
+                        raise
+                    try:
+                        descriptor = os.open(
+                            dst,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            staged.stat().st_mode & 0o777,
+                        )
+                    except FileExistsError:
+                        publication_skipped_sources.add(src)
+                        skipped.append(
+                            {
+                                "name": src.name,
+                                "reason": "destination session XML appeared during transfer",
+                            }
+                        )
+                        continue
+                    published.append((dst, None))
+                    with os.fdopen(descriptor, "wb") as destination_handle:
+                        with staged.open("rb") as source_handle:
+                            shutil.copyfileobj(source_handle, destination_handle)
+                        destination_handle.flush()
+                        os.fsync(destination_handle.fileno())
+                    shutil.copystat(staged, dst, follow_symlinks=False)
+                else:
+                    published.append((dst, None))
+                staged.unlink()
+                set_tree_world_rw(dst)
+                moved.append(
+                    {"name": dst.name, "path": str(dst), "bytes": _path_size(dst)}
+                )
+                continue
             if dst.exists() or dst.is_symlink():
                 if not overwrite:
                     # Metadata can coexist only when it already existed; output
@@ -529,6 +602,8 @@ def _move_local_output_to_storage(
         # Verify the canonical destination after publication before deleting the
         # source.  This makes injected copy/publish failures recoverable.
         for src, dst in move_items + metadata_copies:
+            if src in publication_skipped_sources:
+                continue
             if _content_signature(dst) != staged_signatures[dst]:
                 raise IOError(f"Published transfer validation failed for {dst}")
     except Exception:
@@ -559,6 +634,8 @@ def _move_local_output_to_storage(
     else:
         deletion_errors: list[str] = []
         for src, _dst in move_items:
+            if src in publication_skipped_sources:
+                continue
             try:
                 if src.is_dir() and not src.is_symlink():
                     shutil.rmtree(src)
@@ -579,7 +656,11 @@ def _move_local_output_to_storage(
         "moved": moved,
         "skipped": skipped,
         "inventory": {
-            "move": inventory_move,
+            "move": [
+                item
+                for item in inventory_move
+                if (src_root / item["name"]) not in publication_skipped_sources
+            ],
             "retain": skipped,
             "delete_local": clean_after_move,
         },
@@ -4270,6 +4351,7 @@ class MainWindow(QMainWindow):
             self.force_stop.setEnabled(False)
             self._refresh_persistent_run_monitor()
             detail = " from its completed Run record"
+        self._auto_load_existing_chanmap()
         self._append_log(
             f"Loaded local session {session_dir}{detail}. No job was started or retried.\n"
         )
@@ -4739,6 +4821,8 @@ class MainWindow(QMainWindow):
                 self._process is not None
                 and self._process.state() != QProcess.ProcessState.NotRunning
             )
+            for button in (self.run_all, self.run_pre, self.run_post):
+                button.setEnabled(not legacy_running)
             self.move_outputs.setEnabled(not legacy_running)
             self.browse_move_storage.setEnabled(not legacy_running)
             return
@@ -4750,6 +4834,8 @@ class MainWindow(QMainWindow):
                     self._process is not None
                     and self._process.state() != QProcess.ProcessState.NotRunning
                 )
+                for button in (self.run_all, self.run_pre, self.run_post):
+                    button.setEnabled(not legacy_running)
                 self.move_outputs.setEnabled(not legacy_running)
                 self.browse_move_storage.setEnabled(not legacy_running)
                 return
@@ -4839,6 +4925,8 @@ class MainWindow(QMainWindow):
         )
         persistent_active = self._persistent_state_has_active_work(state)
         self.force_stop.setEnabled(legacy_running or persistent_active)
+        for button in (self.run_all, self.run_pre, self.run_post):
+            button.setEnabled(not legacy_running and not persistent_active)
         self.move_outputs.setEnabled(not legacy_running and not persistent_active)
         self.browse_move_storage.setEnabled(not legacy_running and not persistent_active)
 
@@ -6012,17 +6100,38 @@ class MainWindow(QMainWindow):
             preview_root = source_dir or settings.local_output_dir
             preview_basename = source_basename or settings.basename
             if preview_root is not None and Path(preview_root).is_dir():
-                excluded = {f"{preview_basename}.xml", f"{preview_basename}.rhd", "@eaDir"}
-                if not self.move_dat_to_basepath.isChecked():
-                    excluded.add(f"{preview_basename}.dat")
-                selected = [p for p in Path(preview_root).iterdir() if p.name not in excluded]
+                destination_path = Path(destination).expanduser().resolve() if destination else None
+                session_xml_name = f"{preview_basename}.xml"
+                destination_has_xml = bool(
+                    destination_path
+                    and (
+                        (destination_path / session_xml_name).exists()
+                        or (destination_path / session_xml_name).is_symlink()
+                    )
+                )
+                selected: list[Path] = []
+                retained: list[Path] = []
+                for item in Path(preview_root).iterdir():
+                    keep_local = (
+                        item.name == "@eaDir"
+                        or item.suffix.lower() == ".rhd"
+                        or (
+                            item.suffix.lower() == ".xml"
+                            and (item.name != session_xml_name or destination_has_xml)
+                        )
+                        or (
+                            item.name == f"{preview_basename}.dat"
+                            and not self.move_dat_to_basepath.isChecked()
+                        )
+                    )
+                    (retained if keep_local else selected).append(item)
                 total_bytes = sum(
                     p.stat().st_size if p.is_file() else sum(q.stat().st_size for q in p.rglob("*") if q.is_file())
                     for p in selected
                 )
                 inventory_text = (
                     f"Inventory: move {len(selected)} item(s), {total_bytes:,} bytes; "
-                    f"retain {len(excluded)} metadata/unchecked item(s); "
+                    f"retain {len(retained)} metadata/unchecked item(s); "
                     f"delete local source: {'yes' if self.move_clean_local.isChecked() else 'no'}."
                 )
             message = (
