@@ -172,6 +172,63 @@ Use **Move outputs to storage** to copy selected outputs from the Local working 
 
 ## Optional tools
 
+### Standalone multi-day channel MAD check
+
+The auxiliary `src.stability` module can compare channel noise across the subepochs
+listed in a staged `multi_day_selected_subepochs.csv`. It is not called by the GUI or
+preprocess pipeline.
+
+```python
+from src.stability import analyze_multi_day_mad
+
+result = analyze_multi_day_mad(
+    "/path/to/multi_day_selected_subepochs.csv",
+    bandpass_min_hz=500.0,
+    bandpass_max_hz=8000.0,
+    window_duration_s=1.0,
+    num_windows=20,
+)
+
+print(result.csv_path)     # multi_day_mad.csv
+print(result.figure_path)  # multi_day_mad.png
+```
+
+To overlay every channel as a color-coded time series, with pre-filter and
+post-bandpass values in separate panels, use:
+
+```python
+from src.stability import plot_multi_day_mad_by_channel
+
+figure, _ = plot_multi_day_mad_by_channel(result.metrics, cmap="viridis")
+figure.savefig("multi_day_mad_by_channel.png", dpi=200)
+```
+
+To rank adjacent-subepoch channel reversal or half-swap candidates from the saved
+MAD profiles alone:
+
+```python
+from src.stability import analyze_multi_day_mapping_check
+
+mapping = analyze_multi_day_mapping_check(result.csv_path)
+print(mapping.csv_path)     # multi_day_mapping_check.csv
+print(mapping.figure_path)  # multi_day_mapping_check.png
+```
+
+The mapping check evaluates a bounded set of plausible transformations separately
+on each aligned 64-channel Intan headstage block. It reports identity similarity, conservative
+pre/post consensus permutation gain, corrected similarity, and a priority rank.
+These values shortlist transitions for manual review; they do not automatically
+declare or correct a channel swap.
+
+The CSV contains one row per selected subepoch and electrophysiology channel. The
+only noise metric is the centered MAD converted to a Gaussian-equivalent scale in
+µV, reported as `pre_filter_mad_uv` and `post_filter_mad_uv`. `post_filter` is
+bandpass-filtered but not common-referenced. The table also records dtype and
+per-channel gain/offset provenance. Intan input defaults to `int16` with
+`0.195 µV/count`; pass `dtype`, `gain_to_uV`, or `offset_to_uV` when the acquisition
+uses different values. Selected subepochs with inconsistent physical channel maps
+are rejected. Existing outputs are not replaced unless `overwrite=True`.
+
 ### Phy
 
 Install Phy in the environment used to launch the GUI:

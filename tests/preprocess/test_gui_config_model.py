@@ -18,6 +18,7 @@ from src.preprocess.gui.app import (
     _default_config_has_backend_choice,
     _has_slurm_server_commands,
     _move_local_output_to_storage,
+    _resolve_cell_explorer_source_basepath,
 )
 from src.preprocess.gui.config_model import (
     PipelineGuiSettings,
@@ -40,6 +41,136 @@ def test_only_an_explicit_saved_backend_suppresses_environment_default(
     assert _default_config_has_backend_choice(tmp_path / "missing.json") is False
     assert _default_config_has_backend_choice(legacy) is False
     assert _default_config_has_backend_choice(explicit) is True
+
+
+def _write_multi_day_manifest(
+    local_output: Path,
+    server_basepath: Path,
+    *,
+    name: str | None = None,
+    staged_names: tuple[str, ...] = ("001_Day14_epoch", "002_Day15_epoch"),
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "name": name or local_output.name,
+        "server_basepath": str(server_basepath),
+        "subepochs": [
+            {"staged_subepoch_path": str(server_basepath / staged_name)}
+            for staged_name in staged_names
+        ],
+    }
+    (local_output / "multi_day_manifest.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+
+def test_cell_explorer_source_prefers_multi_day_manifest_over_first_day(
+    tmp_path: Path,
+) -> None:
+    first_day = tmp_path / "raw" / "Day14"
+    first_day.mkdir(parents=True)
+    local_output = tmp_path / "sorting_temp" / "multiday_Day14_to_Day15"
+    local_output.mkdir(parents=True)
+    staged_root = tmp_path / "staged" / local_output.name
+    for staged_name in ("001_Day14_epoch", "002_Day15_epoch"):
+        (staged_root / staged_name).mkdir(parents=True)
+    _write_multi_day_manifest(local_output, staged_root)
+    settings = PipelineGuiSettings(
+        basepath=str(first_day),
+        local_root=str(local_output.parent),
+        multi_day_enabled=True,
+        multi_day_name=local_output.name,
+    )
+
+    resolved = _resolve_cell_explorer_source_basepath(settings, local_output)
+
+    assert resolved == staged_root.resolve()
+
+
+def test_cell_explorer_source_uses_manifest_when_existing_multiday_is_reopened(
+    tmp_path: Path,
+) -> None:
+    first_day = tmp_path / "raw" / "Day14"
+    first_day.mkdir(parents=True)
+    local_output = tmp_path / "sorting_temp" / "multiday_Day14_to_Day15"
+    local_output.mkdir(parents=True)
+    staged_root = tmp_path / "staged" / local_output.name
+    for staged_name in ("001_Day14_epoch", "002_Day15_epoch"):
+        (staged_root / staged_name).mkdir(parents=True)
+    _write_multi_day_manifest(local_output, staged_root)
+    settings = PipelineGuiSettings(
+        basepath=str(local_output),
+        source_basepath=str(first_day),
+        existing_session_dir=str(local_output),
+        multi_day_enabled=False,
+    )
+
+    resolved = _resolve_cell_explorer_source_basepath(settings, local_output)
+
+    assert resolved == staged_root.resolve()
+
+
+def test_cell_explorer_source_without_manifest_preserves_single_day_path(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "raw" / "sessionA"
+    source.mkdir(parents=True)
+    local_output = tmp_path / "sorting_temp" / source.name
+    local_output.mkdir(parents=True)
+    settings = PipelineGuiSettings(basepath=str(source), local_root=str(local_output.parent))
+
+    resolved = _resolve_cell_explorer_source_basepath(settings, local_output)
+
+    assert resolved == source.resolve()
+
+
+def test_cell_explorer_source_rejects_manifest_for_another_session(
+    tmp_path: Path,
+) -> None:
+    import pytest
+
+    local_output = tmp_path / "sorting_temp" / "multiday_Day14_to_Day15"
+    local_output.mkdir(parents=True)
+    staged_root = tmp_path / "staged" / local_output.name
+    for staged_name in ("001_Day14_epoch", "002_Day15_epoch"):
+        (staged_root / staged_name).mkdir(parents=True)
+    _write_multi_day_manifest(local_output, staged_root, name="different_session")
+
+    with pytest.raises(ValueError, match="does not match the selected local session"):
+        _resolve_cell_explorer_source_basepath(PipelineGuiSettings(), local_output)
+
+
+def test_cell_explorer_source_rejects_unsupported_manifest_schema(
+    tmp_path: Path,
+) -> None:
+    import pytest
+
+    local_output = tmp_path / "sorting_temp" / "multiday_Day14_to_Day15"
+    local_output.mkdir(parents=True)
+    staged_root = tmp_path / "staged" / local_output.name
+    for staged_name in ("001_Day14_epoch", "002_Day15_epoch"):
+        (staged_root / staged_name).mkdir(parents=True)
+    _write_multi_day_manifest(local_output, staged_root)
+    manifest_path = local_output / "multi_day_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 2
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unsupported multi-day manifest schema"):
+        _resolve_cell_explorer_source_basepath(PipelineGuiSettings(), local_output)
+
+
+def test_cell_explorer_source_rejects_missing_staged_subepoch(tmp_path: Path) -> None:
+    import pytest
+
+    local_output = tmp_path / "sorting_temp" / "multiday_Day14_to_Day15"
+    local_output.mkdir(parents=True)
+    staged_root = tmp_path / "staged" / local_output.name
+    (staged_root / "001_Day14_epoch").mkdir(parents=True)
+    _write_multi_day_manifest(local_output, staged_root)
+
+    with pytest.raises(FileNotFoundError, match="002_Day15_epoch"):
+        _resolve_cell_explorer_source_basepath(PipelineGuiSettings(), local_output)
 
 
 def test_execution_controls_are_nested_under_ephys(tmp_path: Path, monkeypatch) -> None:
@@ -1273,3 +1404,74 @@ def test_legacy_noise_label_pid_claim_failure_cleans_up_startup(tmp_path: Path, 
     finally:
         window.close()
         application.processEvents()
+
+
+def test_load_xml_updates_probe_assignments_and_chanmap_preview(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    basepath = tmp_path / "session"
+    basepath.mkdir()
+    xml = tmp_path / "selected.xml"
+    xml.write_text(
+        """
+<session>
+  <generalInfo><description>poly2</description></generalInfo>
+  <anatomicalDescription>
+    <channelGroups>
+      <group><channels><n>0</n><n>1</n></channels></group>
+      <group><channels><n>2</n><n>3</n></channels></group>
+    </channelGroups>
+  </anatomicalDescription>
+</session>
+""".strip(),
+        encoding="utf-8",
+    )
+
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    try:
+        window.basepath.setText(str(basepath))
+        window.local_root.setText(str(tmp_path / "local"))
+        monkeypatch.setattr(window, "_select_open_file", lambda *_args: str(xml))
+
+        window._load_xml()
+
+        assert window.xml_path.text() == str(xml)
+        assert window._probe_rows_to_assignments() == [
+            {"type": "poly2", "groups": [0, 1], "x_offset": 0}
+        ]
+        assert "current GUI settings" in window.chanmap_canvas.summary.text()
+        assert window._chanmap_controls_dirty is True
+    finally:
+        window.close()
+        application.processEvents()
+
+
+def test_gui_import_does_not_load_sorter_registry() -> None:
+    import os
+    import subprocess
+    import sys
+
+    environment = dict(os.environ)
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    repository = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import src.preprocess.gui.app; "
+                "assert 'spikeinterface.sorters' not in sys.modules"
+            ),
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
