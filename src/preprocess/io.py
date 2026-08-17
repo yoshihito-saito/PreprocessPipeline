@@ -35,6 +35,7 @@ _OPENEPHYS_RECORD_NODE_NAME = "Record Node 101"
 _DAY_PREFIX_PATTERN = re.compile(r"^(?:day|d)(\d+)", re.IGNORECASE)
 _OPENEPHYS_EPHYS_CHANNEL_PATTERN = re.compile(r"^CH\d+$", re.IGNORECASE)
 _OPENEPHYS_ADC_CHANNEL_PATTERN = re.compile(r"^ADC\d+$", re.IGNORECASE)
+A5X12_16_BUZ_LIN_PROBE_TYPE = "A5x12-16-Buz-Lin-5mm-100-200-160-177"
 
 
 def atomic_write_path(
@@ -561,8 +562,11 @@ def _electrode_type_from_xml(root: ET.Element, default: str = "staggered") -> st
     value = description.text.strip().lower()
     if "neuropixel" in value:
         return "NeuroPixel"
-    if "middle_finger" in value or "middle finger" in value or "middlefinger" in value:
-        return "middle_finger"
+    compact_value = re.sub(r"[\s_/-]+", "", value).replace("×", "x")
+    if "buzsaki5x12" in compact_value or "buz5x12" in compact_value:
+        return "Buzsaki 5x12"
+    if "a5x1216buzlin5mm100200160177" in compact_value:
+        return A5X12_16_BUZ_LIN_PROBE_TYPE
     if any(token in value for token in ("flex-g5", "flex_g5", "flex g5", "flex_probe", "flex probe", "flexprobe")):
         return "flex-G5"
     if "staggered" in value:
@@ -605,10 +609,13 @@ def derive_probe_assignments_from_xml(
 def _normalize_chanmap_layout(layout: str | None) -> str:
     text = str(layout or "").strip()
     key = text.lower().replace("-", "_").replace(" ", "")
+    compact_key = re.sub(r"[\s_/-]+", "", text.lower()).replace("×", "x")
     if key in {"neuropixel", "neuro_pixel"}:
         return "NeuroPixel"
-    if key in {"middle_finger", "middlefinger"}:
-        return "middle_finger"
+    if compact_key in {"buzsaki5x12", "buz5x12"}:
+        return "Buzsaki 5x12"
+    if compact_key == "a5x1216buzlin5mm100200160177":
+        return A5X12_16_BUZ_LIN_PROBE_TYPE
     if key in {"flex", "flexg5", "flex_g5", "flexprobe", "flex_probe"}:
         return "flex-G5"
     if key in {"poly2", "poly3", "poly5"}:
@@ -763,6 +770,57 @@ def _middle_finger_layout_coords(
     )
     y = y_from_bottom[::-1]
     return x, y
+
+
+def _buzsaki_5x12_layout_coords(
+    n_channels: int,
+    group_index: int,
+    n_groups: int,
+    *,
+    vertical_spacing: float = 20.0,
+    shank_spacing: float = 200.0,
+    linear_spacing: float = 200.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Geometry for the 64-channel NeuroNexus Buzsaki 5x12 probe.
+
+    Each side shank has 12 poly2 sites. The center shank adds four
+    single-column sites at 200 um pitch above its 12-site poly2 tip cluster.
+    Center-shank channel order follows that top-to-bottom sequence, as in
+    ``middle_finger``.
+    """
+    if n_groups != 5:
+        raise ValueError(
+            f"Buzsaki 5x12 requires 5 channel groups; received {n_groups}"
+        )
+    center_index = n_groups // 2
+    expected_channels = 16 if group_index == center_index else 12
+    if n_channels != expected_channels:
+        raise ValueError(
+            "Buzsaki 5x12 requires group sizes [12, 12, 16, 12, 12]; "
+            f"group {group_index} has {n_channels} channels"
+        )
+    if group_index != center_index:
+        return _cell_explorer_layout_coords(
+            n_channels,
+            "poly2",
+            group_index,
+            vertical_spacing=vertical_spacing,
+            shank_spacing=shank_spacing,
+        )
+
+    linear_count = 4
+    tip_count = 12
+    tip_x, tip_y = _cell_explorer_layout_coords(
+        tip_count,
+        "poly2",
+        group_index,
+        vertical_spacing=vertical_spacing,
+        shank_spacing=shank_spacing,
+    )
+    center_x = group_index * shank_spacing + 10.0
+    linear_x = np.full(linear_count, center_x, dtype=float)
+    linear_y = linear_spacing * np.arange(linear_count, 0, -1, dtype=float)
+    return np.concatenate((linear_x, tip_x)), np.concatenate((linear_y, tip_y))
 
 
 def _flex_g5_layout_coords(
@@ -983,12 +1041,18 @@ def build_channel_map_data(
                 y_base = (np.arange(n_ch) // 2) + 1
                 y = y_base * -20.0
                 x = x + shank_id * 200
-            elif p_type == "middle_finger":
+            elif p_type == A5X12_16_BUZ_LIN_PROBE_TYPE:
                 x, y = _middle_finger_layout_coords(
                     n_ch,
                     local_idx,
                     len(p_groups),
                     side_n_channels=side_n_channels,
+                )
+            elif p_type == "Buzsaki 5x12":
+                x, y = _buzsaki_5x12_layout_coords(
+                    n_ch,
+                    local_idx,
+                    len(p_groups),
                 )
             else:
                 x, y = _cell_explorer_layout_coords(n_ch, p_type, local_idx)

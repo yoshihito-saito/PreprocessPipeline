@@ -22,3 +22,5 @@
 - [2026-08-13 multi-day CellExplorer source resolution](2026-08-13-multiday-cellexplorer-source.md)
 - [2026-08-13 lazy startup imports and XML GUI synchronization](2026-08-13-lazy-import-and-xml-gui-sync.md)
 - [2026-08-17 CellExplorer spikes v7.3 saving](2026-08-17-cellexplorer-spikes-v73.md)
+- [2026-08-17 Buzsaki 5x12 probe geometry](2026-08-17-buzsaki-5x12-probe-geometry.md)
+- [2026-08-17 A5x12-16-Buz-Lin probe name](2026-08-17-a5x12-16-buz-lin-probe-name.md)

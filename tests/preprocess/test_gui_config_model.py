@@ -15,6 +15,7 @@ from src.execution.models import (
 from src.preprocess.gui.app import (
     CONFIG_DIR,
     MainWindow,
+    PROBE_TYPES,
     _default_config_has_backend_choice,
     _has_slurm_server_commands,
     _move_local_output_to_storage,
@@ -26,6 +27,7 @@ from src.preprocess.gui.config_model import (
     resolve_existing_session_settings,
 )
 from src.preprocess.gui.run_pipeline import _json_safe
+from src.preprocess.io import derive_probe_assignments_from_xml
 
 
 def test_only_an_explicit_saved_backend_suppresses_environment_default(
@@ -41,6 +43,50 @@ def test_only_an_explicit_saved_backend_suppresses_environment_default(
     assert _default_config_has_backend_choice(tmp_path / "missing.json") is False
     assert _default_config_has_backend_choice(legacy) is False
     assert _default_config_has_backend_choice(explicit) is True
+
+
+def test_buzsaki_5x12_xml_description_selects_builtin_geometry(tmp_path: Path) -> None:
+    xml = tmp_path / "buzsaki.xml"
+    xml.write_text(
+        """
+<session>
+  <generalInfo><description>Buzsaki 5×12 poly2</description></generalInfo>
+  <anatomicalDescription>
+    <channelGroups>
+      <group><channels><n>0</n></channels></group>
+    </channelGroups>
+  </anatomicalDescription>
+</session>
+""".strip(),
+        encoding="utf-8",
+    )
+
+    assignments, skipped_channels = derive_probe_assignments_from_xml(xml)
+
+    assert assignments == [{"type": "Buzsaki 5x12", "groups": [0], "x_offset": 0}]
+    assert skipped_channels == []
+    assert "Buzsaki 5x12" in PROBE_TYPES
+
+
+def test_buzsaki_5x12_saved_alias_renders_as_canonical_gui_choice(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    try:
+        window._render_probe_assignments(
+            [{"type": "buzsaki_5x12", "groups": [0, 1, 2, 3, 4], "x_offset": 0}]
+        )
+
+        assert window._probe_rows_to_assignments() == [
+            {"type": "Buzsaki 5x12", "groups": [0, 1, 2, 3, 4], "x_offset": 0}
+        ]
+    finally:
+        window.close()
+        application.processEvents()
 
 
 def _write_multi_day_manifest(

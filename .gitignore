@@ -42,6 +42,8 @@ neurocode
 tests
 !/tests/
 /tests/*
+!/tests/test_buzsaki_5x12_geometry.py
+!/tests/test_middle_finger_probe_name.py
 !/tests/stability/
 /tests/stability/*
 !/tests/stability/test_channel_mad.py

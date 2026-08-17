@@ -69,6 +69,8 @@ from src.preprocess.behavior import (
 )
 from src.preprocess import prepare_chanmap, select_paths_with_gui
 from src.preprocess.io import (
+    A5X12_16_BUZ_LIN_PROBE_TYPE,
+    _normalize_chanmap_layout,
     build_channel_map_data,
     derive_probe_assignments_from_xml,
     save_cell_explorer_chan_coords,
@@ -227,7 +229,8 @@ def _has_slurm_server_commands(
     return all(required)
 
 PROBE_TYPES = (
-    "middle_finger",
+    A5X12_16_BUZ_LIN_PROBE_TYPE,
+    "Buzsaki 5x12",
     "flex-G5",
     "staggered",
     "poly2",
@@ -3478,7 +3481,9 @@ class MainWindow(QMainWindow):
 
         geometry = NoWheelComboBox()
         geometry.addItems(list(PROBE_TYPES))
-        geometry.setCurrentText(str(assignment.get("type") or "staggered"))
+        geometry.setCurrentText(
+            _normalize_chanmap_layout(str(assignment.get("type") or "staggered"))
+        )
 
         groups = QLineEdit()
         raw_groups = assignment.get("groups") or []
