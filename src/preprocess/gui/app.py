@@ -2634,6 +2634,7 @@ class MainWindow(QMainWindow):
         view_multiday.setMaximumWidth(145)
         view_multiday.clicked.connect(self._view_multi_day_sessions)
         self.multi_day_name = QLineEdit()
+        self.multi_day_name.setMinimumWidth(240)
         self.multi_day_name.setPlaceholderText("multi-day name")
 
         self.local_root = QLineEdit()
@@ -2687,8 +2688,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(local_row, 2, 0, 1, 7)
         layout.addWidget(config_row, 3, 0, 1, 7)
         layout.setColumnStretch(2, 1)
-        layout.setColumnStretch(3, 4)
-        layout.setColumnStretch(4, 1)
+        layout.setColumnStretch(3, 3)
+        layout.setColumnStretch(5, 1)
+        layout.setColumnStretch(6, 1)
 
         self.basepath.textChanged.connect(self._schedule_refresh)
         self.local_root.textChanged.connect(self._schedule_refresh)
