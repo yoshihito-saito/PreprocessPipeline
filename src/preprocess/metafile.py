@@ -131,7 +131,7 @@ class MergePointsData:
 
 @dataclass
 class AcquisitionCatalog:
-    source_type: Literal["intan", "openephys"]
+    source_type: Literal["intan", "openephys", "wild"]
     subsession_names: list[str]
     recording_paths: list[Path]
     recording_stream_names: list[str | None]
@@ -166,6 +166,9 @@ class AcquisitionCatalog:
     adc_output_indices_by_subsession: list[list[int]] = field(default_factory=list)
     adc_layout_sources_by_subsession: list[str] = field(default_factory=list)
     analogin_source_paths: list[Path | None] = field(default_factory=list)
+    ephys_sampling_frequencies_by_subsession: list[float | None] = field(default_factory=list)
+    analog_sample_counts_by_subsession: list[int | None] = field(default_factory=list)
+    analog_sampling_frequencies_by_subsession: list[float | None] = field(default_factory=list)
 
 
 @dataclass

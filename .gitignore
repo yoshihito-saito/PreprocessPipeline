@@ -31,6 +31,7 @@ Thumbs.db
 # --- logs & tmp ---
 *.log
 *.tmp
+/pytest_tmp_force_stop*/
 implementation/
 
 # --- secrets (if any) ---
@@ -48,6 +49,7 @@ tests
 !/tests/stability/
 /tests/stability/*
 !/tests/stability/test_channel_mad.py
+!/tests/execution/
 PreprocessPipeline.code-workspace
 Sorting_comparison_KS.ipynb
 .codex

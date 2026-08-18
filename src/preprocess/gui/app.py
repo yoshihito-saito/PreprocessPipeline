@@ -4654,12 +4654,14 @@ class MainWindow(QMainWindow):
             self,
             "Force stop",
             "Stop the current Run and cancel all active Local/Slurm jobs? "
-            "Logs and partial outputs will be kept.",
+            "Logs will be kept. Incomplete preprocessing binary files will be "
+            "removed after worker termination is confirmed.",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         if self._launch_persistent_controller(["--cancel"]):
             self.force_stop.setEnabled(False)
+            self._update_pipeline_run_buttons(persistent_active=True)
             self._append_log(f"Force stop requested for Run: {self._active_run_dir}\n")
             QTimer.singleShot(750, self._refresh_persistent_run_monitor)
 
@@ -4932,11 +4934,16 @@ class MainWindow(QMainWindow):
             for attempt in view.get("attempts") or []:
                 if not attempt.get("jobs"):
                     continue
-                # A cancelled Attempt is emitted only after cancel_confirmed.json
-                # exists, so it is safe to treat even an unknown Local observation
-                # as inactive. Superseded Attempts intentionally do not get this
-                # shortcut because an older backend job may still be alive.
-                if str(attempt.get("status") or "") == StageStatus.CANCELLED.value:
+                # These statuses require an immutable worker terminal fact or a
+                # conclusive backend/cancellation fact. A stale non-terminal
+                # observation must not keep the GUI locked after the worker has
+                # already written failure.json. Superseded Attempts intentionally
+                # do not get this shortcut because an older job may still be alive.
+                if str(attempt.get("status") or "") in {
+                    StageStatus.COMPLETED.value,
+                    StageStatus.FAILED.value,
+                    StageStatus.CANCELLED.value,
+                }:
                     continue
                 status = ((attempt.get("latest_observation") or {}).get("status") or {})
                 terminal = bool(status.get("terminal", False))
@@ -4948,6 +4955,20 @@ class MainWindow(QMainWindow):
                 if not conclusive:
                     return True
         return False
+
+    def _update_pipeline_run_buttons(self, *, persistent_active: bool) -> None:
+        legacy_running = (
+            self._process is not None
+            and self._process.state() != QProcess.ProcessState.NotRunning
+        )
+        enabled = (
+            not persistent_active
+            and not legacy_running
+            and not self._phy_is_running()
+            and not self._cell_explorer_is_running()
+        )
+        for button in (self.run_all, self.run_pre, self.run_post):
+            button.setEnabled(enabled)
 
     def _refresh_persistent_run_monitor(self) -> None:
         current_session = self._current_persistent_session_dir()
@@ -4981,6 +5002,7 @@ class MainWindow(QMainWindow):
             )
             self.move_outputs.setEnabled(not legacy_running)
             self.browse_move_storage.setEnabled(not legacy_running)
+            self._update_pipeline_run_buttons(persistent_active=False)
             return
         if self._active_run_dir is None:
             discovered = self._discover_active_persistent_run()
@@ -4992,6 +5014,7 @@ class MainWindow(QMainWindow):
                 )
                 self.move_outputs.setEnabled(not legacy_running)
                 self.browse_move_storage.setEnabled(not legacy_running)
+                self._update_pipeline_run_buttons(persistent_active=False)
                 return
             self._set_active_run(discovered, session_dir=current_session)
             self._append_log(f"\n=== Reconnected to active Run: {discovered.name} ===\n")
@@ -5005,6 +5028,7 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             self.execution_run_status.setText(f"Run state error: {exc}")
+            self._update_pipeline_run_buttons(persistent_active=True)
             return
 
         run_status = str(state.get("status") or "unknown")
@@ -5079,6 +5103,7 @@ class MainWindow(QMainWindow):
         )
         persistent_active = self._persistent_state_has_active_work(state)
         self.force_stop.setEnabled(legacy_running or persistent_active)
+        self._update_pipeline_run_buttons(persistent_active=persistent_active)
         self.move_outputs.setEnabled(not legacy_running and not persistent_active)
         self.browse_move_storage.setEnabled(not legacy_running and not persistent_active)
 

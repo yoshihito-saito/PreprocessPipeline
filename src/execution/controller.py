@@ -453,6 +453,12 @@ def create_run(
         atomic_write_json(run_dir / "snapshots" / "environment.json", _environment_provenance())
         atomic_write_json(run_dir / "snapshots" / "inputs.json", _input_provenance(settings))
         create_initial_attempts(store)
+        if StageName.PREPROCESS in enabled:
+            _cleanup_preprocess_partials_for_store(
+                store,
+                fact_name="startup_partial_cleanup.json",
+                strict=True,
+            )
         from .session import adopt_existing_outputs
 
         decisions = adopt_existing_outputs(store)
@@ -530,6 +536,75 @@ def _submitted_jobs(store: RunStore, stage: StageName, attempt: int) -> list[Job
     if fact is None:
         return []
     return [JobRef.from_dict(value) for value in fact.get("jobs", [])]
+
+
+def _preprocess_jobs_are_inactive(store: RunStore, backend: Any) -> bool:
+    for attempt in store.list_attempt_numbers(StageName.PREPROCESS):
+        for job in _submitted_jobs(store, StageName.PREPROCESS, attempt):
+            try:
+                status = backend.status(job)
+            except BaseException:
+                return False
+            if not status.terminal:
+                return False
+            if (
+                job.backend != BackendName.LOCAL
+                and status.successful is None
+                and status.state.lower() not in {"cancelled", "canceled"}
+            ):
+                return False
+    return True
+
+
+def _cleanup_preprocess_partials_for_store(
+    store: RunStore,
+    *,
+    fact_name: str,
+    strict: bool,
+) -> dict[str, Any]:
+    from .session import (
+        cleanup_preprocess_binary_partials,
+        session_output_dir,
+        settings_for_store,
+    )
+
+    settings = settings_for_store(store)
+    report = cleanup_preprocess_binary_partials(
+        session_output_dir(settings),
+        settings.basename,
+    )
+    report = {**report, "cleaned_at": utc_now()}
+    if report["removed"]:
+        print(
+            "Removed incomplete preprocess binaries after confirmed worker stop: "
+            f"files={len(report['removed'])}, bytes={report['removed_bytes']}"
+        )
+        for removed_path in report["removed"]:
+            print(f"  removed: {removed_path}")
+    for cleanup_error in report["errors"]:
+        print(
+            "Warning: could not remove incomplete preprocess binary: "
+            f"{cleanup_error['path']}: {cleanup_error['error']}"
+        )
+    attempt = _selected_attempt_number(store, StageName.PREPROCESS)
+    if attempt is not None:
+        path = store.attempt_dir(StageName.PREPROCESS, attempt) / fact_name
+        if not path.exists():
+            store.write_attempt_fact(
+                StageName.PREPROCESS,
+                attempt,
+                fact_name,
+                report,
+            )
+    if strict and report["errors"]:
+        details = "; ".join(
+            f"{item['path']}: {item['error']}" for item in report["errors"]
+        )
+        raise RuntimeError(
+            "Cannot safely start preprocessing while incomplete binary outputs "
+            f"cannot be removed: {details}"
+        )
+    return report
 
 
 def _dependency_jobs(store: RunStore, spec: AttemptSpec) -> list[JobRef]:
@@ -877,6 +952,18 @@ def _reconcile_run_locked(store: RunStore) -> dict[str, Any]:
             StageStatus.LOST.value,
         }:
             _mark_downstream_blocked(store, stage, f"{stage.value} did not complete successfully")
+    preprocess_attempt = _selected_attempt_number(store, StageName.PREPROCESS)
+    if preprocess_attempt is not None:
+        preprocess_dir = store.attempt_dir(StageName.PREPROCESS, preprocess_attempt)
+        if (
+            (preprocess_dir / "cancel_requested.json").exists()
+            and _preprocess_jobs_are_inactive(store, backend)
+        ):
+            _cleanup_preprocess_partials_for_store(
+                store,
+                fact_name="reconcile_partial_cleanup.json",
+                strict=False,
+            )
     state = store.rebuild_state()
     if state.get("status") == StageStatus.COMPLETED.value:
         from .session import finalize_successful_run
@@ -897,9 +984,29 @@ def _cancel_run_locked(
     backend = _backend_for(store)
     state = store.derive_state()
     start_index = STAGE_ORDER.index(stage) if stage is not None else 0
+    cancellation_pending = False
     for target in STAGE_ORDER[start_index:]:
         for attempt_view in state["stages"][target.value]["attempts"]:
-            _cancel_attempt_jobs(store, backend, target, int(attempt_view["attempt"]))
+            cancellation_pending = (
+                _cancel_attempt_jobs(
+                    store,
+                    backend,
+                    target,
+                    int(attempt_view["attempt"]),
+                )
+                or cancellation_pending
+            )
+    preprocess_targeted = stage is None or stage == StageName.PREPROCESS
+    if (
+        preprocess_targeted
+        and not cancellation_pending
+        and _preprocess_jobs_are_inactive(store, backend)
+    ):
+        _cleanup_preprocess_partials_for_store(
+            store,
+            fact_name="cancel_partial_cleanup.json",
+            strict=False,
+        )
     return store.rebuild_state()
 
 
@@ -957,6 +1064,17 @@ def _prepare_retry_locked(
         raise RuntimeError(
             "Retry is waiting for cancellation confirmation of: "
             + ", ".join(cancellation_pending)
+        )
+    if stage == StageName.PREPROCESS:
+        if not _preprocess_jobs_are_inactive(store, backend):
+            raise RuntimeError(
+                "Retry is waiting for the previous preprocess worker to terminate "
+                "before incomplete outputs can be removed"
+            )
+        _cleanup_preprocess_partials_for_store(
+            store,
+            fact_name="retry_partial_cleanup.json",
+            strict=True,
         )
 
     for target in STAGE_ORDER[start_index:]:

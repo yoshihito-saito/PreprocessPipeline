@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import ctypes
 import os
 from pathlib import Path
 import signal
@@ -26,6 +27,63 @@ def _linux_process_start_ticks(pid: int) -> str | None:
         return fields[19]
     except (OSError, IndexError):
         return None
+
+
+def _windows_process_start_time(pid: int) -> str | None:
+    """Return the immutable Windows process creation FILETIME for *pid*."""
+
+    if os.name != "nt" or pid <= 0:
+        return None
+    try:
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        process_query_limited_information = 0x1000
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return None
+        try:
+            created = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            value = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+            return str(value)
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _process_start_token(pid: int) -> str | None:
+    """Return a platform-qualified token that survives controller restarts."""
+
+    if os.name == "nt":
+        created = _windows_process_start_time(pid)
+        return f"windows-filetime:{created}" if created is not None else None
+    ticks = _linux_process_start_ticks(pid)
+    return f"linux-ticks:{ticks}" if ticks is not None else None
 
 
 def _process_exists(pid: int) -> bool:
@@ -117,6 +175,7 @@ class LocalBackend(ExecutionBackend):
             "pid": process.pid,
             "process_group_id": process.pid if os.name != "nt" else None,
             "process_start_ticks": _linux_process_start_ticks(process.pid),
+            "process_start_token": _process_start_token(process.pid),
             "command": command,
         }
         return [
@@ -135,6 +194,10 @@ class LocalBackend(ExecutionBackend):
         owned = self._children.get(job_ref.job_id)
         if owned is not None and owned.pid == pid and owned.poll() is None:
             return True
+        expected_token = job_ref.metadata.get("process_start_token")
+        if expected_token is not None:
+            actual_token = _process_start_token(pid)
+            return actual_token is not None and str(expected_token) == str(actual_token)
         expected = job_ref.metadata.get("process_start_ticks")
         actual = _linux_process_start_ticks(pid)
         # Persistent cancellation must fail closed when process identity cannot
@@ -183,13 +246,24 @@ class LocalBackend(ExecutionBackend):
                 "the live process identity cannot be verified"
             )
         if os.name == "nt":
-            subprocess.run(
+            completed = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 check=False,
                 capture_output=True,
                 text=True,
             )
-            return
+            for _ in range(50):
+                # PID reuse is harmless here: identity matching includes the
+                # persisted Windows creation FILETIME, not only the PID.
+                if not self._identity_matches(job_ref):
+                    return
+                time.sleep(0.1)
+            detail = (completed.stderr or completed.stdout or "").strip()
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(
+                f"Failed to terminate Local job {job_ref.job_id} with taskkill"
+                f" (exit code {completed.returncode}){suffix}"
+            )
         try:
             process_group_id = int(job_ref.metadata.get("process_group_id") or pid)
             os.killpg(process_group_id, signal.SIGTERM)

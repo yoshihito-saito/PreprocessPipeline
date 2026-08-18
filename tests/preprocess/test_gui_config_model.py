@@ -549,6 +549,7 @@ def test_persistent_monitor_handles_confirmed_cancel_and_session_switch(
         assert window._human_stage_status(cancelled_stage) == "Cancelled"
         assert window._persistent_state_has_active_work(cancelled_state) is False
         assert window.force_stop.isEnabled() is False
+        assert window.run_all.isEnabled() is True
         assert window.move_outputs.isEnabled() is True
 
         stop_targets: list[Path | None] = []
@@ -563,10 +564,40 @@ def test_persistent_monitor_handles_confirmed_cancel_and_session_switch(
         assert window._active_run_dir == run_b.resolve()
         assert window.execution_run_status.text().startswith("Running on Slurm")
         assert window.force_stop.isEnabled() is True
+        assert window.run_all.isEnabled() is False
         assert stop_targets == [run_b.resolve()]
     finally:
         window.close()
         application.processEvents()
+
+
+def test_persistent_monitor_treats_worker_failure_as_terminal() -> None:
+    state = {
+        "status": "failed",
+        "stages": {
+            "preprocess": {
+                "enabled": True,
+                "status": "failed",
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "status": "failed",
+                        "jobs": [{"job_id": "35196"}],
+                        "failure": {"status": "failed"},
+                        "latest_observation": {
+                            "status": {
+                                "state": "cancel_failed",
+                                "terminal": False,
+                                "successful": None,
+                            }
+                        },
+                    }
+                ],
+            }
+        },
+    }
+
+    assert MainWindow._persistent_state_has_active_work(state) is False
 
 
 def test_fresh_server_gui_defaults_to_explicit_slurm(monkeypatch) -> None:
