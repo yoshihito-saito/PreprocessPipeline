@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import json
 
+from scipy.io import savemat
+
 from src.execution.backends import SlurmCapabilities
 from src.execution.models import (
     AnalysisConfig,
@@ -424,6 +426,9 @@ def test_persistent_progress_uses_stage_rows_main_log_and_force_stop(
         )
         assert window.execution_stage_job_labels["sorting"].text() == "101"
         assert window.force_stop.isEnabled()
+        assert window.run_all.isEnabled() is False
+        assert window.run_pre.isEnabled() is False
+        assert window.run_post.isEnabled() is False
         assert window.move_outputs.isEnabled() is False
         assert window.browse_move_storage.isEnabled() is False
         log_text = window.log.toPlainText()
@@ -550,6 +555,8 @@ def test_persistent_monitor_handles_confirmed_cancel_and_session_switch(
         assert window._persistent_state_has_active_work(cancelled_state) is False
         assert window.force_stop.isEnabled() is False
         assert window.run_all.isEnabled() is True
+        assert window.run_pre.isEnabled() is True
+        assert window.run_post.isEnabled() is True
         assert window.move_outputs.isEnabled() is True
 
         stop_targets: list[Path | None] = []
@@ -565,6 +572,8 @@ def test_persistent_monitor_handles_confirmed_cancel_and_session_switch(
         assert window.execution_run_status.text().startswith("Running on Slurm")
         assert window.force_stop.isEnabled() is True
         assert window.run_all.isEnabled() is False
+        assert window.run_pre.isEnabled() is False
+        assert window.run_post.isEnabled() is False
         assert stop_targets == [run_b.resolve()]
     finally:
         window.close()
@@ -979,6 +988,19 @@ def test_gui_browse_local_session_resume_is_common_and_reconnects(
     settings = PipelineGuiSettings(basepath=str(raw), local_root=str(session.parent))
     settings.xml_path = str(tmp_path / "unmounted-server" / "day1.xml")
     run_dir = _write_active_resume_session(session, settings)
+    chanmap_path = session / "chanMap.mat"
+    savemat(
+        chanmap_path,
+        {
+            "xcoords": [[0.0], [20.0]],
+            "ycoords": [[0.0], [-20.0]],
+            "kcoords": [[1.0], [1.0]],
+            "probe_ids": [[1.0], [1.0]],
+            "connected": [[1], [0]],
+            "chanMap": [[1], [2]],
+            "chanMap0ind": [[0], [1]],
+        },
+    )
     application = QApplication.instance() or QApplication([])
     window = MainWindow()
     set_active_calls: list[tuple[Path, Path | None]] = []
@@ -1005,6 +1027,9 @@ def test_gui_browse_local_session_resume_is_common_and_reconnects(
         assert window.basepath.text() == str(raw)
         assert window.local_root.text() == str(session.parent.resolve())
         assert window.xml_path.text() == settings.xml_path
+        assert window.chanmap_path.text() == str(chanmap_path)
+        assert window.reject_channels.text() == "1"
+        assert str(chanmap_path) in window.chanmap_canvas.summary.text()
         assert set_active_calls == [(run_dir.resolve(), session.resolve())]
         assert reconcile_calls == [True]
         assert window.browse_local_session_resume.width() >= (

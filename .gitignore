@@ -46,6 +46,12 @@ tests
 /tests/*
 !/tests/test_buzsaki_5x12_geometry.py
 !/tests/test_middle_finger_probe_name.py
+!/tests/execution/
+/tests/execution/*
+!/tests/execution/test_local_backend.py
+!/tests/preprocess/
+/tests/preprocess/*
+!/tests/preprocess/test_gui_move_outputs.py
 !/tests/stability/
 /tests/stability/*
 !/tests/stability/test_channel_mad.py
