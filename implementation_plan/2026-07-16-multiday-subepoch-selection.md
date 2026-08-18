@@ -18,6 +18,11 @@ The only available workaround is to make temporary directories or manually move
 subepoch folders before running, which is error-prone and makes the staged
 manifest less representative of the intended run.
 
+When an explicit selection is saved, runtime discovery currently validates
+every session folder before applying that selection. A session whose rows are
+all unchecked can therefore fail the Run with `No subepochs found`, even though
+none of its data will be staged.
+
 ## Why This Is Needed Now
 
 The GUI is already the main front end for multi-day preprocessing, and the
@@ -84,6 +89,9 @@ The CSV should be written to both the server and local multi-day basepaths as
 - If no explicit subepoch selection exists, all discovered subepochs remain
   selected by default so old saved configs behave the same.
 - Run-time staging uses only checked subepochs when a selection has been saved.
+- With an explicit selection, sessions containing no checked subepochs are not
+  discovered or validated; their original session-order indices remain intact
+  for selected rows from later sessions.
 - Staging writes a human-readable CSV containing the final staged order,
   session identity, source subepoch path, staged subepoch path, source binary,
   source type, channel count, sampling frequency, and sample count.

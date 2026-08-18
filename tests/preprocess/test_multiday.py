@@ -289,6 +289,61 @@ def test_prepare_multi_day_basepath_filters_selected_subepochs_and_removes_stale
     assert (staged.local_basepath / "multi_day_selected_subepochs.csv").exists()
 
 
+def test_prepare_multi_day_basepath_ignores_unused_session_without_subepochs(
+    tmp_path: Path,
+) -> None:
+    unused = tmp_path / "animal_day1"
+    day2 = tmp_path / "animal_day2"
+    day3 = tmp_path / "animal_day3"
+    unused.mkdir()
+    day2.mkdir()
+    day3.mkdir()
+    (unused / "raw_only").mkdir()
+    (unused / "raw_only" / "recording.rhd").write_bytes(b"raw")
+    _write_xml(day2)
+    _write_xml(day3)
+    ep2 = _write_epoch(day2, "ep_240102_120000", n_samples=4)
+    ep3 = _write_epoch(day3, "ep_240103_120000", n_samples=5)
+
+    staged = prepare_multi_day_basepath(
+        session_paths=[unused, day2, day3],
+        selected_subepoch_paths=[ep2, ep3],
+        local_root=tmp_path / "local",
+        name="animal_multiday",
+        overwrite=True,
+    )
+
+    assert [item.session_index for item in staged.subepochs] == [2, 3]
+    assert [Path(item.source_subepoch_path).resolve() for item in staged.subepochs] == [
+        ep2.resolve(),
+        ep3.resolve(),
+    ]
+
+
+def test_prepare_multi_day_basepath_rejects_used_session_without_subepochs(
+    tmp_path: Path,
+) -> None:
+    day1 = tmp_path / "animal_day1"
+    day2 = tmp_path / "animal_day2"
+    day1.mkdir()
+    day2.mkdir()
+    raw_only = day1 / "raw_only"
+    raw_only.mkdir()
+    (raw_only / "recording.rhd").write_bytes(b"raw")
+    _write_xml(day1)
+    _write_xml(day2)
+    ep2 = _write_epoch(day2, "ep_240102_120000")
+
+    with pytest.raises(FileNotFoundError, match="No subepochs found.*animal_day1"):
+        prepare_multi_day_basepath(
+            session_paths=[day1, day2],
+            selected_subepoch_paths=[raw_only, ep2],
+            local_root=tmp_path / "local",
+            name="animal_multiday",
+            overwrite=True,
+        )
+
+
 def test_prepare_multi_day_basepath_rejects_unknown_selected_subepoch(tmp_path: Path) -> None:
     day1 = tmp_path / "animal_day1"
     day2 = tmp_path / "animal_day2"

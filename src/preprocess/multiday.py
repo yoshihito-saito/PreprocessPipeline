@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import json
 import os
@@ -218,6 +218,14 @@ def _resolve_path_set(paths: list[Path] | None) -> set[str]:
     return {str(Path(path).expanduser().resolve()) for path in paths}
 
 
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 def _cleanup_stale_staged_subepochs(
     *,
     manifest_path: Path,
@@ -307,12 +315,32 @@ def prepare_multi_day_basepath(
     sessions = [Path(path).expanduser().resolve() for path in session_paths]
     if len(sessions) < 2:
         raise ValueError("Multi-day staging requires at least two session folders.")
-    for session in sessions:
+    selected_paths = _resolve_path_set(selected_subepoch_paths)
+    selected_path_objects = [Path(path) for path in selected_paths]
+    active_session_entries = [
+        (session_index, session)
+        for session_index, session in enumerate(sessions, start=1)
+        if not selected_path_objects
+        or any(_path_is_within(path, session) for path in selected_path_objects)
+    ]
+    if selected_paths and not active_session_entries:
+        preview = ", ".join(sorted(selected_paths)[:5])
+        suffix = "" if len(selected_paths) <= 5 else f", ... ({len(selected_paths)} total)"
+        raise ValueError(
+            "Selected multi-day subepoch paths were not found under the selected sessions: "
+            f"{preview}{suffix}"
+        )
+    active_sessions = [session for _session_index, session in active_session_entries]
+    for session in active_sessions:
         if not session.exists() or not session.is_dir():
             raise NotADirectoryError(f"Invalid multi-day session folder: {session}")
 
     multiday_name = _safe_name(name) if name else default_multi_day_name(sessions)
-    root = Path(server_root).expanduser().resolve() if server_root is not None else _common_parent(sessions)
+    root = (
+        Path(server_root).expanduser().resolve()
+        if server_root is not None
+        else _common_parent(active_sessions)
+    )
     server_basepath = (root / multiday_name).resolve()
     local_basepath = (Path(local_root).expanduser().resolve() / multiday_name).resolve()
     server_basepath.mkdir(parents=True, exist_ok=True)
@@ -335,12 +363,12 @@ def prepare_multi_day_basepath(
     elif staged_xml.exists():
         reference_xml = staged_xml
     else:
-        reference_xml = _find_session_xml(sessions[0])
+        reference_xml = _find_session_xml(active_sessions[0])
         xml_copy_source = reference_xml
 
     reference_meta = load_xml_metadata(reference_xml)
     if not has_authoritative_xml:
-        for session in sessions:
+        for session in active_sessions:
             meta = load_xml_metadata(_find_session_xml(session))
             if int(meta.n_channels) != int(reference_meta.n_channels) or float(meta.sr) != float(reference_meta.sr):
                 raise ValueError(
@@ -349,14 +377,28 @@ def prepare_multi_day_basepath(
                     f"{session} has n_channels={meta.n_channels}, sr={meta.sr}."
                 )
 
-    first_rhd = find_rhd_source(sessions[0], sessions[0].name, use_first_child_match=True)
+    first_session = active_sessions[0]
+    first_rhd = find_rhd_source(
+        first_session, first_session.name, use_first_child_match=True
+    )
     staged_rhd = server_basepath / f"{multiday_name}.rhd"
 
     subepochs: list[MultiDaySubepoch] = []
     openephys_stream_channels: int | None = None
     openephys_sampling_frequency: float | None = None
-    selected_paths = _resolve_path_set(selected_subepoch_paths)
-    discovered_rows = discover_multi_day_subepochs(sessions, require_subepochs=True)
+    discovered_rows = discover_multi_day_subepochs(
+        active_sessions, require_subepochs=True
+    )
+    original_session_indices = [
+        session_index for session_index, _session in active_session_entries
+    ]
+    discovered_rows = [
+        replace(
+            row,
+            session_index=original_session_indices[row.session_index - 1],
+        )
+        for row in discovered_rows
+    ]
     discovered_source_paths = {
         str(Path(row.source_subepoch_path).expanduser().resolve()) for row in discovered_rows
     }
