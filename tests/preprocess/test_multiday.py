@@ -9,10 +9,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.preprocess.io import discover_subsessions
+from src.preprocess.io import build_acquisition_catalog, discover_subsessions
 from src.preprocess.gui.config_model import PipelineGuiSettings
 from src.preprocess.gui.run_pipeline import run_pipeline
 from src.preprocess.multiday import prepare_multi_day_basepath
+from src.preprocess.recording import (
+    write_concatenated_dat,
+    write_concatenated_dat_analogin,
+)
 import src.preprocess.multiday as multiday
 
 
@@ -61,6 +65,59 @@ def _write_epoch(session: Path, name: str, *, n_channels: int = 4, n_samples: in
     data = np.arange(n_samples * n_channels, dtype=np.int16)
     (epoch / "amplifier.dat").write_bytes(data.tobytes())
     return epoch
+
+
+def test_explicit_subsession_order_uses_portable_relative_paths(tmp_path: Path) -> None:
+    first = _write_epoch(tmp_path, "session_1") / "amplifier.dat"
+    second = _write_epoch(tmp_path, "session_2") / "amplifier.dat"
+    third = _write_epoch(tmp_path, "session_3") / "amplifier.dat"
+
+    discovered = discover_subsessions(
+        basepath=tmp_path,
+        sort_files=True,
+        alt_sort=None,
+        ignore_folders=[],
+        subsession_order=[
+            "session_3/amplifier.dat",
+            "session_1/amplifier.dat",
+            "session_2/amplifier.dat",
+        ],
+    )
+
+    assert discovered == [third, first, second]
+
+
+def test_explicit_subsession_order_rejects_stale_or_incomplete_selection(
+    tmp_path: Path,
+) -> None:
+    _write_epoch(tmp_path, "session_1")
+    _write_epoch(tmp_path, "session_2")
+
+    with pytest.raises(ValueError, match="every discovered recording exactly once"):
+        discover_subsessions(
+            basepath=tmp_path,
+            sort_files=True,
+            alt_sort=None,
+            ignore_folders=[],
+            subsession_order=["session_1/amplifier.dat"],
+        )
+
+
+def test_explicit_subsession_order_rejects_duplicates(tmp_path: Path) -> None:
+    _write_epoch(tmp_path, "session_1")
+    _write_epoch(tmp_path, "session_2")
+
+    with pytest.raises(ValueError, match="duplicate paths"):
+        discover_subsessions(
+            basepath=tmp_path,
+            sort_files=True,
+            alt_sort=None,
+            ignore_folders=[],
+            subsession_order=[
+                "session_1/amplifier.dat",
+                "session_1/amplifier.dat",
+            ],
+        )
 
 
 def _write_openephys_epoch(
@@ -760,3 +817,123 @@ def test_run_pipeline_multi_day_requires_basepath_name(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Multi-day basepath name is required"):
         run_pipeline(settings, "preprocess")
+
+
+@pytest.mark.parametrize(
+    ("ephys_channels", "analog_channels"),
+    [(64, 16), (128, 32), (192, 48)],
+)
+def test_wild_catalog_uses_manifest_analog_width_and_1250_hz(
+    tmp_path: Path,
+    ephys_channels: int,
+    analog_channels: int,
+) -> None:
+    epoch = tmp_path / f"wild_{ephys_channels}ch"
+    epoch.mkdir()
+    ephys_samples = 32
+    analog_samples = 2
+    amplifier_path = epoch / "amplifier.dat"
+    amplifier_path.write_bytes(
+        np.zeros((ephys_samples, ephys_channels), dtype=np.int16).tobytes()
+    )
+    (epoch / "analogin.dat").write_bytes(
+        np.zeros((analog_samples, analog_channels), dtype=np.int16).tobytes()
+    )
+    (epoch / "wild_preprocess_run.json").write_text(
+        json.dumps(
+            {
+                "merge": {
+                    "fs": 20000,
+                    "n_channels": ephys_channels,
+                    "n_samples": ephys_samples,
+                    "analog_channels": analog_channels,
+                    "analog_samples": analog_samples,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    catalog = build_acquisition_catalog(
+        amplifier_paths=[amplifier_path],
+        n_amplifier_channels=ephys_channels,
+        dtype="int16",
+    )
+
+    assert catalog.source_type == "wild"
+    assert catalog.source_adc_channels == [analog_channels]
+    assert catalog.board_adc_channels == analog_channels
+    assert catalog.analog_sample_counts_by_subsession == [analog_samples]
+    assert catalog.analog_sampling_frequencies_by_subsession == [1250.0]
+    assert catalog.ephys_sampling_frequencies_by_subsession == [20000.0]
+
+
+def test_analog_concat_downsamples_non_wild_epochs_to_wild_rate(tmp_path: Path) -> None:
+    wild = np.arange(12, dtype=np.int16).reshape(3, 4)
+    wild_path = tmp_path / "wild-analogin.dat"
+    wild_path.write_bytes(wild.tobytes())
+
+    other = np.arange(32 * 4, dtype=np.int16).reshape(32, 4)
+    other_path = tmp_path / "other-continuous.dat"
+    other_path.write_bytes(other.tobytes())
+    output_path = tmp_path / "analogin.dat"
+
+    result = write_concatenated_dat_analogin(
+        dat_paths=[wild_path, other_path],
+        output_dat_path=output_path,
+        sampling_frequency=1250.0,
+        num_channels=4,
+        overwrite=False,
+        job_kwargs={},
+        sample_counts=[3, 2],
+        source_sample_counts=[3, 32],
+        source_sampling_frequencies=[1250.0, 20000.0],
+        source_num_channels=[4, 4],
+        source_channel_indices=[None, [2, 3]],
+        destination_channel_indices=[[0, 1, 2, 3], [0, 1]],
+    )
+
+    assert result == output_path
+    actual = np.fromfile(output_path, dtype=np.uint16).reshape(-1, 4)
+    expected_other = np.zeros((2, 4), dtype=np.uint16)
+    expected_other[:, :2] = other[[0, 16]][:, [2, 3]].astype(np.uint16)
+    np.testing.assert_array_equal(
+        actual,
+        np.vstack((wild.astype(np.uint16), expected_other)),
+    )
+    layout = json.loads((tmp_path / "analogin.dat.layout.json").read_text(encoding="utf-8"))
+    assert layout["sampling_frequency"] == 1250.0
+    assert layout["sample_counts"] == [3, 2]
+    assert layout["source_sample_counts"] == [3, 32]
+    assert layout["source_sampling_frequencies"] == [1250.0, 20000.0]
+
+
+def test_concatenated_dat_removes_partial_after_keyboard_interrupt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class Recording:
+        def get_num_channels(self) -> int:
+            return 4
+
+    def interrupted_write(_recording, *, file_paths, **_kwargs) -> None:
+        Path(file_paths).write_bytes(b"incomplete")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "src.preprocess.recording.si.write_binary_recording",
+        interrupted_write,
+    )
+    output = tmp_path / "session.dat"
+
+    with pytest.raises(KeyboardInterrupt):
+        write_concatenated_dat(
+            recording=Recording(),
+            output_dat_path=output,
+            dtype="int16",
+            overwrite=False,
+            job_kwargs={},
+        )
+
+    assert not output.exists()
+    assert list(tmp_path.glob("session.dat.partial-*")) == []

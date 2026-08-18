@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import ctypes
 import os
 from pathlib import Path
 import signal
@@ -37,7 +38,6 @@ def _windows_process_identity(pid: int) -> tuple[bool | None, str | None]:
     if not _is_windows() or pid <= 0:
         return False, None
     try:
-        import ctypes
         from ctypes import wintypes
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -89,6 +89,16 @@ def _windows_process_identity(pid: int) -> tuple[bool | None, str | None]:
 def _windows_process_creation_time(pid: int) -> str | None:
     exists, creation_time = _windows_process_identity(pid)
     return creation_time if exists is True else None
+
+
+def _process_start_token(pid: int) -> str | None:
+    """Return a platform-qualified token that survives controller restarts."""
+
+    if _is_windows():
+        created = _windows_process_creation_time(pid)
+        return f"windows-filetime:{created}" if created is not None else None
+    ticks = _linux_process_start_ticks(pid)
+    return f"linux-ticks:{ticks}" if ticks is not None else None
 
 
 def _process_exists(pid: int) -> bool:
@@ -206,6 +216,7 @@ class LocalBackend(ExecutionBackend):
             "pid": process.pid,
             "process_group_id": process.pid if not _is_windows() else None,
             "process_start_ticks": _linux_process_start_ticks(process.pid),
+            "process_start_token": _process_start_token(process.pid),
             "process_creation_time": process_creation_time,
             "command": command,
         }
@@ -232,6 +243,10 @@ class LocalBackend(ExecutionBackend):
                 actual_creation_time is not None
                 and str(expected_creation_time) == str(actual_creation_time)
             )
+        expected_token = job_ref.metadata.get("process_start_token")
+        if expected_token is not None:
+            actual_token = _process_start_token(pid)
+            return actual_token is not None and str(expected_token) == str(actual_token)
         expected = job_ref.metadata.get("process_start_ticks")
         actual = _linux_process_start_ticks(pid)
         # Persistent cancellation must fail closed when process identity cannot
@@ -284,6 +299,11 @@ class LocalBackend(ExecutionBackend):
             expected_creation_time = str(
                 job_ref.metadata.get("process_creation_time") or ""
             )
+            if not expected_creation_time:
+                legacy_token = str(job_ref.metadata.get("process_start_token") or "")
+                prefix = "windows-filetime:"
+                if legacy_token.startswith(prefix):
+                    expected_creation_time = legacy_token[len(prefix) :]
             for _ in range(50):
                 exists, actual_creation_time = _windows_process_identity(pid)
                 if exists is False or (

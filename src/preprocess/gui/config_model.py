@@ -424,6 +424,7 @@ class PipelineGuiSettings:
     multi_day_session_paths: list[str] = field(default_factory=list)
     multi_day_selected_subepoch_paths: list[str] = field(default_factory=list)
     multi_day_name: str = ""
+    subsession_order: list[str] = field(default_factory=list)
     preprocess: PreprocessGuiSettings = field(default_factory=PreprocessGuiSettings)
     behavior: BehaviorGuiSettings = field(default_factory=BehaviorGuiSettings)
     postprocess: PostprocessGuiSettings = field(default_factory=PostprocessGuiSettings)
@@ -535,6 +536,7 @@ class PipelineGuiSettings:
                 if self.existing_session_dir and self.local_output_dir is not None
                 else self.local_root_path
             ),
+            subsession_order=list(self.subsession_order),
             save_raw=p.save_raw,
             analog_inputs=p.analog_inputs,
             digital_inputs=p.digital_inputs,

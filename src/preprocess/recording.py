@@ -371,22 +371,30 @@ def write_concatenated_dat(
     partial_path = output_dat_path.with_name(
         f"{output_dat_path.name}.partial-{uuid.uuid4().hex[:12]}"
     )
-    si.write_binary_recording(
-        recording,
-        file_paths=str(partial_path),
-        add_file_extension=False,
-        dtype=dtype,
-        verbose=True,
-        **job_kwargs,
-    )
-    _validate_existing_binary_size(
-        path=partial_path,
-        dtype=dtype,
-        num_channels=int(recording.get_num_channels()),
-        expected_frames=_recording_num_frames(recording),
-        label="new concatenated dat",
-    )
-    os.replace(partial_path, output_dat_path)
+    try:
+        si.write_binary_recording(
+            recording,
+            file_paths=str(partial_path),
+            add_file_extension=False,
+            dtype=dtype,
+            verbose=True,
+            **job_kwargs,
+        )
+        _validate_existing_binary_size(
+            path=partial_path,
+            dtype=dtype,
+            num_channels=int(recording.get_num_channels()),
+            expected_frames=_recording_num_frames(recording),
+            label="new concatenated dat",
+        )
+        os.replace(partial_path, output_dat_path)
+    except BaseException as exc:
+        try:
+            partial_path.unlink(missing_ok=True)
+        except OSError as cleanup_exc:
+            if hasattr(exc, "add_note"):
+                exc.add_note(f"Could not remove incomplete output {partial_path}: {cleanup_exc}")
+        raise
     return output_dat_path
 
 
@@ -400,12 +408,14 @@ def _write_concatenated_sidecar_dat(
     overwrite: bool,
     job_kwargs: dict[str, Any],
     sample_counts: list[int] | None = None,
+    source_sample_counts: list[int | None] | None = None,
+    source_sampling_frequencies: list[float | None] | None = None,
     source_num_channels: list[int | None] | None = None,
     source_channel_indices: list[list[int] | None] | None = None,
     destination_channel_indices: list[list[int] | None] | None = None,
     source_dtype: str = "int16",
 ) -> Path | None:
-    del sampling_frequency, job_kwargs
+    del job_kwargs
     if not dat_paths:
         return None
     if not any(p is not None and Path(p).exists() for p in dat_paths):
@@ -415,7 +425,10 @@ def _write_concatenated_sidecar_dat(
         "schema_version": 1,
         "dtype": str(np.dtype(dtype)),
         "num_channels": int(num_channels),
+        "sampling_frequency": float(sampling_frequency),
         "sample_counts": None if sample_counts is None else [int(n) for n in sample_counts],
+        "source_sample_counts": None if source_sample_counts is None else [None if n is None else int(n) for n in source_sample_counts],
+        "source_sampling_frequencies": None if source_sampling_frequencies is None else [None if rate is None else float(rate) for rate in source_sampling_frequencies],
         "source_num_channels": None if source_num_channels is None else [None if n is None else int(n) for n in source_num_channels],
         "source_channel_indices": source_channel_indices,
         "destination_channel_indices": destination_channel_indices,
@@ -463,6 +476,16 @@ def _write_concatenated_sidecar_dat(
             "sample_counts must have the same length as sidecar dat_paths: "
             f"{len(sample_counts)} != {len(dat_paths)}"
         )
+    if source_sample_counts is not None and len(source_sample_counts) != len(dat_paths):
+        raise ValueError(
+            "source_sample_counts must have the same length as sidecar dat_paths: "
+            f"{len(source_sample_counts)} != {len(dat_paths)}"
+        )
+    if source_sampling_frequencies is not None and len(source_sampling_frequencies) != len(dat_paths):
+        raise ValueError(
+            "source_sampling_frequencies must have the same length as sidecar dat_paths: "
+            f"{len(source_sampling_frequencies)} != {len(dat_paths)}"
+        )
     if source_num_channels is not None and len(source_num_channels) != len(dat_paths):
         raise ValueError(
             "source_num_channels must have the same length as sidecar dat_paths: "
@@ -492,18 +515,45 @@ def _write_concatenated_sidecar_dat(
     try:
         with open(partial_path, "wb") as fout:
             for idx, path in enumerate(dat_paths):
-                expected_samples = None if sample_counts is None else int(sample_counts[idx])
+                expected_output_samples = None if sample_counts is None else int(sample_counts[idx])
+                expected_source_samples = (
+                    expected_output_samples
+                    if source_sample_counts is None
+                    else (
+                        None
+                        if source_sample_counts[idx] is None
+                        else int(source_sample_counts[idx])
+                    )
+                )
+                source_rate = (
+                    float(sampling_frequency)
+                    if source_sampling_frequencies is None
+                    or source_sampling_frequencies[idx] is None
+                    else float(source_sampling_frequencies[idx])
+                )
+                if sampling_frequency <= 0 or source_rate <= 0:
+                    raise ValueError(
+                        f"Sidecar sampling frequencies must be positive: "
+                        f"source={source_rate}, output={sampling_frequency}"
+                    )
+                rate_ratio = source_rate / float(sampling_frequency)
+                downsample_stride = int(round(rate_ratio))
+                if downsample_stride < 1 or not np.isclose(rate_ratio, downsample_stride):
+                    raise ValueError(
+                        "Only integer-factor sidecar downsampling is supported: "
+                        f"source={source_rate} Hz, output={sampling_frequency} Hz"
+                    )
                 src_channels = None if source_num_channels is None else source_num_channels[idx]
                 selected_channels = None if source_channel_indices is None else source_channel_indices[idx]
                 destination_channels = (
                 None if destination_channel_indices is None else destination_channel_indices[idx]
                 )
                 if path is None or not Path(path).exists():
-                    if expected_samples is None:
+                    if expected_output_samples is None:
                         continue
                     _write_zero_sidecar_frames(
                     fout,
-                    n_samples=expected_samples,
+                    n_samples=expected_output_samples,
                     num_channels=int(num_channels),
                     dtype=dtype_np,
                     )
@@ -512,7 +562,7 @@ def _write_concatenated_sidecar_dat(
                 p = Path(path)
                 if selected_channels is not None or destination_channels is not None or (
                 src_channels is not None and int(src_channels) != int(num_channels)
-                ):
+                ) or downsample_stride != 1 or expected_source_samples != expected_output_samples:
                     if src_channels is None:
                         raise ValueError(f"source_num_channels is required for selected sidecar extraction: {p}")
                     channels_to_copy = (
@@ -529,7 +579,9 @@ def _write_concatenated_sidecar_dat(
                     output_num_channels=int(num_channels),
                     source_dtype=source_dtype_np,
                     output_dtype=dtype_np,
-                    expected_samples=expected_samples,
+                    expected_source_samples=expected_source_samples,
+                    expected_output_samples=expected_output_samples,
+                    downsample_stride=downsample_stride,
                     )
                     continue
 
@@ -540,10 +592,10 @@ def _write_concatenated_sidecar_dat(
                     f"size={size}, frame_bytes={frame_bytes}"
                     )
                 actual_samples = size // frame_bytes
-                if expected_samples is not None and int(actual_samples) != int(expected_samples):
+                if expected_source_samples is not None and int(actual_samples) != int(expected_source_samples):
                     raise ValueError(
-                    f"{p} sample count does not match amplifier epoch length: "
-                    f"{actual_samples} != {expected_samples}"
+                        f"{p} sample count does not match source sidecar metadata: "
+                        f"{actual_samples} != {expected_source_samples}"
                     )
                 with open(p, "rb") as fin:
                     while True:
@@ -600,12 +652,16 @@ def _write_selected_sidecar_frames(
     output_num_channels: int,
     source_dtype: np.dtype,
     output_dtype: np.dtype,
-    expected_samples: int | None,
+    expected_source_samples: int | None,
+    expected_output_samples: int | None,
+    downsample_stride: int,
 ) -> None:
     if source_num_channels <= 0:
         raise ValueError(f"source_num_channels must be > 0 for sidecar extraction: {source_num_channels}")
     if output_num_channels <= 0:
         raise ValueError(f"output_num_channels must be > 0 for sidecar extraction: {output_num_channels}")
+    if downsample_stride <= 0:
+        raise ValueError(f"downsample_stride must be positive: {downsample_stride}")
     if len(selected_channel_indices) > output_num_channels:
         raise ValueError(
             "Selected sidecar channel count exceeds output channel count: "
@@ -632,13 +688,15 @@ def _write_selected_sidecar_frames(
             f"size={size}, frame_bytes={source_frame_bytes}"
         )
     actual_samples = size // source_frame_bytes
-    if expected_samples is not None and int(actual_samples) != int(expected_samples):
+    if expected_source_samples is not None and int(actual_samples) != int(expected_source_samples):
         raise ValueError(
-            f"{path} sample count does not match amplifier epoch length: "
-            f"{actual_samples} != {expected_samples}"
+            f"{path} sample count does not match source sidecar metadata: "
+            f"{actual_samples} != {expected_source_samples}"
         )
 
     frames_per_chunk = max(1, (1024 * 1024) // source_frame_bytes)
+    source_offset = 0
+    written_samples = 0
     with open(path, "rb") as fin:
         while True:
             chunk = fin.read(frames_per_chunk * source_frame_bytes)
@@ -648,6 +706,14 @@ def _write_selected_sidecar_frames(
             if raw.size % source_num_channels != 0:
                 raise ValueError(f"Partial sidecar frame encountered while reading {path}")
             source = raw.reshape(-1, source_num_channels)
+            first_selected = (-source_offset) % downsample_stride
+            source = source[first_selected::downsample_stride]
+            source_offset += raw.size // source_num_channels
+            if expected_output_samples is not None:
+                remaining = int(expected_output_samples) - written_samples
+                if remaining <= 0:
+                    break
+                source = source[:remaining]
             selected = source[:, selected_channel_indices]
             if selected.shape[1] == output_num_channels and destination_channel_indices is None:
                 output = selected.astype(output_dtype, copy=False)
@@ -657,6 +723,13 @@ def _write_selected_sidecar_frames(
                     destinations = destination_channel_indices or list(range(selected.shape[1]))
                     output[:, destinations] = selected.astype(output_dtype, copy=False)
             fout.write(output.tobytes(order="C"))
+            written_samples += int(output.shape[0])
+    if expected_output_samples is not None and written_samples != int(expected_output_samples):
+        raise ValueError(
+            f"{path} cannot provide the requested resampled sidecar length: "
+            f"wrote={written_samples}, expected={expected_output_samples}, "
+            f"source_samples={actual_samples}, stride={downsample_stride}"
+        )
 
 
 def _write_zero_sidecar_frames(
@@ -709,6 +782,8 @@ def write_concatenated_dat_analogin(
     overwrite: bool,
     job_kwargs: dict[str, Any],
     sample_counts: list[int] | None = None,
+    source_sample_counts: list[int | None] | None = None,
+    source_sampling_frequencies: list[float | None] | None = None,
     source_num_channels: list[int | None] | None = None,
     source_channel_indices: list[list[int] | None] | None = None,
     destination_channel_indices: list[list[int] | None] | None = None,
@@ -722,6 +797,8 @@ def write_concatenated_dat_analogin(
         overwrite=overwrite,
         job_kwargs=job_kwargs,
         sample_counts=sample_counts,
+        source_sample_counts=source_sample_counts,
+        source_sampling_frequencies=source_sampling_frequencies,
         source_num_channels=source_num_channels,
         source_channel_indices=source_channel_indices,
         destination_channel_indices=destination_channel_indices,
@@ -1091,32 +1168,40 @@ def write_lfp(
     )
     rec_lfp = spre.resample(rec_lfp_prefiltered, resample_rate=lfp_rate)
     partial_path = lfp_path.with_name(f"{lfp_path.name}.partial-{uuid.uuid4().hex[:12]}")
-    si.write_binary_recording(
-        rec_lfp,
-        file_paths=str(partial_path),
-        add_file_extension=False,
-        dtype=dtype,
-        verbose=True,
-        **job_kwargs,
-    )
-    n_channels = (
-        int(recording_raw.get_num_channels())
-        if hasattr(recording_raw, "get_num_channels")
-        else 1
-    )
-    raw_frames = _recording_num_frames(recording_raw)
-    expected_lfp_frames = (
-        int(round(float(raw_frames) * float(lfp_rate) / input_fs))
-        if raw_frames is not None and input_fs > 0
-        else None
-    )
-    _validate_existing_binary_size(
-        path=partial_path,
-        dtype=dtype,
-        num_channels=n_channels,
-        expected_frames=expected_lfp_frames,
-        frame_tolerance=1,
-        label="new lfp",
-    )
-    os.replace(partial_path, lfp_path)
+    try:
+        si.write_binary_recording(
+            rec_lfp,
+            file_paths=str(partial_path),
+            add_file_extension=False,
+            dtype=dtype,
+            verbose=True,
+            **job_kwargs,
+        )
+        n_channels = (
+            int(recording_raw.get_num_channels())
+            if hasattr(recording_raw, "get_num_channels")
+            else 1
+        )
+        raw_frames = _recording_num_frames(recording_raw)
+        expected_lfp_frames = (
+            int(round(float(raw_frames) * float(lfp_rate) / input_fs))
+            if raw_frames is not None and input_fs > 0
+            else None
+        )
+        _validate_existing_binary_size(
+            path=partial_path,
+            dtype=dtype,
+            num_channels=n_channels,
+            expected_frames=expected_lfp_frames,
+            frame_tolerance=1,
+            label="new lfp",
+        )
+        os.replace(partial_path, lfp_path)
+    except BaseException as exc:
+        try:
+            partial_path.unlink(missing_ok=True)
+        except OSError as cleanup_exc:
+            if hasattr(exc, "add_note"):
+                exc.add_note(f"Could not remove incomplete output {partial_path}: {cleanup_exc}")
+        raise
     return lfp_path

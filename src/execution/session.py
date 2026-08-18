@@ -593,6 +593,9 @@ def validate_output_inventory(inventory: dict[str, Any], *, label: str) -> list[
                     n_channels = int(payload["num_channels"])
                     if n_channels <= 0:
                         raise ValueError("num_channels must be positive")
+                    sampling_frequency = payload.get("sampling_frequency")
+                    if sampling_frequency is not None and float(sampling_frequency) <= 0:
+                        raise ValueError("sampling_frequency must be positive")
                     sample_counts = payload["sample_counts"]
                     if not isinstance(sample_counts, list) or any(
                         int(value) < 0 for value in sample_counts
@@ -600,6 +603,8 @@ def validate_output_inventory(inventory: dict[str, Any], *, label: str) -> list[
                         raise ValueError("sample_counts must be a nonnegative list")
                     n_epochs = len(sample_counts)
                     for field in (
+                        "source_sample_counts",
+                        "source_sampling_frequencies",
                         "source_num_channels",
                         "source_channel_indices",
                         "destination_channel_indices",
@@ -651,6 +656,75 @@ def session_output_dir(settings: Any) -> Path:
     if output is None:
         raise ValueError("The session output directory cannot be resolved")
     return Path(output).expanduser().resolve()
+
+
+_BINARY_PARTIAL_TOKEN = re.compile(r"^(?:[0-9a-fA-F]{12}|[0-9a-fA-F]{32})$")
+
+
+def cleanup_preprocess_binary_partials(
+    session_dir: Path | str,
+    basename: str,
+) -> dict[str, Any]:
+    """Remove producer-owned incomplete binary outputs from one session root.
+
+    This intentionally handles only binary files whose canonical targets are
+    owned by preprocessing.  It never recurses and never removes a canonical
+    output, so unrelated user files and completed data remain untouched.
+    """
+
+    root = Path(session_dir).expanduser().resolve()
+    clean_basename = str(basename).strip()
+    if not clean_basename or Path(clean_basename).name != clean_basename:
+        raise ValueError(f"Invalid preprocess basename for partial cleanup: {basename!r}")
+    if not root.exists():
+        return {"removed": [], "removed_bytes": 0, "errors": []}
+    if not root.is_dir():
+        raise NotADirectoryError(f"Preprocess session output is not a directory: {root}")
+
+    target_names = {
+        f"{clean_basename}.dat",
+        f"{clean_basename}_raw.dat",
+        f"{clean_basename}.lfp",
+        "analogin.dat",
+        "digitalin.dat",
+        "auxiliary.dat",
+        "supply.dat",
+        "time.dat",
+    }
+
+    def owned_partial(name: str) -> bool:
+        folded = name.casefold()
+        for target in target_names:
+            target_folded = target.casefold()
+            for prefix in (
+                f"{target_folded}.partial-",
+                f".{target_folded}.partial-",
+            ):
+                if folded.startswith(prefix):
+                    return _BINARY_PARTIAL_TOKEN.fullmatch(name[len(prefix) :]) is not None
+        return False
+
+    removed: list[str] = []
+    errors: list[dict[str, str]] = []
+    removed_bytes = 0
+    for candidate in root.iterdir():
+        if not owned_partial(candidate.name):
+            continue
+        if candidate.is_dir() and not candidate.is_symlink():
+            continue
+        try:
+            size = int(candidate.lstat().st_size)
+            candidate.unlink()
+        except OSError as exc:
+            errors.append({"path": str(candidate), "error": str(exc)})
+        else:
+            removed.append(str(candidate))
+            removed_bytes += size
+    return {
+        "removed": removed,
+        "removed_bytes": removed_bytes,
+        "errors": errors,
+    }
 
 
 _PREPROCESS_CONTRACT_NAME = ".preprocess-output-contract.json"
@@ -905,8 +979,16 @@ def _claim_blocks_new_run(claim: dict[str, Any]) -> bool:
                 store.read_attempt_fact(stage, attempt, "cancel_confirmed.json")
                 is not None
             )
+            worker_terminal = any(
+                store.read_attempt_fact(stage, attempt, name) is not None
+                for name in ("result.json", "failure.json")
+            )
             if submitted is not None:
-                if not backend_conclusive_terminal and not cancel_confirmed:
+                if (
+                    not backend_conclusive_terminal
+                    and not cancel_confirmed
+                    and not worker_terminal
+                ):
                     return True
             started = store.read_attempt_fact(stage, attempt, "started.json")
             if started is not None and not any(

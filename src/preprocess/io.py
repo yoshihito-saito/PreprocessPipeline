@@ -1540,6 +1540,49 @@ def _find_local_intan_rhd(recording_dir: Path) -> Path | None:
     return matches[0] if len(matches) == 1 else None
 
 
+@dataclass(frozen=True)
+class WildMergedInfo:
+    ephys_sampling_frequency: float
+    ephys_num_channels: int
+    ephys_sample_count: int
+    analog_sampling_frequency: float
+    analog_num_channels: int
+    analog_sample_count: int
+
+
+def _resolve_wild_merged_info(recording_dir: Path) -> WildMergedInfo | None:
+    manifest_path = recording_dir / "wild_preprocess_run.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        merge = payload["merge"]
+        ephys_rate = float(merge["fs"])
+        ephys_channels = int(merge["n_channels"])
+        ephys_samples = int(merge["n_samples"])
+        analog_channels = int(merge["analog_channels"])
+        analog_samples = int(merge["analog_samples"])
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid WILD preprocess manifest: {manifest_path}: {exc}") from exc
+    if min(ephys_rate, ephys_channels, ephys_samples, analog_channels, analog_samples) <= 0:
+        raise ValueError(f"WILD preprocess manifest has non-positive merged dimensions: {manifest_path}")
+    analog_rate = 1250.0
+    expected_analog_samples = int(round(ephys_samples * analog_rate / ephys_rate))
+    if abs(analog_samples - expected_analog_samples) > 1:
+        raise ValueError(
+            f"WILD analog duration is inconsistent with 1250 Hz metadata: "
+            f"manifest={analog_samples}, expected={expected_analog_samples} ({manifest_path})"
+        )
+    return WildMergedInfo(
+        ephys_sampling_frequency=ephys_rate,
+        ephys_num_channels=ephys_channels,
+        ephys_sample_count=ephys_samples,
+        analog_sampling_frequency=analog_rate,
+        analog_num_channels=analog_channels,
+        analog_sample_count=analog_samples,
+    )
+
+
 def _resolve_intan_adc_layout(
     *, analog_path: Path | None, sample_count: int, recording_dir: Path
 ) -> tuple[int, list[int], str]:
@@ -1720,6 +1763,7 @@ def discover_subsessions(
     sort_files: bool,
     alt_sort: list[int] | None,
     ignore_folders: list[str] | None,
+    subsession_order: list[str] | None = None,
 ) -> list[Path]:
     ignore_folders = ignore_folders or []
 
@@ -1752,13 +1796,60 @@ def discover_subsessions(
     if not paths:
         return []
 
-    if alt_sort:
+    if subsession_order:
+        paths = _apply_explicit_subsession_order(
+            paths,
+            basepath=basepath,
+            subsession_order=subsession_order,
+        )
+    elif alt_sort:
         idx = _normalize_alt_sort_indices(alt_sort, len(paths))
         paths = [paths[i] for i in idx]
     else:
         paths = sorted(paths, key=_subsession_sort_key)
 
     return paths
+
+
+def _apply_explicit_subsession_order(
+    discovered_paths: list[Path],
+    *,
+    basepath: Path,
+    subsession_order: list[str],
+) -> list[Path]:
+    base = Path(basepath).expanduser().resolve()
+
+    def resolve_order_entry(value: str) -> Path:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("subsession_order must not contain empty paths")
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = base / path
+        return path.resolve()
+
+    discovered_by_path = {
+        Path(path).expanduser().resolve(): Path(path) for path in discovered_paths
+    }
+    requested = [resolve_order_entry(value) for value in subsession_order]
+    if len(set(requested)) != len(requested):
+        raise ValueError("subsession_order contains duplicate paths")
+
+    requested_set = set(requested)
+    discovered_set = set(discovered_by_path)
+    if requested_set != discovered_set:
+        missing = sorted(str(path) for path in discovered_set - requested_set)
+        unexpected = sorted(str(path) for path in requested_set - discovered_set)
+        details: list[str] = []
+        if missing:
+            details.append("missing=" + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected=" + ", ".join(unexpected))
+        raise ValueError(
+            "subsession_order must contain every discovered recording exactly once: "
+            + "; ".join(details)
+        )
+    return [discovered_by_path[path] for path in requested]
 
 
 def _normalize_alt_sort_indices(alt_sort: list[int], n: int) -> list[int]:
@@ -1851,6 +1942,9 @@ def build_acquisition_catalog(
     adc_layout_sources_by_subsession: list[str] = []
     analogin_source_paths: list[Path | None] = []
     analogin_paths: list[Path] = []
+    ephys_sampling_frequencies_by_subsession: list[float | None] = []
+    analog_sample_counts_by_subsession: list[int | None] = []
+    analog_sampling_frequencies_by_subsession: list[float | None] = []
     digitalin_paths: list[Path] = []
     auxiliary_paths: list[Path] = []
     supply_paths: list[Path] = []
@@ -1896,6 +1990,13 @@ def build_acquisition_catalog(
             adc_output_indices_by_subsession.append([])
             adc_layout_sources_by_subsession.append(adc_layout_source)
             analogin_source_paths.append(info.continuous_dat if info.adc_channel_indices else None)
+            ephys_sampling_frequencies_by_subsession.append(float(info.sampling_frequency))
+            analog_sample_counts_by_subsession.append(
+                sample_counts[-1] if info.adc_channel_indices else None
+            )
+            analog_sampling_frequencies_by_subsession.append(
+                float(info.sampling_frequency) if info.adc_channel_indices else None
+            )
             continue
 
         sample_count = _infer_sample_count_from_binary(
@@ -1910,14 +2011,39 @@ def build_acquisition_catalog(
         supply = d / "supply.dat"
         tdat = d / "time.dat"
 
+        wild_info = _resolve_wild_merged_info(d)
         intan_adc_channels = 0
         if analog.exists():
             analogin_paths.append(analog)
-        intan_adc_channels, intan_adc_orders, intan_adc_layout_source = _resolve_intan_adc_layout(
-            analog_path=analog if analog.exists() else None,
-            sample_count=sample_count,
-            recording_dir=d,
-        )
+        if wild_info is not None:
+            if sample_count != wild_info.ephys_sample_count:
+                raise ValueError(
+                    f"WILD amplifier sample count disagrees with {d / 'wild_preprocess_run.json'}: "
+                    f"{sample_count} != {wild_info.ephys_sample_count}"
+                )
+            if int(n_amplifier_channels) != wild_info.ephys_num_channels:
+                raise ValueError(
+                    f"WILD amplifier channel count disagrees with XML: "
+                    f"manifest={wild_info.ephys_num_channels}, xml={n_amplifier_channels}"
+                )
+            intan_adc_channels = wild_info.analog_num_channels if analog.exists() else 0
+            intan_adc_orders = list(range(intan_adc_channels))
+            intan_adc_layout_source = "wild_preprocess_manifest"
+            if analog.exists():
+                expected_bytes = (
+                    wild_info.analog_sample_count * wild_info.analog_num_channels * np.dtype("int16").itemsize
+                )
+                if analog.stat().st_size != expected_bytes:
+                    raise ValueError(
+                        f"WILD analogin.dat size disagrees with manifest: "
+                        f"{analog.stat().st_size} != {expected_bytes} ({analog})"
+                    )
+        else:
+            intan_adc_channels, intan_adc_orders, intan_adc_layout_source = _resolve_intan_adc_layout(
+                analog_path=analog if analog.exists() else None,
+                sample_count=sample_count,
+                recording_dir=d,
+            )
         if digital.exists():
             digitalin_paths.append(digital)
         if aux.exists():
@@ -1927,7 +2053,7 @@ def build_acquisition_catalog(
         if tdat.exists():
             time_paths.append(tdat)
 
-        source_types.append("intan")
+        source_types.append("wild" if wild_info is not None else "intan")
         subsession_names.append(d.name)
         recording_paths.append(d)
         recording_stream_names.append(None)
@@ -1944,8 +2070,22 @@ def build_acquisition_catalog(
         adc_output_indices_by_subsession.append([])
         adc_layout_sources_by_subsession.append(intan_adc_layout_source)
         analogin_source_paths.append(analog if analog.exists() else None)
-        intan_paths.append(path)
-        intan_sample_counts.append(sample_count)
+        ephys_sampling_frequencies_by_subsession.append(
+            wild_info.ephys_sampling_frequency if wild_info is not None else None
+        )
+        analog_sample_counts_by_subsession.append(
+            wild_info.analog_sample_count
+            if wild_info is not None and analog.exists()
+            else (sample_count if analog.exists() else None)
+        )
+        analog_sampling_frequencies_by_subsession.append(
+            wild_info.analog_sampling_frequency
+            if wild_info is not None and analog.exists()
+            else None
+        )
+        if wild_info is None:
+            intan_paths.append(path)
+            intan_sample_counts.append(sample_count)
 
     sidecar_sample_counts = {p.parent: int(n) for p, n in zip(intan_paths, intan_sample_counts, strict=True)}
 
@@ -1957,7 +2097,10 @@ def build_acquisition_catalog(
 
     aux_ch = _infer_channels_for_sidecar(auxiliary_paths)
     supply_ch = _infer_channels_for_sidecar(supply_paths)
-    adc_ch = _infer_channels_for_sidecar(analogin_paths)
+    # ADC width is resolved from each source's native identities below.  In
+    # particular, WILD analogin.dat uses 1250 Hz and cannot be inferred using
+    # the amplifier sample count.
+    adc_ch = 0
     adc_native_orders: list[int] = []
 
     if intan_header is not None:
@@ -2018,6 +2161,11 @@ def build_acquisition_catalog(
         sampling_frequency = openephys_sampling_frequency
         ttl_event_paths = [path for path in ttl_event_paths_by_subsession if path is not None]
         amplifier_channels = unique_ephys_channels[0] if unique_ephys_channels else int(n_amplifier_channels)
+    elif source_types and all(source_type == "wild" for source_type in source_types):
+        catalog_source_type = "wild"
+        sampling_frequency = None
+        ttl_event_paths = []
+        amplifier_channels = int(n_amplifier_channels)
     else:
         catalog_source_type = "intan"
         sampling_frequency = openephys_sampling_frequency
@@ -2063,6 +2211,9 @@ def build_acquisition_catalog(
         adc_output_indices_by_subsession=adc_output_indices_by_subsession,
         adc_layout_sources_by_subsession=adc_layout_sources_by_subsession,
         analogin_source_paths=analogin_source_paths,
+        ephys_sampling_frequencies_by_subsession=ephys_sampling_frequencies_by_subsession,
+        analog_sample_counts_by_subsession=analog_sample_counts_by_subsession,
+        analog_sampling_frequencies_by_subsession=analog_sampling_frequencies_by_subsession,
     )
 
 

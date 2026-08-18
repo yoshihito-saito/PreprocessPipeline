@@ -114,10 +114,10 @@ def _catalog_analogin_source_num_channels(catalog, source_types: list[str]) -> l
 
     out: list[int | None] = []
     for idx, source_type in enumerate(source_types):
+        adc_channels = int(source_adc_channels[idx])
         if source_type == "openephys":
-            out.append(int(source_total_channels[idx]))
+            out.append(int(source_total_channels[idx]) if adc_channels > 0 else None)
         else:
-            adc_channels = int(source_adc_channels[idx])
             out.append(adc_channels if adc_channels > 0 else None)
     return out
 
@@ -176,6 +176,77 @@ def _catalog_analogin_destination_indices(catalog) -> list[list[int] | None] | N
             )
         normalized.append(mapping if source_count > 0 else None)
     return normalized
+
+
+def _catalog_aligned_optional_values(catalog, field: str) -> list[float | int | None] | None:
+    values = getattr(catalog, field, None)
+    if not values:
+        return None
+    n_subsessions = len(catalog.amplifier_paths)
+    if len(values) != n_subsessions:
+        raise ValueError(
+            f"catalog.{field} must align with catalog.amplifier_paths: "
+            f"{len(values)} != {n_subsessions}"
+        )
+    return list(values)
+
+
+def _catalog_analogin_source_sample_counts(catalog) -> list[int | None]:
+    values = _catalog_aligned_optional_values(catalog, "analog_sample_counts_by_subsession")
+    if values is None:
+        return [int(value) for value in catalog.sample_counts]
+    return [None if value is None else int(value) for value in values]
+
+
+def _catalog_analogin_source_sampling_frequencies(
+    catalog,
+    source_types: list[str],
+    *,
+    intan_sampling_frequency: float,
+) -> list[float | None]:
+    values = _catalog_aligned_optional_values(
+        catalog, "analog_sampling_frequencies_by_subsession"
+    )
+    if values is None:
+        values = [None for _ in source_types]
+    return [
+        (
+            float(values[idx])
+            if values[idx] is not None
+            else (
+                float(intan_sampling_frequency)
+                if source_type == "intan"
+                else None
+            )
+        )
+        for idx, source_type in enumerate(source_types)
+    ]
+
+
+def _analog_output_sample_counts(
+    catalog,
+    source_types: list[str],
+    source_sample_counts: list[int | None],
+    *,
+    ephys_sampling_frequency: float,
+    analog_sampling_frequency: float,
+) -> list[int]:
+    output: list[int] = []
+    for idx, source_type in enumerate(source_types):
+        source_count = source_sample_counts[idx]
+        if source_type == "wild" and source_count is not None:
+            output.append(int(source_count))
+        else:
+            output.append(
+                int(
+                    round(
+                        int(catalog.sample_counts[idx])
+                        * float(analog_sampling_frequency)
+                        / float(ephys_sampling_frequency)
+                    )
+                )
+            )
+    return output
 
 
 def _catalog_openephys_ttl_inputs(
@@ -519,6 +590,7 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         sort_files=config.sort_files,
         alt_sort=config.alt_sort,
         ignore_folders=config.ignore_folders,
+        subsession_order=config.subsession_order,
     )
     print("Subsession file order:")
     for idx, path in enumerate(subsession_paths, start=1):
@@ -538,6 +610,9 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     )
     print_catalog_summary(catalog)
     catalog_source_types = _catalog_source_types(catalog)
+    source_ephys_rates = _catalog_aligned_optional_values(
+        catalog, "ephys_sampling_frequencies_by_subsession"
+    )
     openephys_ttl_paths, openephys_sample_counts = _catalog_openephys_ttl_inputs(
         catalog,
         catalog_source_types,
@@ -557,16 +632,37 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
     if catalog.source_type == "openephys":
         effective_sr = float(catalog.sampling_frequency if catalog.sampling_frequency is not None else xml_meta.sr)
         effective_n_channels = int(catalog.amplifier_channels)
-        analog_sr = effective_sr
         digital_sr = effective_sr
     else:
         effective_sr = float(xml_meta.sr)
         effective_n_channels = int(xml_meta.n_channels)
-        analog_sr = effective_sr
         digital_sr = effective_sr
         if intan_header is not None:
-            analog_sr = float(intan_header.board_adc_sample_rate)
             digital_sr = float(intan_header.board_dig_in_sample_rate)
+
+    if source_ephys_rates is not None:
+        mismatched_rates = [
+            (catalog.subsession_names[idx], float(rate))
+            for idx, rate in enumerate(source_ephys_rates)
+            if rate is not None and not np.isclose(float(rate), effective_sr)
+        ]
+        if mismatched_rates:
+            raise ValueError(
+                "Recording sampling frequency disagrees with the XML/common timebase: "
+                f"expected={effective_sr}, sources={mismatched_rates}"
+            )
+
+    intan_analog_sr = (
+        float(intan_header.board_adc_sample_rate)
+        if intan_header is not None
+        else effective_sr
+    )
+    # WILD merged analogin.dat has its own fixed 1250 Hz timebase.  When WILD
+    # and another acquisition type are mixed, normalize every analog epoch to
+    # this rate before concatenation.
+    analog_sr = 1250.0 if "wild" in catalog_source_types else (
+        effective_sr if catalog.source_type == "openephys" else intan_analog_sr
+    )
 
     _step("Build merge points")
     merge_data = compute_mergepoints(
@@ -609,6 +705,19 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         analog_source_num_channels = _catalog_analogin_source_num_channels(catalog, catalog_source_types)
         analog_source_channel_indices = _catalog_analogin_channel_indices(catalog, catalog_source_types)
         analog_destination_channel_indices = _catalog_analogin_destination_indices(catalog)
+        analog_source_sample_counts = _catalog_analogin_source_sample_counts(catalog)
+        analog_source_sampling_frequencies = _catalog_analogin_source_sampling_frequencies(
+            catalog,
+            catalog_source_types,
+            intan_sampling_frequency=intan_analog_sr,
+        )
+        analog_output_sample_counts = _analog_output_sample_counts(
+            catalog,
+            catalog_source_types,
+            analog_source_sample_counts,
+            ephys_sampling_frequency=effective_sr,
+            analog_sampling_frequency=analog_sr,
+        )
         digital_sidecar_paths = [
             (p.parent / "digitalin.dat") if (p.parent / "digitalin.dat").exists() else None
             for p in catalog.amplifier_paths
@@ -621,7 +730,9 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
             num_channels=analog_ch,
             overwrite=config.overwrite,
             job_kwargs=config.job_kwargs,
-            sample_counts=catalog.sample_counts,
+            sample_counts=analog_output_sample_counts,
+            source_sample_counts=analog_source_sample_counts,
+            source_sampling_frequencies=analog_source_sampling_frequencies,
             source_num_channels=analog_source_num_channels,
             source_channel_indices=analog_source_channel_indices,
             destination_channel_indices=analog_destination_channel_indices,
