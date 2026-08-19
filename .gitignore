@@ -49,6 +49,7 @@ tests
 !/tests/execution/
 /tests/execution/*
 !/tests/execution/test_local_backend.py
+!/tests/execution/test_gpu_selection.py
 !/tests/preprocess/
 /tests/preprocess/*
 !/tests/preprocess/test_gui_move_outputs.py

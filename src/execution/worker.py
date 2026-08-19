@@ -256,8 +256,6 @@ def _run_preprocess(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
 
 
 def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
-    from src.preprocess.sorting_stage import run_sorting_stage
-
     preprocess_fact = _load_upstream_result(store, spec, StageName.PREPROCESS)
     preprocess_result = _preprocess_result_from_dict(preprocess_fact["outputs"]["preprocess_result"])
     settings = _settings_for_run(store)
@@ -271,14 +269,38 @@ def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
         "max_threads_per_worker": 1,
         "progress_bar": False,
     }
+    from .gpu_selection import GpuUsageMonitor, activate_least_used_gpu
+
+    gpu_log_path = store.attempt_dir(spec.stage, spec.attempt) / "gpu-selection.jsonl"
+    gpu_selection = activate_least_used_gpu(
+        log_path=gpu_log_path
+    )
+    # Import the sorter only after CUDA visibility has been finalized. Some
+    # sorter dependencies initialize CUDA as part of their import path.
+    from src.preprocess.sorting_stage import run_sorting_stage
+
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
     if spec.attempt > 1:
         timestamp = f"{timestamp}_a{spec.attempt:03d}"
-    result = run_sorting_stage(
-        config,
-        preprocess_result,
-        output_timestamp=timestamp,
+    selected_gpu = gpu_selection["selected_gpu"]
+    if not isinstance(selected_gpu, dict) or not selected_gpu.get("uuid"):
+        raise RuntimeError("GPU selection returned no selected GPU UUID")
+    gpu_monitor = GpuUsageMonitor(
+        log_path=gpu_log_path,
+        selected_gpu_uuid=str(selected_gpu["uuid"]),
     )
+    gpu_monitor.start()
+    try:
+        result = run_sorting_stage(
+            config,
+            preprocess_result,
+            output_timestamp=timestamp,
+        )
+    except BaseException:
+        gpu_monitor.stop(final_status="sorter_failed")
+        raise
+    else:
+        gpu_monitor.stop(final_status="sorter_finished")
     output_dirs = [Path(path) for path in result.sorter_output_dirs]
     if not output_dirs:
         raise RuntimeError("Sorting completed without an output directory")
@@ -299,6 +321,7 @@ def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
         "sorter_output_dir": str(result.sorter_output_dir) if result.sorter_output_dir else "",
         "sorter_output_dirs": [str(path) for path in output_dirs],
         "sorter_partition_manifest_path": str(manifest) if manifest else "",
+        "gpu_selection": gpu_selection,
         "validated_paths": validated,
     }
 

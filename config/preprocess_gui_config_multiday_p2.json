@@ -1,15 +1,12 @@
 {
-  "basepath": "/workdir/ys2375/data/ayadataB4/Fabrication/p2/Day7",
+  "basepath": "/workdir/ys2375/data/ayadataB4/Fabrication/p2/Day12",
   "local_root": "/local/workdir/ys2375/PreprocessPipeline/sorting_temp",
   "source_basepath": "",
   "existing_session_dir": "",
-  "xml_path": "/workdir/ys2375/data/ayadataB4/Fabrication/p2/amplifier.xml",
-  "chanmap_path": "/workdir/ys2375/data/ayadataB4/Fabrication/p2/Day7/chanMap.mat",
+  "xml_path": "/fs/ayadata2-afr77.nbb.cornell.edu/volume4/ayadataB4/Fabrication/p2/amplifier.xml",
+  "chanmap_path": "/local/workdir/ys2375/PreprocessPipeline/sorting_temp/multiday_Day12_to_Day41/chanMap.mat",
   "multi_day_enabled": true,
   "multi_day_session_paths": [
-    "/workdir/ys2375/data/ayadataB4/Fabrication/p2/Day7",
-    "/workdir/ys2375/data/ayadataB4/Fabrication/p2/Day9",
-    "/workdir/ys2375/data/ayadataB4/Fabrication/p2/Day11",
     "/workdir/ys2375/data/ayadataB4/Fabrication/p2/Day12",
     "/workdir/ys2375/data/ayadataB4/Fabrication/p2/Day13",
     "/workdir/ys2375/data/ayadataB4/Fabrication/p2/Day14",
@@ -42,6 +39,7 @@
     "/workdir/ys2375/data/ayadataB4/Fabrication/p2/Day41"
   ],
   "multi_day_selected_subepoch_paths": [
+    "/fs/ayadata2-afr77.nbb.cornell.edu/volume4/ayadataB4/Fabrication/p2/Day12/D12_nightsleep_260720_221528",
     "/fs/ayadata2-afr77.nbb.cornell.edu/volume4/ayadataB4/Fabrication/p2/Day12/D12_overnightsleep_260721_001638",
     "/fs/ayadata2-afr77.nbb.cornell.edu/volume4/ayadataB4/Fabrication/p2/Day13/D13_presleep_260721_084216",
     "/fs/ayadata2-afr77.nbb.cornell.edu/volume4/ayadataB4/Fabrication/p2/Day13/D13_linearA_260721_101053",
@@ -131,7 +129,7 @@
     "/fs/ayadata2-afr77.nbb.cornell.edu/volume4/ayadataB4/Fabrication/p2/Day41/D41_linearA_260818_113418",
     "/fs/ayadata2-afr77.nbb.cornell.edu/volume4/ayadataB4/Fabrication/p2/Day41/D41_postsleep_260818_115626"
   ],
-  "multi_day_name": "multiday_Day7_to_Day41",
+  "multi_day_name": "multiday_Day12_to_Day41",
   "subsession_order": [],
   "preprocess": {
     "analog_inputs": false,
@@ -143,7 +141,7 @@
     "reference": "local",
     "local_radius_um": [
       20.0,
-      600.0
+      1000.0
     ],
     "make_lfp": true,
     "lfp_fs": 1250.0,
@@ -171,7 +169,7 @@
     "artifact_ttl_mode": "linear",
     "remove_highamp_artifacts": true,
     "artifact_highamp_group_mode": "shank",
-    "highamp_threshold_sigma": 15.0,
+    "highamp_threshold_sigma": 10.0,
     "highamp_ms_before": 2.0,
     "highamp_ms_after": 2.0,
     "highamp_mode": "linear",
@@ -230,7 +228,7 @@
     "sorter": "Kilosort",
     "sorter_partition_mode": "all",
     "sorter_path": "sorter/KiloSort1",
-    "sorter_config_path": "sorter/Kilosort1_config.yaml",
+    "sorter_config_path": "/local/workdir/ys2375/PreprocessPipeline/sorting_temp/.pipeline/run-20260818T222205Z-729d7cf7/snapshots/Kilosort1_config.yaml",
     "matlab_path": "",
     "preprocess_worker_count": 128,
     "sorter_worker_count": 128,
