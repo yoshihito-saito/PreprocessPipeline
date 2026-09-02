@@ -85,11 +85,12 @@ def test_multiday_default_storage_creates_named_sibling_of_basepath(
     )
 
     assert (expected / "quality_metrics.csv").exists()
-    assert not (local_session / "quality_metrics.csv").exists()
+    assert (local_session / "quality_metrics.csv").exists()
     assert result["storage_dir"] == str(expected.resolve())
+    assert result["cleaned"] is False
 
 
-def test_move_without_local_cleanup_removes_only_selected_source_items(tmp_path: Path) -> None:
+def test_copy_without_local_cleanup_preserves_all_source_items(tmp_path: Path) -> None:
     basepath = tmp_path / "storage" / "session"
     local_root = tmp_path / "local"
     source = local_root / "session"
@@ -109,9 +110,9 @@ def test_move_without_local_cleanup_removes_only_selected_source_items(tmp_path:
 
     assert (basepath / "quality_metrics.csv").exists()
     assert (basepath / "session.xml").read_text(encoding="utf-8") == "<session />"
-    assert not (source / "quality_metrics.csv").exists()
+    assert (source / "quality_metrics.csv").exists()
     assert (source / "session.dat").exists()
-    assert not (source / "session.xml").exists()
+    assert (source / "session.xml").read_text(encoding="utf-8") == "<session />"
     assert (source / "session.rhd").exists()
 
 
@@ -139,7 +140,7 @@ def test_move_preserves_existing_destination_session_xml(
         assert not source.exists()
     else:
         assert (source / "session.xml").read_text(encoding="utf-8") == "<source />"
-        assert not (source / "result.mat").exists()
+        assert (source / "result.mat").read_bytes() == b"result"
     assert {item["name"]: item["reason"] for item in result["skipped"]}[
         "session.xml"
     ] == "destination session XML already exists"
@@ -175,7 +176,7 @@ def test_move_atomically_preserves_destination_xml_created_during_publication(
     assert destination_xml.read_text(encoding="utf-8") == "<late-destination />"
     assert source_xml.read_text(encoding="utf-8") == "<source />"
     assert (destination / "result.mat").read_bytes() == b"result"
-    assert not (source / "result.mat").exists()
+    assert (source / "result.mat").read_bytes() == b"result"
     assert {item["name"]: item["reason"] for item in result["skipped"]}[
         "session.xml"
     ] == "destination session XML appeared during transfer"
@@ -243,7 +244,7 @@ def test_move_xml_uses_no_clobber_copy_when_hard_links_are_unsupported(
     )
 
     assert (destination / "session.xml").read_text(encoding="utf-8") == "<source />"
-    assert not (source / "session.xml").exists()
+    assert (source / "session.xml").read_text(encoding="utf-8") == "<source />"
 
 
 def test_explicit_storage_destination_overrides_multiday_default(
@@ -296,7 +297,9 @@ def test_browse_save_dir_updates_basepath_but_retains_local_move_source(
     try:
         window.basepath.setText(str(basepath))
         window.local_root.setText(str(local_root))
-        assert window.move_outputs.text() == "Move outputs to storage"
+        assert window.move_outputs.text() == "Copy outputs to storage"
+        assert window.move_clean_local.text() == "Delete local after verified copy"
+        assert window.move_clean_local.isChecked() is False
         assert window.move_storage_dir.text() == str(basepath.resolve())
         monkeypatch.setattr(window, "_select_directory", lambda *_args: str(custom))
 

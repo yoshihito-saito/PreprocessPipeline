@@ -23,3 +23,4 @@
 - [2026-08-17 move missing session XML](2026-08-17-move-missing-session-xml.md)
 - [2026-08-17 Windows Force stop and restart](2026-08-17-windows-force-stop-restart.md)
 - [2026-08-19 automatic GPU selection and audit log](2026-08-19-automatic-gpu-selection.md)
+- [2026-09-01 copy outputs while retaining local data](2026-09-01-copy-outputs-retain-local.md)

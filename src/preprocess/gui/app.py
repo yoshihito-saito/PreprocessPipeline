@@ -632,23 +632,6 @@ def _move_local_output_to_storage(
                 "Destination publication succeeded, but local source cleanup failed; "
                 f"the destination remains valid at {dst_root}: {exc}"
             ) from exc
-    else:
-        deletion_errors: list[str] = []
-        for src, _dst in move_items:
-            if src in publication_skipped_sources:
-                continue
-            try:
-                if src.is_dir() and not src.is_symlink():
-                    shutil.rmtree(src)
-                else:
-                    src.unlink(missing_ok=True)
-            except Exception as exc:
-                deletion_errors.append(f"{src}: {exc}")
-        if deletion_errors:
-            raise OSError(
-                "Destination publication succeeded, but some moved local source items could not be removed; "
-                f"the destination remains valid at {dst_root}: " + "; ".join(deletion_errors)
-            )
 
     return {
         "basepath": str(dst_root),
@@ -3588,15 +3571,15 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QGridLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.move_dat_to_basepath = QCheckBox("Move basename.dat")
-        self.move_overwrite = QCheckBox("Overwrite moved files")
-        self.move_clean_local = QCheckBox("Clean local after move")
-        self.move_clean_local.setChecked(True)
+        self.move_dat_to_basepath = QCheckBox("Copy basename.dat")
+        self.move_overwrite = QCheckBox("Overwrite copied files")
+        self.move_clean_local = QCheckBox("Delete local after verified copy")
+        self.move_clean_local.setChecked(False)
         self.move_storage_dir = QLineEdit()
         self.move_storage_dir.setReadOnly(True)
         self.move_storage_dir.setPlaceholderText("Default: Basepath")
         self.browse_move_storage = QPushButton("Browse save dir")
-        self.move_outputs = QPushButton("Move outputs to storage")
+        self.move_outputs = QPushButton("Copy outputs to storage")
         self.force_stop = QPushButton("Force stop")
         self.force_stop.setObjectName("dangerButton")
         self.clear_log = QPushButton("Clear log")
@@ -6400,15 +6383,16 @@ class MainWindow(QMainWindow):
                     f"delete local source: {'yes' if self.move_clean_local.isChecked() else 'no'}."
                 )
             message = (
-                "Move local output files to storage?\n\n"
+                "Copy local output files to storage?\n\n"
                 f"Storage destination: {destination or '-'}\n"
                 f"Local output: {source_dir or settings.local_output_dir or '-'}\n"
-                f"Move basename.dat: {'yes' if self.move_dat_to_basepath.isChecked() else 'no'}\n"
+                f"Copy basename.dat: {'yes' if self.move_dat_to_basepath.isChecked() else 'no'}\n"
                 f"Overwrite existing files: {'yes' if self.move_overwrite.isChecked() else 'no'}\n"
-                f"Clean local after move: {'yes' if self.move_clean_local.isChecked() else 'no'}\n\n"
+                "Delete local after verified copy: "
+                f"{'yes' if self.move_clean_local.isChecked() else 'no'}\n\n"
                 f"{inventory_text}"
             )
-            answer = QMessageBox.question(self, "Move outputs to storage", message)
+            answer = QMessageBox.question(self, "Copy outputs to storage", message)
             if answer != QMessageBox.StandardButton.Yes:
                 return
             result = _move_local_output_to_storage(
@@ -6421,11 +6405,11 @@ class MainWindow(QMainWindow):
                 source_basename=source_basename,
             )
             lines = [
-                "Move to storage finished",
+                "Copy to storage finished",
                 f"Storage destination: {result['storage_dir']}",
                 f"Local output: {result['local_output_dir']}",
                 "",
-                f"Moved ({len(result['moved'])}):",
+                f"Copied ({len(result['moved'])}):",
             ]
             lines.extend(
                 [f"- {item['name']}" for item in result["moved"]]
@@ -6442,12 +6426,12 @@ class MainWindow(QMainWindow):
             lines.append("")
             lines.append(f"Cleaned local output: {'yes' if result['cleaned'] else 'no'}")
             lines.append("")
-            lines.append("Move outputs to storage complete!")
+            lines.append("Copy outputs to storage complete!")
             text = "\n".join(lines)
             self.run_preview.setPlainText(text)
             self._append_log(text + "\n")
         except Exception as exc:
-            QMessageBox.critical(self, "Move outputs failed", str(exc))
+            QMessageBox.critical(self, "Copy outputs failed", str(exc))
 
     def _move_outputs_to_basepath(self) -> None:
         """Compatibility alias for older direct callers."""

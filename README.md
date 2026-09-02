@@ -168,7 +168,7 @@ Depending on the enabled options, a processed session contains:
 
 Very large `SleepScoreLFP` outputs use MATLAB v7.3/HDF5 when they exceed the MATLAB v5 format limit. Ordinary MAT outputs remain in v5 format.
 
-Use **Move outputs to storage** to copy selected outputs from the Local working directory to their final destination. The GUI displays which files will be moved, retained, or deleted before starting.
+Use **Copy outputs to storage** to copy selected outputs from the Local working directory to their final destination. Local outputs are retained by default. Enable **Delete local after verified copy** only when the complete local session directory should be removed after the staged copy is content-verified and published. The GUI displays which files will be copied, retained, or deleted before starting.
 
 ## Optional tools
 
