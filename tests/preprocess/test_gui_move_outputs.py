@@ -116,6 +116,36 @@ def test_copy_without_local_cleanup_preserves_all_source_items(tmp_path: Path) -
     assert (source / "session.rhd").exists()
 
 
+def test_copy_makes_entire_destination_tree_world_readable_writable(tmp_path: Path) -> None:
+    destination = tmp_path / "storage" / "session"
+    source = tmp_path / "local" / "session"
+    destination.mkdir(parents=True)
+    source.mkdir(parents=True)
+    existing = destination / "existing.txt"
+    existing.write_text("existing", encoding="utf-8")
+    copied_dir = source / "results"
+    copied_dir.mkdir()
+    copied_file = copied_dir / "result.mat"
+    copied_file.write_bytes(b"result")
+
+    destination.chmod(0o750)
+    existing.chmod(0o600)
+    copied_dir.chmod(0o700)
+    copied_file.chmod(0o600)
+
+    _move_local_output_to_storage(
+        PipelineGuiSettings(basepath=str(destination), local_root=str(source.parent)),
+        move_dat=False,
+        overwrite=False,
+        clean_after_move=False,
+    )
+
+    assert destination.stat().st_mode & 0o777 == 0o777
+    assert existing.stat().st_mode & 0o666 == 0o666
+    assert (destination / "results").stat().st_mode & 0o777 == 0o777
+    assert (destination / "results" / "result.mat").stat().st_mode & 0o666 == 0o666
+
+
 @pytest.mark.parametrize("clean_after_move", [False, True])
 def test_move_preserves_existing_destination_session_xml(
     tmp_path: Path, clean_after_move: bool

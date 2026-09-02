@@ -579,7 +579,6 @@ def _move_local_output_to_storage(
                 else:
                     published.append((dst, None))
                 staged.unlink()
-                set_tree_world_rw(dst)
                 moved.append(
                     {"name": dst.name, "path": str(dst), "bytes": _path_size(dst)}
                 )
@@ -597,7 +596,6 @@ def _move_local_output_to_storage(
             os.replace(staged, dst)
             published.append((dst, backup))
             if (src, dst) in move_items:
-                set_tree_world_rw(dst)
                 moved.append({"name": dst.name, "path": str(dst), "bytes": _path_size(dst)})
 
         # Verify the canonical destination after publication before deleting the
@@ -607,6 +605,11 @@ def _move_local_output_to_storage(
                 continue
             if _content_signature(dst) != staged_signatures[dst]:
                 raise IOError(f"Published transfer validation failed for {dst}")
+
+        # Make the storage root and all published or pre-existing content
+        # collaborative. Directories need execute permission for traversal;
+        # regular files need read/write permission for every user.
+        set_tree_world_rw(dst_root)
     except Exception:
         for dst, backup in reversed(published):
             if dst.exists() or dst.is_symlink():
