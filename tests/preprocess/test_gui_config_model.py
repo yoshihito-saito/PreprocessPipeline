@@ -1565,7 +1565,7 @@ def test_load_xml_updates_probe_assignments_and_chanmap_preview(
   <generalInfo><description>poly2</description></generalInfo>
   <anatomicalDescription>
     <channelGroups>
-      <group><channels><n>0</n><n>1</n></channels></group>
+      <group><channels><n>0</n><n skip="1">1</n></channels></group>
       <group><channels><n>2</n><n>3</n></channels></group>
     </channelGroups>
   </anatomicalDescription>
@@ -1579,11 +1579,13 @@ def test_load_xml_updates_probe_assignments_and_chanmap_preview(
     try:
         window.basepath.setText(str(basepath))
         window.local_root.setText(str(tmp_path / "local"))
+        window.reject_channels.setText("17, 23")
         monkeypatch.setattr(window, "_select_open_file", lambda *_args: str(xml))
 
         window._load_xml()
 
         assert window.xml_path.text() == str(xml)
+        assert window.reject_channels.text() == "1"
         assert window._probe_rows_to_assignments() == [
             {"type": "poly2", "groups": [0, 1], "x_offset": 0}
         ]

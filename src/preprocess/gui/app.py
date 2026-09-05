@@ -4088,9 +4088,8 @@ class MainWindow(QMainWindow):
             try:
                 self.xml_path.setText(str(xml_path))
                 self._render_probe_assignments(assignments)
-                current_bad = set(parse_int_list(self.reject_channels.text()))
-                current_bad.update(int(channel) for channel in skipped_channels)
-                self.reject_channels.setText(", ".join(str(v) for v in sorted(current_bad)))
+                xml_bad = sorted(set(int(channel) for channel in skipped_channels))
+                self.reject_channels.setText(", ".join(str(v) for v in xml_bad))
                 # An explicit XML selection invalidates a previously loaded
                 # chanMap file as the preview source until the map is regenerated.
                 self._chanmap_controls_dirty = True
