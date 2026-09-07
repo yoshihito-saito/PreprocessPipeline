@@ -1036,7 +1036,16 @@ def test_gui_browse_local_session_resume_is_common_and_reconnects(
             window.browse_local_session_resume.sizeHint().width()
         )
         assert "font-size: 11px" in window.styleSheet()
-        assert window.main_splitter.sizes()[0] < 500
+        splitter_sizes = window.main_splitter.sizes()
+        assert splitter_sizes[1] > 2 * splitter_sizes[0]
+        probe_row = window._probe_rows[0]
+        groups_field = probe_row["groups"]
+        assert groups_field.isEnabled()
+        assert not groups_field.isReadOnly()
+        assert groups_field.minimumWidth() >= 100
+        assert groups_field.width() >= 100
+        assert window.log.minimumHeight() == 80
+        assert not hasattr(window, "run_preview")
         assert window.execution_scroll_area.horizontalScrollBar().maximum() == 0
     finally:
         window.close()

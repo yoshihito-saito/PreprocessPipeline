@@ -926,6 +926,23 @@ def _flex_probe_layout_coords(n_channels: int, group_index: int) -> tuple[np.nda
     return _flex_g5_layout_coords(n_channels, group_index)
 
 
+def _center_channel_coords_at_x(
+    coords: list[dict[str, float | int]], target_x: float | int
+) -> None:
+    """Place one probe assignment's horizontal bounding-box center at target_x."""
+    finite_x = [
+        float(coord["x"])
+        for coord in coords
+        if np.isfinite(float(coord["x"]))
+    ]
+    if not finite_x:
+        return
+    current_center = (min(finite_x) + max(finite_x)) / 2.0
+    shift = float(target_x) - current_center
+    for coord in coords:
+        coord["x"] = float(coord["x"]) + shift
+
+
 def build_channel_map_data(
     basepath: Path | str,
     basename: str | None = None,
@@ -966,6 +983,7 @@ def build_channel_map_data(
 
     channel_coords = []
     for probe_idx, probe in enumerate(probe_assignments):
+        probe_coord_start = len(channel_coords)
         p_type = _normalize_chanmap_layout(probe.get("type", electrode_type))
         p_groups = probe.get("groups", [])
         p_x_offset = probe.get("x_offset", 0)
@@ -1012,6 +1030,7 @@ def build_channel_map_data(
                         }
                     )
                 local_block_idx += max(1, int(np.ceil(n_ch / 64.0)))
+            _center_channel_coords_at_x(channel_coords[probe_coord_start:], p_x_offset)
             continue
 
         for local_idx, g_idx in enumerate(p_groups):
@@ -1070,6 +1089,7 @@ def build_channel_map_data(
                         "p": probe_idx + 1,
                     }
                 )
+        _center_channel_coords_at_x(channel_coords[probe_coord_start:], p_x_offset)
 
     sorted_coords = sorted(channel_coords, key=lambda d: d["id"])
     if not sorted_coords:

@@ -2322,7 +2322,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("PreprocessPipeline GUI")
-        self.resize(1320, 860)
+        self.resize(1500, 900)
         self._process: QProcess | None = None
         self._process_config_path: Path | None = None
         self._process_result: dict[str, Any] | None = None
@@ -2354,6 +2354,7 @@ class MainWindow(QMainWindow):
         self._phy_status_timer.setInterval(30000)
         self._phy_status_timer.timeout.connect(self._append_phy_curation_status)
         self._log_buffer = ""
+        self._settings_preview_text = ""
         self._log_flush_timer = QTimer(self)
         self._log_flush_timer.setSingleShot(True)
         self._log_flush_timer.setInterval(80)
@@ -2656,7 +2657,7 @@ class MainWindow(QMainWindow):
         self.main_splitter.addWidget(self.center_scroll_area)
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
-        self.main_splitter.setSizes([440, 880])
+        self.main_splitter.setSizes([360, 1140])
         layout.addWidget(self.main_splitter, 1)
 
         layout.addWidget(self._build_run_bar())
@@ -2982,8 +2983,9 @@ class MainWindow(QMainWindow):
     def _form_layout(self, parent: QWidget) -> QFormLayout:
         layout = QFormLayout(parent)
         layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
-        layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         layout.setHorizontalSpacing(16)
         layout.setVerticalSpacing(9)
         return layout
@@ -3545,29 +3547,15 @@ class MainWindow(QMainWindow):
         log_head.setObjectName("miniHead")
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMinimumHeight(160)
+        self.log.setMinimumHeight(80)
         self.log.document().setMaximumBlockCount(5000)
         log_layout.addWidget(log_head)
         log_layout.addWidget(self.log, 1)
 
-        monitor_layout.addWidget(self.monitor_stack, 5)
+        monitor_layout.addWidget(self.monitor_stack, 9)
         monitor_layout.addWidget(log_panel, 1)
 
-        preview_panel = QFrame()
-        preview_panel.setObjectName("miniPanel")
-        preview_layout = QVBoxLayout(preview_panel)
-        preview_layout.setContentsMargins(0, 0, 0, 0)
-        preview_layout.setSpacing(0)
-        preview_head = QLabel("Setting config")
-        preview_head.setObjectName("miniHead")
-        self.run_preview = QPlainTextEdit()
-        self.run_preview.setReadOnly(True)
-        self.run_preview.setMinimumHeight(180)
-        preview_layout.addWidget(preview_head)
-        preview_layout.addWidget(self.run_preview, 1)
-
-        layout.addWidget(monitor, 5)
-        layout.addWidget(preview_panel, 1)
+        layout.addWidget(monitor, 1)
         return panel
 
     def _build_run_bar(self) -> QWidget:
@@ -3665,16 +3653,27 @@ class MainWindow(QMainWindow):
 
         geometry = NoWheelComboBox()
         geometry.addItems(list(PROBE_TYPES))
+        geometry.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        geometry.setMinimumContentsLength(11)
+        geometry.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         geometry.setCurrentText(
             _normalize_chanmap_layout(str(assignment.get("type") or "staggered"))
         )
 
         groups = QLineEdit()
+        groups.setMinimumWidth(100)
+        groups.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         raw_groups = assignment.get("groups") or []
         groups.setPlaceholderText("0, 1, 2, 3")
+        groups.setToolTip("Editable comma-separated 0-based XML group numbers")
         groups.setText(", ".join(str(int(v)) for v in raw_groups))
 
         x_offset = self._spin(-1000000, 1000000, int(assignment.get("x_offset") or 0))
+        x_offset.setMinimumWidth(78)
+        x_offset.setMaximumWidth(96)
+        x_offset.setToolTip("Horizontal center position of this probe assignment (um)")
 
         remove = QPushButton("-")
         remove.setFixedWidth(34)
@@ -6187,7 +6186,7 @@ class MainWindow(QMainWindow):
             else:
                 lines.extend(["", "Ephys preflight:"])
                 lines.extend(self._format_checks(checks))
-            self.run_preview.setPlainText("\n".join(lines))
+            self._settings_preview_text = "\n".join(lines)
             chanmap = settings.resolved_chanmap_path()
             explicit_chanmap = Path(settings.chanmap_path).expanduser() if settings.chanmap_path.strip() else None
             if (
@@ -6200,7 +6199,7 @@ class MainWindow(QMainWindow):
                 if not self._chanmap_controls_dirty and chanmap is not None and chanmap.exists():
                     self._load_chanmap_preview(chanmap)
         except Exception as exc:
-            self.run_preview.setPlainText(f"Config error:\n{exc}")
+            self._settings_preview_text = f"Config error:\n{exc}"
 
     def _format_checks(self, checks: list[CheckResult]) -> list[str]:
         prefix = {"ok": "[OK]", "warn": "[WARN]", "error": "[ERROR]"}
@@ -6430,7 +6429,7 @@ class MainWindow(QMainWindow):
             lines.append("")
             lines.append("Copy outputs to storage complete!")
             text = "\n".join(lines)
-            self.run_preview.setPlainText(text)
+            self._settings_preview_text = text
             self._append_log(text + "\n")
         except Exception as exc:
             QMessageBox.critical(self, "Copy outputs failed", str(exc))
