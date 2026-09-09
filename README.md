@@ -168,6 +168,14 @@ Depending on the enabled options, a processed session contains:
 
 Very large `SleepScoreLFP` outputs use MATLAB v7.3/HDF5 when they exceed the MATLAB v5 format limit. Ordinary MAT outputs remain in v5 format.
 
+State-scoring channel selection reads each candidate from the memory-mapped LFP
+and converts only its downsampled samples to float64. Candidate evaluation uses
+at most four concurrent workers (or the smaller requested `n_jobs`); other
+preprocessing stages retain their requested worker counts. All candidate channels,
+scoring parameters, and output formats are preserved. Memory still grows with
+recording duration because each active channel's spectral calculation spans the
+full recording.
+
 Use **Copy outputs to storage** to copy selected outputs from the Local working directory to their final destination. Local outputs are retained by default. Enable **Delete local after verified copy** only when the complete local session directory should be removed after the staged copy is content-verified and published. After verification, the destination folder and its complete tree are made readable and writable by all users, with directory traversal enabled. The GUI displays which files will be copied, retained, or deleted before starting.
 
 ## Optional tools

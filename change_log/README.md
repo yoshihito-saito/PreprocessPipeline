@@ -1,5 +1,7 @@
 # Change Log
 
+- [2026-09-09 memory-efficient state scoring](2026-09-09-memory-efficient-state-scoring.md)
+
 - [2026-06-16 default environment setup](2026-06-16-default-environment-setup.md)
 - [2026-06-16 standalone Qt GUI parity](2026-06-16-standalone-qt-gui-parity.md)
 - [2026-06-16 noise threshold waveform defaults](2026-06-16-noise-threshold-waveform-defaults.md)

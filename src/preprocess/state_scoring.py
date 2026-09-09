@@ -1458,23 +1458,21 @@ def _compute_sleepscore_lfp(
     if th_cands.size == 0:
         th_cands = usechannels[:1]
 
-    needed_channels = np.unique(np.concatenate([sw_cands, th_cands]).astype(np.int64, copy=False))
-    lfp_subset, loaded_channels_1based, channel_to_col = _load_binary_lfp_channels(
-        lfp_path,
-        n_channels=n_channels,
-        channels_1based=needed_channels,
-    )
-    if loaded_channels_1based.size == 0:
-        raise RuntimeError("No LFP channels loaded for state scoring.")
-
+    lfp_mm = _load_binary_lfp(lfp_path, n_channels=n_channels)
     downsamplefactor = 5
-    lfp_ds = _matlab_downsample(lfp_subset.astype(np.float64), downsamplefactor)
     fs_ds = fs / float(downsamplefactor)
+    # Bound concurrent full-duration spectral work independently of Slurm CPU count.
+    candidate_jobs = max(1, min(int(parallel_jobs), 4))
+    histbins = np.linspace(0.0, 1.0, 21, dtype=np.float64)
+    hist_edges = np.linspace(0.0, 1.0, histbins.size + 1, dtype=np.float64)
+
+    def _candidate_lfp(ch: int) -> np.ndarray:
+        # MATLAB downsample is pure slicing: convert only retained int16 samples.
+        return _matlab_downsample(lfp_mm[:, int(ch) - 1], downsamplefactor).astype(np.float64)
 
     def _sw_eval(ch: int) -> tuple[float, np.ndarray]:
-        col = channel_to_col[int(ch)]
-        return _score_sw_candidate(
-            lfp_ds[:, col],
+        score, vals = _score_sw_candidate(
+            _candidate_lfp(ch),
             fs_ds,
             window_sec,
             smoothfact,
@@ -1482,11 +1480,14 @@ def _compute_sleepscore_lfp(
             pss_cache=None,
             cache_key=None,
         )
+        vals = np.asarray(vals, dtype=np.float64).reshape(-1)
+        vals = np.clip(vals[np.isfinite(vals)], 0.0, 1.0)
+        counts, _ = np.histogram(vals, bins=hist_edges)
+        return score, counts.astype(np.float64, copy=False)
 
-    def _th_eval(ch: int) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
-        col = channel_to_col[int(ch)]
-        return _score_theta_candidate(
-            lfp_ds[:, col],
+    def _th_eval(ch: int) -> tuple[float, np.ndarray, np.ndarray]:
+        score, _, meanspec, freqs = _score_theta_candidate(
+            _candidate_lfp(ch),
             fs_ds,
             window_sec,
             smoothfact,
@@ -1494,32 +1495,31 @@ def _compute_sleepscore_lfp(
             pss_cache=None,
             cache_key=None,
         )
+        return score, meanspec, freqs
 
     sw_scores: list[float] = []
-    sw_metric_vals: list[np.ndarray] = []
+    sw_hists = np.zeros((histbins.size, sw_cands.size), dtype=np.float64)
     sw_iter = [int(ch) for ch in np.asarray(sw_cands, dtype=np.int64).reshape(-1)]
-    if int(parallel_jobs) > 1 and len(sw_iter) > 1:
-        with ThreadPoolExecutor(max_workers=min(int(parallel_jobs), len(sw_iter))) as ex:
+    if candidate_jobs > 1 and len(sw_iter) > 1:
+        with ThreadPoolExecutor(max_workers=min(candidate_jobs, len(sw_iter))) as ex:
             sw_results = list(ex.map(_sw_eval, sw_iter))
     else:
         sw_results = [_sw_eval(ch) for ch in sw_iter]
-    for score, vals in sw_results:
+    for i, (score, counts) in enumerate(sw_results):
         sw_scores.append(float(score))
-        sw_metric_vals.append(np.asarray(vals, dtype=np.float64).reshape(-1))
+        sw_hists[:, i] = counts
 
     th_scores: list[float] = []
-    th_metric_vals: list[np.ndarray] = []
     th_meanspec_list: list[np.ndarray] = []
     th_freqs_ref: np.ndarray | None = None
     th_iter = [int(ch) for ch in np.asarray(th_cands, dtype=np.int64).reshape(-1)]
-    if int(parallel_jobs) > 1 and len(th_iter) > 1:
-        with ThreadPoolExecutor(max_workers=min(int(parallel_jobs), len(th_iter))) as ex:
+    if candidate_jobs > 1 and len(th_iter) > 1:
+        with ThreadPoolExecutor(max_workers=min(candidate_jobs, len(th_iter))) as ex:
             th_results = list(ex.map(_th_eval, th_iter))
     else:
         th_results = [_th_eval(ch) for ch in th_iter]
-    for score, vals, meanspec, freqs in th_results:
+    for score, meanspec, freqs in th_results:
         th_scores.append(float(score))
-        th_metric_vals.append(np.asarray(vals, dtype=np.float64).reshape(-1))
         th_meanspec_list.append(np.asarray(meanspec, dtype=np.float64).reshape(-1))
         if th_freqs_ref is None and np.asarray(freqs).size:
             th_freqs_ref = np.asarray(freqs, dtype=np.float64).reshape(-1)
@@ -1528,18 +1528,6 @@ def _compute_sleepscore_lfp(
     th_best_idx = int(np.argmax(np.asarray(th_scores))) if th_scores else 0
     sw_ch = int(sw_cands[sw_best_idx])
     th_ch = int(th_cands[th_best_idx])
-
-    histbins = np.linspace(0.0, 1.0, 21, dtype=np.float64)
-    sw_hists = np.zeros((histbins.size, sw_cands.size), dtype=np.float64)
-    hist_edges = np.linspace(0.0, 1.0, histbins.size + 1, dtype=np.float64)
-    for i, vals in enumerate(sw_metric_vals):
-        vv = np.asarray(vals, dtype=np.float64).reshape(-1)
-        vv = vv[np.isfinite(vv)]
-        if vv.size == 0:
-            continue
-        vv = np.clip(vv, 0.0, 1.0)
-        counts, _ = np.histogram(vv, bins=hist_edges)
-        sw_hists[:, i] = counts.astype(np.float64, copy=False)
 
     th_freqs = th_freqs_ref if th_freqs_ref is not None else np.logspace(np.log10(2.0), np.log10(20.0), 100, dtype=np.float64)
     th_meanspec = np.zeros((th_freqs.size, th_cands.size), dtype=np.float64)
@@ -1550,8 +1538,9 @@ def _compute_sleepscore_lfp(
     sw_order = np.argsort(np.nan_to_num(np.asarray(sw_scores, dtype=np.float64), nan=-np.inf))
     th_order = np.argsort(np.nan_to_num(np.asarray(th_scores, dtype=np.float64), nan=-np.inf))
 
-    sw_lfp = lfp_subset[:, channel_to_col[sw_ch]].astype(np.int16, copy=False).reshape(-1, 1)
-    th_lfp = lfp_subset[:, channel_to_col[th_ch]].astype(np.int16, copy=False).reshape(-1, 1)
+    sw_lfp = np.array(lfp_mm[:, sw_ch - 1], dtype=np.int16, copy=True).reshape(-1, 1)
+    th_lfp = np.array(lfp_mm[:, th_ch - 1], dtype=np.int16, copy=True).reshape(-1, 1)
+    del lfp_mm
     t = (np.arange(sw_lfp.shape[0], dtype=np.float64) / fs).reshape(1, -1)
 
     sw_freq_list = np.logspace(0.5, 2.0, 100, dtype=np.float64).reshape(1, -1)
@@ -1580,16 +1569,16 @@ def _compute_sleepscore_lfp(
     if save_files:
         atomic_savemat(out_path, {"SleepScoreLFP": sleepscore_lfp}, required_key="SleepScoreLFP")
     sw_plot = _build_sw_plot_payload(
-        lfp_ch=lfp_ds[:, channel_to_col[sw_ch]],
+        lfp_ch=_matlab_downsample(sw_lfp[:, 0], downsamplefactor).astype(np.float64),
         fs=fs_ds,
         window_sec=window_sec,
         smoothfact=smoothfact,
         ignoretime=ignoretime,
         pss_cache=pss_cache,
-        cache_key=("sw_plot", int(sw_ch), int(lfp_ds.shape[0]), float(fs_ds), float(window_sec), float(smoothfact)),
+        cache_key=("sw_plot", int(sw_ch), int(sw_lfp[::downsamplefactor].shape[0]), float(fs_ds), float(window_sec), float(smoothfact)),
     )
     th_plot = _build_th_plot_payload(
-        lfp_ch=lfp_ds[:, channel_to_col[th_ch]],
+        lfp_ch=_matlab_downsample(th_lfp[:, 0], downsamplefactor).astype(np.float64),
         fs=fs_ds,
         window_sec=window_sec,
         smoothfact=smoothfact,
@@ -1827,8 +1816,8 @@ def _compute_sleep_state(
     if out_path.exists() and not overwrite:
         return validate_mat_output(out_path, "SleepState")["SleepState"], out_path
 
-    sw_lfp = np.asarray(sleepscore_lfp["swLFP"], dtype=np.float64).reshape(-1)
-    th_lfp = np.asarray(sleepscore_lfp["thLFP"], dtype=np.float64).reshape(-1)
+    sw_lfp = np.asarray(sleepscore_lfp["swLFP"]).reshape(-1)
+    th_lfp = np.asarray(sleepscore_lfp["thLFP"]).reshape(-1)
     sf = float(np.asarray(sleepscore_lfp["sf"]).reshape(-1)[0])
     t_full = np.asarray(sleepscore_lfp["t"], dtype=np.float64).reshape(-1)
     sw_chan_id = int(np.asarray(sleepscore_lfp["SWchanID"]).reshape(-1)[0])
@@ -1843,8 +1832,8 @@ def _compute_sleep_state(
     else:
         downsamplefactor = 1
     sf_lfp = sf / float(downsamplefactor)
-    sw_d = _matlab_downsample(sw_lfp, downsamplefactor)
-    th_d = _matlab_downsample(th_lfp, downsamplefactor)
+    sw_d = _matlab_downsample(sw_lfp, downsamplefactor).astype(np.float64, copy=False)
+    th_d = _matlab_downsample(th_lfp, downsamplefactor).astype(np.float64, copy=False)
     t_d = _matlab_downsample(t_full, downsamplefactor)
     if t_d.size == 0:
         t_d = np.arange(sw_d.size, dtype=np.float64) / max(sf_lfp, 1e-12)

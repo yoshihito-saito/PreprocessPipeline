@@ -53,6 +53,7 @@ tests
 !/tests/preprocess/
 /tests/preprocess/*
 !/tests/preprocess/test_gui_move_outputs.py
+!/tests/preprocess/test_state_scoring_memory.py
 !/tests/stability/
 /tests/stability/*
 !/tests/stability/test_channel_mad.py
