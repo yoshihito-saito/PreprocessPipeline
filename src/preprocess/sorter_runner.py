@@ -1898,7 +1898,12 @@ def execute_sorting_job(
             _KILOSORT4_ALLOWED_PARAM_KEYS = None
             params = _normalize_kilosort4_params(params)
         if ignored_channels_0based:
-            params["bad_channels"] = ignored_channels_0based
+            # Channel slicing already removes these channels and the wrapper
+            # exports a compact probe map. Original binary indices are only
+            # valid when the sorter recording still has the full width.
+            params["bad_channels"] = (
+                [] if sorter_uses_channel_subset else ignored_channels_0based
+            )
         print("Resolved Kilosort4 params")
     params = _merge_sorter_job_kwargs(params, job_kwargs)
 

@@ -13,6 +13,11 @@ dependencies:
   - numba=0.62.1
   - scikit-learn=1.7.2
   - matplotlib=3.10.8
+  # Runtime dependencies of the vendored sorter/Kilosort4 (torch is installed by setup).
+  - faiss-cpu=1.13.0
+  - psutil=7.1.3
+  - tqdm=4.67.1
+  - packaging=25.0
   - pyside6=6.9.2
   - spikeinterface=0.103.2
   - pytest=9.0.1

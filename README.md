@@ -40,6 +40,17 @@ python scripts/setup_env.py
 conda activate preprocess
 ```
 
+Kilosort4 runs from the customized source in `sorter/Kilosort4`; setup installs
+its dependencies and checks that this source imports successfully. Keep the
+repository checkout available when running the pipeline. Do not replace it with
+a public Kilosort release to resolve installation errors.
+
+If an older setup failed with `No matching distribution found for
+kilosort==0.1.dev1513+g9f8e7052f`, obtain the corrected repository files and rerun
+`python scripts/setup_env.py`. It updates an existing partially created environment;
+deleting the environment is unnecessary. Linux retains the pinned CUDA 13.0
+PyTorch build and explicitly includes its official wheel index.
+
 To recreate the environment from scratch:
 
 ```bash

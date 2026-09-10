@@ -314,6 +314,7 @@ dependencies:
   - zstandard=0.25.0=py311haee01d2_1
   - zstd=1.5.7=hb8e6e7a_2
   - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu130
       - absl-py==2.3.1
       - aiohappyeyeballs==2.6.1
       - aiohttp==3.13.3
@@ -347,7 +348,7 @@ dependencies:
       - ipywidgets==8.1.8
       - joblib==1.4.2
       - jupyterlab-widgets==3.0.16
-      - kilosort==0.1.dev1513+g9f8e7052f
+      # Kilosort4 is loaded from sorter/Kilosort4 by the pipeline.
       - klustakwik2==0.2.6
       - lazy-loader==0.4
       - lightning==2.6.0

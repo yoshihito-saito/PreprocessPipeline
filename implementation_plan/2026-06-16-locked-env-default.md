@@ -77,3 +77,19 @@ No package runtime API changes are planned.
 ## Non-Goals
 
 - Do not generate a Windows environment export on Linux.
+
+## 2026-09-10: Portable vendored Kilosort4 setup
+
+- Failure: the Linux export requests unpublished `kilosort==0.1.dev1513+g9f8e7052f`.
+- Remove that distribution requirement. Runtime already imports `sorter/Kilosort4`
+  directly; preserve that source and all sorting parameters unchanged.
+- Keep its runtime dependencies explicit in platform environments; add missing
+  Windows dependencies. Do not build the vendored setup.py, whose SCM version
+  would depend on the enclosing pipeline checkout.
+- Add the official CUDA 13.0 wheel index for existing Linux torch/torchvision pins.
+- Verify the vendored import and its resolved file in the target environment
+  after stack checks, and fail early if the source is missing.
+- Document retrying setup after a partial Conda failure without deleting the env.
+- Verify with setup regression tests (including source shadowing/missing source),
+  environment dependency checks, and an actual vendored import in the available
+  scientific environment. Full fresh Conda creation may require network access.

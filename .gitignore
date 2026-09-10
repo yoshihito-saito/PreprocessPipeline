@@ -44,6 +44,7 @@ neurocode
 tests
 !/tests/
 /tests/*
+!/tests/test_setup_env.py
 !/tests/test_buzsaki_5x12_geometry.py
 !/tests/test_middle_finger_probe_name.py
 !/tests/execution/

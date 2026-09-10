@@ -82,6 +82,29 @@ def _verify_linux_stack(conda: str, env_name: str) -> None:
     _conda_run(conda, env_name, ["python", "-c", code])
 
 
+def _vendored_kilosort_root() -> Path:
+    root = REPO_ROOT / "sorter" / "Kilosort4"
+    if not (root / "kilosort" / "__init__.py").is_file():
+        raise SystemExit(f"Vendored Kilosort4 source is missing: {root}")
+    return root.resolve()
+
+
+def _verify_vendored_kilosort(conda: str, env_name: str) -> None:
+    root = _vendored_kilosort_root()
+    # Match the pipeline's source override without installing an SCM-derived build.
+    code = (
+        "import sys; from pathlib import Path; "
+        f"root = Path({str(root)!r}); "
+        "sys.path.insert(0, str(root)); "
+        "import kilosort; "
+        "actual = Path(kilosort.__file__).resolve(); "
+        "expected = root / 'kilosort' / '__init__.py'; "
+        "assert actual == expected, f'Unexpected Kilosort source: {actual}'; "
+        "print('vendored_kilosort_ok', kilosort.__version__, actual)"
+    )
+    _conda_run(conda, env_name, ["python", "-c", code])
+
+
 def _verify_windows_stack(conda: str, env_name: str) -> None:
     checks = (
         "import torch; import numpy; import scipy; import spikeinterface; print('torch_then_numpy_ok')",
@@ -129,6 +152,7 @@ def main() -> None:
     env_file = _resolve_env_file(strategy)
     env_name = args.env_name or _parse_env_name(env_file)
     print(f"Using environment file: {env_file.relative_to(REPO_ROOT)}")
+    _vendored_kilosort_root()
 
     if args.force_recreate:
         _remove_env(conda, env_name)
@@ -142,9 +166,9 @@ def main() -> None:
 
     if strategy == "windows":
         _verify_windows_stack(conda, env_name)
-        return
-
-    _verify_linux_stack(conda, env_name)
+    else:
+        _verify_linux_stack(conda, env_name)
+    _verify_vendored_kilosort(conda, env_name)
 
 
 if __name__ == "__main__":
