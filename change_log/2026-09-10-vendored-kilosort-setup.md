@@ -37,3 +37,20 @@ vendored import, Windows execution, and GPU sorting remain unverified.
 The Linux environment remains a large pinned export; this change does not claim
 to resolve every possible package availability or driver compatibility issue.
 Unrelated pre-existing changes were left intact.
+
+## Follow-up: klustakwik2 build failure (uncommitted)
+
+- Removed `klustakwik2==0.2.6` from the Linux pip list. No pipeline code imports
+  this legacy Python sorter. Session metadata recognizes Klustakwik file formats
+  without using the package. Inspected local Phy plugins invoke the separate
+  `~/klustakwik/KlustaKwik` executable, and installed Phy metadata does not require
+  `klustakwik2`. No sorter code, binary, or parameters were modified.
+- Updated README and the existing implementation plan; added an environment
+  regression assertion against including this unused distribution.
+- `/local/workdir/ys2375/miniforge3/envs/spn/bin/python -m pytest tests/test_setup_env.py -q`
+  before removal: 1 failed, 6 passed; after removal: 7 passed.
+- `git diff --check` passed; inspected final diff.
+- The underlying wheel-build exception is absent from the supplied log, so its
+  exact cause is unknown. Full fresh environment installation remains unverified.
+  Users who independently need the Python klustakwik2 API must provision it
+  separately; it is no longer installed by standard pipeline setup.
