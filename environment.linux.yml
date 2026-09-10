@@ -349,7 +349,6 @@ dependencies:
       - joblib==1.4.2
       - jupyterlab-widgets==3.0.16
       # Kilosort4 is loaded from sorter/Kilosort4 by the pipeline.
-      - klustakwik2==0.2.6
       - lazy-loader==0.4
       - lightning==2.6.0
       - lightning-utilities==0.15.2

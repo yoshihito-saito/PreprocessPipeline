@@ -51,6 +51,11 @@ kilosort==0.1.dev1513+g9f8e7052f`, obtain the corrected repository files and rer
 deleting the environment is unnecessary. Linux retains the pinned CUDA 13.0
 PyTorch build and explicitly includes its official wheel index.
 
+The standard environment does not require the legacy Python package `klustakwik2`.
+If an older environment file fails to build it, use the corrected file and rerun
+setup. Phy plugins that invoke an external `KlustaKwik` executable require that
+executable separately; installing `klustakwik2` does not supply that configuration.
+
 To recreate the environment from scratch:
 
 ```bash

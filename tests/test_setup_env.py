@@ -30,6 +30,7 @@ def test_environment_supplies_vendored_dependencies_without_kilosort_distributio
         needed.remove("torch")  # Installed by install_torch.py after Conda.
     assert needed <= names
     assert not any(entry.lower().startswith("kilosort") for entry in requirements)
+    assert "klustakwik2" not in names  # Optional legacy sorter, not a pipeline dependency.
     if platform == "linux":
         assert "--extra-index-url https://download.pytorch.org/whl/cu130" in requirements
         assert "torch==2.9.1+cu130" in requirements

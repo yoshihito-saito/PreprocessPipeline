@@ -93,3 +93,14 @@ No package runtime API changes are planned.
 - Verify with setup regression tests (including source shadowing/missing source),
   environment dependency checks, and an actual vendored import in the available
   scientific environment. Full fresh Conda creation may require network access.
+
+### Follow-up: unused klustakwik2 build failure
+
+- The next reported setup failure is wheel build-requirement discovery for
+  `klustakwik2==0.2.6`; the supplied log omits the underlying exception.
+- Remove this unused Python distribution from the Linux environment. Repository
+  runtime code does not import it. The inspected user Phy plugins execute the
+  separate `~/klustakwik/KlustaKwik` binary; preserve that workflow.
+- Document the distinction and extend the environment regression check to prevent
+  accidental reintroduction from an environment export. Verify the test fails
+  before removal and passes after removal. No clustering algorithm changes.
