@@ -32,6 +32,10 @@ def test_environment_supplies_vendored_dependencies_without_kilosort_distributio
     assert not any(entry.lower().startswith("kilosort") for entry in requirements)
     assert "klustakwik2" not in names  # Optional legacy sorter, not a pipeline dependency.
     if platform == "linux":
+        assert "nelpy @ git+https://github.com/nelpy/nelpy.git" in requirements
+        assert not any(entry.startswith("nelpy==") for entry in requirements)
+        assert "neuro-analysis-py==0.0.2" in requirements
+        assert "git" in names
         assert "--extra-index-url https://download.pytorch.org/whl/cu130" in requirements
         assert "torch==2.9.1+cu130" in requirements
 

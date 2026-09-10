@@ -2,6 +2,7 @@ name: preprocess
 channels:
   - conda-forge
 dependencies:
+  - git  # Required by neuro-analysis-py's nelpy Git dependency.
   - _libgcc_mutex=0.1=conda_forge
   - _openmp_mutex=4.5=2_gnu
   - alsa-lib=1.2.14=hb9d3cd8_0
@@ -360,7 +361,8 @@ dependencies:
       - mpmath==1.3.0
       - mtscomp==1.0.2
       - multidict==6.7.0
-      - nelpy==0.2.2
+      # Match neuro-analysis-py's Git URL to avoid conflicting source requirements.
+      - nelpy @ git+https://github.com/nelpy/nelpy.git
       - neo==0.14.3
       - networkx==3.6
       - neuro-analysis-py==0.0.2

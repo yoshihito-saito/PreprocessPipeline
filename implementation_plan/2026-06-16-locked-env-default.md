@@ -104,3 +104,27 @@ No package runtime API changes are planned.
 - Document the distinction and extend the environment regression check to prevent
   accidental reintroduction from an environment export. Verify the test fails
   before removal and passes after removal. No clustering algorithm changes.
+
+### Follow-up: nelpy source dependency
+
+- `nelpy==0.2.2` is unavailable from the user's package index. The installed
+  `neuro-analysis-py==0.0.2` metadata instead requires
+  `nelpy @ git+https://github.com/nelpy/nelpy.git`. The existing environment's
+  nelpy direct_url.json confirms GitHub installation.
+- Remove the incompatible index pin and let neuro-analysis-py supply its declared
+  source dependency. Add Git explicitly to the Linux Conda environment.
+- Preserve GUI Phy log summary functionality; do not downgrade nelpy to 0.2.1
+  or remove neuro-analysis-py. The upstream unpinned Git dependency remains a
+  reproducibility limitation; pinning it independently can conflict with the
+  direct URL required by neuro-analysis-py.
+- Extend environment regression checks, document the GitHub dependency, and run
+  setup tests. Full network installation remains a separate verification limit.
+
+### Explicit Git installation requested
+
+- Declare `nelpy @ git+https://github.com/nelpy/nelpy.git` explicitly in the
+  Linux pip list, matching neuro-analysis-py's exact dependency URL. This makes
+  the source visible rather than relying only on transitive installation.
+- Retain Conda Git. Do not claim commit-level reproducibility: the existing
+  installed commit is known, but the shared upstream requirement tracks Git HEAD.
+- Update the regression assertion and README to reflect explicit installation.

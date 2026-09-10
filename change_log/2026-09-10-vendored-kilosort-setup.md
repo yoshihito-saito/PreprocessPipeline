@@ -54,3 +54,35 @@ Unrelated pre-existing changes were left intact.
   exact cause is unknown. Full fresh environment installation remains unverified.
   Users who independently need the Python klustakwik2 API must provision it
   separately; it is no longer installed by standard pipeline setup.
+
+## Follow-up: nelpy source requirement (uncommitted)
+
+- Removed the unavailable `nelpy==0.2.2` index requirement. Kept
+  `neuro-analysis-py==0.0.2`, whose installed metadata explicitly requires
+  `nelpy @ git+https://github.com/nelpy/nelpy.git`; added Conda Git for that install.
+- Local spn nelpy provenance records GitHub commit
+  `d25a13c95b44196b6db748af544624633470e1df`. The GUI's Phy log summary imports
+  `neuro_py.raw.spike_sorting.phy_log_to_epocharray`, so dropping this functionality
+  or substituting the older PyPI nelpy release was avoided.
+- Updated the existing plan and README. Regression checks require retaining
+  neuro-analysis-py and Git and omitting the conflicting nelpy index pin.
+- `/local/workdir/ys2375/miniforge3/envs/spn/bin/python -m pytest tests/test_setup_env.py -q`
+  before the environment fix: 1 failed, 6 passed; after: 7 passed.
+- `git diff --check` passed; final diff inspected.
+- Fresh network resolution/install was not run. Upstream neuro-analysis-py uses
+  an unpinned Git URL, so the resolved nelpy commit may differ from the existing
+  environment. Independently pinning a different URL here risks a pip direct-URL
+  conflict; a fully locked dependency set needs separate validation.
+
+### Explicit Git installation
+
+- At user request, Linux now explicitly lists
+  `nelpy @ git+https://github.com/nelpy/nelpy.git`. This supersedes the preceding
+  reliance on transitive installation. The URL matches the installed
+  neuro-analysis-py metadata exactly; checked using packaging.Requirement and
+  importlib.metadata against the YAML requirement in the spn environment.
+- README and plan clarify that the Git source is explicit but its commit remains
+  unpinned. The former PyPI version pin is not restored.
+- `/local/workdir/ys2375/miniforge3/envs/spn/bin/python -m pytest tests/test_setup_env.py -q`
+  — 7 passed after updating the source requirement regression check.
+- `git diff --check` passed. No network install was performed; work is uncommitted.

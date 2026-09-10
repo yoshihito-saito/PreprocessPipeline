@@ -56,6 +56,12 @@ If an older environment file fails to build it, use the corrected file and rerun
 setup. Phy plugins that invoke an external `KlustaKwik` executable require that
 executable separately; installing `klustakwik2` does not supply that configuration.
 
+Linux setup explicitly installs `nelpy @ git+https://github.com/nelpy/nelpy.git`,
+matching the dependency declared by `neuro-analysis-py==0.0.2` for Phy log summaries.
+Git is included in the environment; setup needs access to GitHub. This URL tracks
+the upstream default branch, not a fixed commit. Do not add the exported
+`nelpy==0.2.2` index pin: that version is not available from the package index.
+
 To recreate the environment from scratch:
 
 ```bash
