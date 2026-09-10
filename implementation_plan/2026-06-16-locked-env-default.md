@@ -128,3 +128,12 @@ No package runtime API changes are planned.
 - Retain Conda Git. Do not claim commit-level reproducibility: the existing
   installed commit is known, but the shared upstream requirement tracks Git HEAD.
 - Update the regression assertion and README to reflect explicit installation.
+
+### Follow-up: Phy Git provenance
+
+- Replace unavailable `phy==2.0b6` with the Git URL and full commit recorded in
+  the existing phy2 environment: `1ddcd015e0382c3fc0ba20cd99dd5b8771bb8702`.
+- Keep the Phy API and plugins unchanged; do not upgrade to the public 2.1 release.
+- Align README installation instructions and test the explicit source requirement.
+- Audit available installed direct_url metadata for remaining exported source
+  dependencies. Full index availability and fresh solving require network access.

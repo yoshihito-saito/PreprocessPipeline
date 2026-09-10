@@ -261,10 +261,12 @@ are rejected. Existing outputs are not replaced unless `overwrite=True`.
 
 ### Phy
 
-Install Phy in the environment used to launch the GUI:
+Linux setup installs Phy from the same Git commit recorded in the reference
+phy2 environment. For a separate Phy installation in the environment used to
+launch the GUI:
 
 ```bash
-pip install git+https://github.com/cortex-lab/phy.git
+pip install "phy @ git+https://github.com/cortex-lab/phy.git@1ddcd015e0382c3fc0ba20cd99dd5b8771bb8702"
 ```
 
 The GUI can launch Phy after Sorting. Optional plugins are available from [phy2-plugins](https://github.com/petersenpeter/phy2-plugins).

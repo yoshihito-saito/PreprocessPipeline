@@ -86,3 +86,21 @@ Unrelated pre-existing changes were left intact.
 - `/local/workdir/ys2375/miniforge3/envs/spn/bin/python -m pytest tests/test_setup_env.py -q`
   — 7 passed after updating the source requirement regression check.
 - `git diff --check` passed. No network install was performed; work is uncommitted.
+
+### Phy source pin (uncommitted)
+
+- Replaced unavailable `phy==2.0b6` with
+  `phy @ git+https://github.com/cortex-lab/phy.git@1ddcd015e0382c3fc0ba20cd99dd5b8771bb8702`.
+  URL and commit were read from the existing phy2 environment's direct_url.json.
+- Updated README, plan, and source requirement regression checks. No Phy or
+  plugin implementation changed.
+- `/local/workdir/ys2375/miniforge3/envs/spn/bin/python -m pytest tests/test_setup_env.py -q`
+  failed before the YAML fix (1 failed, 6 passed), then passed (7 passed).
+- `git diff --check` passed; inspected task diff.
+- Audited installed direct_url metadata in spn and phy2 against the Linux pip
+  requirements. Phy and nelpy were the Git sources found; neuro-analysis-py is
+  installed editably from a local checkout, so matching its version alone does
+  not establish full source equivalence to PyPI.
+- An HTTPS request to the PyPI JSON API failed with temporary name-resolution
+  failure. Full package-index availability audit, Git fetch, and fresh Conda/pip
+  installation remain unverified.
