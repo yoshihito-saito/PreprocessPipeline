@@ -771,9 +771,26 @@ def load_local_session_resume(session_dir: Path) -> LocalSessionResume:
         raise NotADirectoryError(f"Local session folder does not exist: {session_dir}")
 
     claim_path = session_dir / ".pipeline-active-run.json"
+    claim = None
     if claim_path.exists():
         try:
             claim = json.loads(claim_path.read_text(encoding="utf-8"))
+            claim_session = str(claim.get("session_dir") or "").strip()
+            if claim_session and Path(claim_session).expanduser().resolve() != session_dir:
+                raise ValueError("Active-session marker belongs to a different output folder")
+            if claim.get("kind") == "manual":
+                # Curation leases protect writes, but do not prevent reading
+                # saved settings. Keep the lease intact, including stale leases.
+                claim = claim.get("previous_claim")
+                if claim is not None and not isinstance(claim, dict):
+                    raise ValueError("Manual-session marker has an invalid previous claim")
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot recover the persistent Run referenced by {claim_path}: {exc}"
+            ) from exc
+
+    if claim is not None:
+        try:
             if claim.get("kind", "run") != "run":
                 raise ValueError("the active-session marker is not a persistent Run")
             run_text = str(claim.get("run_dir") or "").strip()

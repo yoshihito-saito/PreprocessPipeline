@@ -307,6 +307,10 @@ def _input_provenance(settings: Any) -> dict[str, Any]:
                 )
         except OSError:
             continue
+    for item in values:
+        path = Path(item["path"])
+        if item.get("is_dir") is False and path.suffix.lower() in {".xml", ".json", ".oebin", ".txt"}:
+            item["sha256"] = _file_sha256(path)
     return {
         "scan_started_at": scan_started_at,
         "recorded_at": utc_now(),

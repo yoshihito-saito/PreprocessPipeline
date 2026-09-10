@@ -939,6 +939,53 @@ def test_move_completed_session_resume_uses_custom_selected_folder(tmp_path: Pat
     assert recovered.settings.execution.workspace == str(external_workspace.resolve())
 
 
+def test_local_session_resume_reads_completed_record_with_manual_lease(tmp_path: Path) -> None:
+    import os
+    import yaml
+
+    session = tmp_path / "sorting_temp" / "day1"
+    session.mkdir(parents=True)
+    settings = PipelineGuiSettings(basepath=str(tmp_path / "raw" / "day1"))
+    (session / "preprocess_run.yaml").write_text(
+        yaml.safe_dump({
+            "session_output_dir": str(session),
+            "analysis": AnalysisConfig.create(json.loads(settings.to_json())).to_dict(),
+            "execution": _resume_execution(session.parent).to_dict(),
+        }), encoding="utf-8",
+    )
+    marker = session / ".pipeline-active-run.json"
+    lease = json.dumps({
+        "kind": "manual", "owner": "Phy", "owner_pid": os.getpid(),
+        "session_dir": str(session), "previous_claim": None,
+    })
+    marker.write_text(lease, encoding="utf-8")
+
+    recovered = load_local_session_resume(session)
+
+    assert recovered.run_dir is None
+    assert recovered.metadata_source == "preprocess_run.yaml"
+    assert recovered.settings.local_output_dir == session
+    assert marker.read_text(encoding="utf-8") == lease
+
+
+def test_local_session_resume_reads_run_beneath_manual_lease(tmp_path: Path) -> None:
+    session = tmp_path / "sorting_temp" / "day1"
+    settings = PipelineGuiSettings(basepath=str(tmp_path / "raw" / "day1"))
+    run_dir = _write_active_resume_session(session, settings)
+    marker = session / ".pipeline-active-run.json"
+    lease = json.dumps({
+        "kind": "manual", "owner": "Phy", "session_dir": str(session),
+        "previous_claim": json.loads(marker.read_text(encoding="utf-8")),
+    })
+    marker.write_text(lease, encoding="utf-8")
+
+    recovered = load_local_session_resume(session)
+
+    assert recovered.run_dir == run_dir
+    assert recovered.settings.local_output_dir == session
+    assert marker.read_text(encoding="utf-8") == lease
+
+
 def test_local_session_resume_fails_closed_on_invalid_active_marker(tmp_path: Path) -> None:
     import pytest
     import yaml

@@ -171,11 +171,32 @@ def _input_snapshots_compatible(
     if not relevant_roots:
         return False
 
+    authoritative_xml = settings.resolved_xml_path()
+    authoritative_xml = Path(authoritative_xml).resolve() if authoritative_xml else None
+
+    def unused_multiday_xml(path: str) -> bool:
+        # Explicit XML supplies all Intan channel/rate metadata during staging.
+        # Per-recording amplifier XML is not read in that workflow.
+        return bool(
+            getattr(settings, "multi_day_enabled", False)
+            and authoritative_xml is not None
+            and Path(path).name.lower() == "amplifier.xml"
+            and Path(path).resolve() != authoritative_xml
+        )
+
+    def same_content(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        return bool(
+            left.get("is_dir") is False and right.get("is_dir") is False
+            and left.get("exists") is True and right.get("exists") is True
+            and left.get("size") == right.get("size")
+            and left.get("sha256") and left.get("sha256") == right.get("sha256")
+        )
+
     def relevant_entries(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
         return {
             str(item.get("path")): item
             for item in snapshot.get("inputs", [])
-            if any(
+            if not unused_multiday_xml(str(item.get("path"))) and any(
                 str(item.get("path")) == root
                 or str(item.get("path")).startswith(root + os.sep)
                 for root in relevant_roots
@@ -210,6 +231,11 @@ def _input_snapshots_compatible(
     metadata_keys = ("exists", "size", "mtime_ns", "is_dir")
     for path, stored in stored_current.items():
         live = live_current[path]
+        if same_content(stored, live):
+            live_ctimes[path] = live["ctime_ns"]
+            continue
+        if stored.get("sha256") and stored.get("sha256") != live.get("sha256"):
+            return False
         if any(stored.get(key) != live.get(key) for key in metadata_keys):
             return False
         live_ctime = live.get("ctime_ns")
@@ -230,10 +256,11 @@ def _input_snapshots_compatible(
     if not all(
         path in prior_entries
         and path in current_entries
-        and all(
+        and (same_content(prior_entries[path], current_entries[path]) or all(
             prior_entries[path].get(key) == current_entries[path].get(key)
             for key in metadata_keys
-        )
+        ))
+        and (not prior_entries[path].get("sha256") or prior_entries[path].get("sha256") == current_entries[path].get("sha256"))
         for path in prior_relevant_paths
     ):
         return False
@@ -265,6 +292,8 @@ def _input_snapshots_compatible(
     ):
         return False
     for path in prior_relevant_paths:
+        if same_content(prior_entries[path], current_entries[path]):
+            continue
         prior_ctime = prior_entries[path].get("ctime_ns")
         if isinstance(prior_ctime, int):
             if live_ctimes[path] != prior_ctime:

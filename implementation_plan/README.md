@@ -1,5 +1,9 @@
 # Implementation Plans
 
+- [2026-09-10 Kilosort4 partition channel exclusions](2026-09-10-kilosort-partition-channels.md)
+
+- [2026-09-10 resume input identity and manual-session recovery](2026-09-10-resume-input-identity.md)
+
 - [2026-09-09 memory-efficient state scoring](2026-09-09-memory-efficient-state-scoring.md)
 
 - [2026-06-16 default environment setup](2026-06-16-locked-env-default.md)

@@ -50,10 +50,12 @@ tests
 /tests/execution/*
 !/tests/execution/test_local_backend.py
 !/tests/execution/test_gpu_selection.py
+!/tests/execution/test_input_identity.py
 !/tests/preprocess/
 /tests/preprocess/*
 !/tests/preprocess/test_gui_move_outputs.py
 !/tests/preprocess/test_state_scoring_memory.py
+!/tests/preprocess/test_kilosort_partition_channels.py
 !/tests/stability/
 /tests/stability/*
 !/tests/stability/test_channel_mad.py
