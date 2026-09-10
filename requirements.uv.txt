@@ -1,0 +1,27 @@
+# Run via scripts/setup_uv.py from the repository root.
+-e .[dev,notebook]
+
+# Reference numerical stack; reusable package dependencies live in pyproject.toml.
+numpy==1.26.4
+scipy==1.16.3
+pandas==2.3.3
+PyYAML==6.0.3
+joblib==1.4.2
+llvmlite==0.45.1
+numba==0.62.1
+scikit-learn==1.7.2
+matplotlib==3.10.8
+PySide6==6.9.2
+
+# Kilosort is imported from sorter/Kilosort4, not installed from PyPI.
+torch==2.9.1
+torchvision==0.24.1
+faiss-cpu==1.13.0
+psutil==7.1.3
+tqdm==4.67.1
+packaging==25.0
+
+# Phy and its log-summary integration.
+phy @ git+https://github.com/cortex-lab/phy.git@1ddcd015e0382c3fc0ba20cd99dd5b8771bb8702
+nelpy @ git+https://github.com/nelpy/nelpy.git
+neuro-analysis-py==0.0.2

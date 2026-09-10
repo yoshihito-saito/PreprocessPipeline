@@ -13,6 +13,10 @@ spec = importlib.util.spec_from_file_location("setup_env", ROOT / "scripts/setup
 setup_env = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup_env)
 
+uv_spec = importlib.util.spec_from_file_location("setup_uv", ROOT / "scripts/setup_uv.py")
+setup_uv = importlib.util.module_from_spec(uv_spec)
+uv_spec.loader.exec_module(setup_uv)
+
 
 @pytest.mark.parametrize("platform", ["linux", "windows"])
 def test_environment_supplies_vendored_dependencies_without_kilosort_distribution(platform):
@@ -88,3 +92,73 @@ def test_setup_checks_vendored_source_after_stack(platform, monkeypatch):
     setup_env.main()
     assert events[0] == "create"
     assert events[-2:] == ["stack", "kilosort"]
+
+
+@pytest.mark.parametrize("system,relative_python", [("Linux", "bin/python"), ("Windows", "Scripts/python.exe")])
+@pytest.mark.parametrize("existing", [False, True])
+def test_uv_targets_venv_and_preserves_existing_environment(tmp_path, monkeypatch, system, relative_python, existing):
+    monkeypatch.setattr(setup_uv, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(setup_uv.platform, "system", lambda: system)
+    monkeypatch.setattr(setup_uv.shutil, "which", lambda name: name)
+    monkeypatch.setattr(sys, "argv", ["setup_uv.py", "--torch-backend", "cpu"])
+    monkeypatch.setenv("CONDA_PREFIX", "/unrelated/conda")
+    package = tmp_path / "sorter/Kilosort4/kilosort"
+    package.mkdir(parents=True)
+    (package / "__init__.py").touch()
+    python = tmp_path / ".venv" / relative_python
+    if existing:
+        python.parent.mkdir(parents=True)
+        python.touch()
+        (tmp_path / ".venv/pyvenv.cfg").touch()
+    calls = []
+    monkeypatch.setattr(setup_uv, "_run", lambda cmd: calls.append(cmd))
+    setup_uv.main()
+    assert any(cmd[:2] == ["uv", "venv"] for cmd in calls) is not existing
+    install = next(cmd for cmd in calls if cmd[:3] == ["uv", "pip", "install"])
+    assert install[install.index("--python") + 1] == str(python)
+    assert install[install.index("--torch-backend") + 1] == "cpu"
+    assert ["uv", "pip", "check", "--python", str(python)] in calls
+    assert calls[-1][0] == str(python)
+    assert "import kilosort" in calls[-1][-1]
+
+
+def test_uv_missing_tool_fails_before_mutation(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["setup_uv.py"])
+    monkeypatch.setattr(setup_uv.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(setup_uv.shutil, "which", lambda name: None)
+    monkeypatch.setattr(setup_uv, "_run", lambda cmd: pytest.fail("unexpected mutation"))
+    with pytest.raises(SystemExit, match="uv was not found"):
+        setup_uv.main()
+
+
+def test_uv_refuses_to_replace_non_environment_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["setup_uv.py"])
+    monkeypatch.setattr(setup_uv, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(setup_uv.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(setup_uv.shutil, "which", lambda name: name)
+    package = tmp_path / "sorter/Kilosort4/kilosort"
+    package.mkdir(parents=True)
+    (package / "__init__.py").touch()
+    (tmp_path / ".venv").mkdir()
+    marker = tmp_path / ".venv/keep.txt"
+    marker.write_text("user data")
+    monkeypatch.setattr(setup_uv, "_run", lambda cmd: pytest.fail("unexpected mutation"))
+    with pytest.raises(SystemExit, match="not a usable virtual environment"):
+        setup_uv.main()
+    assert marker.read_text() == "user data"
+
+
+def test_uv_requirements_cover_sorter_and_preserve_git_sources():
+    from packaging.requirements import Requirement
+    entries = [line.strip() for line in (ROOT / "requirements.uv.txt").read_text().splitlines()
+               if line.strip() and not line.startswith("#")]
+    assert "-e .[dev,notebook]" in entries
+    reqs = {req.name.lower(): req for req in map(Requirement, (x for x in entries if not x.startswith("-e ")))}
+    tree = ast.parse((ROOT / "sorter/Kilosort4/setup.py").read_text())
+    deps = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "install_deps" for t in n.targets))
+    assert {Requirement(d).name.lower() for d in deps} <= reqs.keys()
+    assert str(reqs["torch"].specifier) == "==2.9.1"
+    assert reqs["phy"].url.endswith("@1ddcd015e0382c3fc0ba20cd99dd5b8771bb8702")
+    assert reqs["nelpy"].url == "git+https://github.com/nelpy/nelpy.git"
+    assert not {"kilosort", "klustakwik2"} & reqs.keys()

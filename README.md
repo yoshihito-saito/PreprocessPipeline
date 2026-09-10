@@ -26,10 +26,43 @@ raw recordings
 
 - Windows or Linux
 - Git
-- Conda or Miniforge
+- uv, or Conda/Miniforge for the existing setup workflow
 - A graphical display for the Qt GUI
 - MATLAB and a compatible GPU/CUDA setup when required by the selected sorter
 - Slurm client commands when submitting jobs to a Slurm cluster
+
+### Install with uv
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and Git,
+then run these commands (an existing Python can launch the setup script):
+
+```bash
+git clone https://github.com/yoshihito-saito/PreprocessPipeline.git
+cd PreprocessPipeline
+python scripts/setup_uv.py
+source .venv/bin/activate
+preprocess-gui
+```
+
+On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1` instead.
+Setup creates a Python 3.11 `.venv` using uv, installs `requirements.uv.txt`,
+checks dependency consistency, and imports the vendored Kilosort4 and Phy stack.
+Rerun the same command to update an existing `.venv`; it never deletes it.
+An active Conda environment is not the installation target.
+
+The default is PyTorch 2.9.1 with CUDA 13.0. For CPU use
+`python scripts/setup_uv.py --torch-backend cpu`; CUDA 12.6 and 12.8 are also
+available via `cu126` and `cu128`. Backend selection uses the
+[uv PyTorch interface](https://docs.astral.sh/uv/guides/integration/pytorch/).
+GPU sorting still requires a compatible driver and GPU.
+
+This workflow uses `uv pip`, with a focused dependency list instead of the full
+Conda export. It does not supply a validated `uv.lock`; launch from the activated
+environment rather than running `uv sync`, which uses a different dependency set.
+GitHub access is required for Phy and nelpy. Git and system GUI libraries must be
+available on the host; uv does not install Conda's operating-system libraries.
+
+### Install with Conda
 
 Clone the repository and create the environment:
 
@@ -71,8 +104,10 @@ conda activate preprocess
 
 ## Start the GUI
 
+Activate the environment created by your chosen installer (`source
+.venv/bin/activate` for uv on Linux, or `conda activate preprocess` for Conda), then:
+
 ```bash
-conda activate preprocess
 preprocess-gui
 ```
 

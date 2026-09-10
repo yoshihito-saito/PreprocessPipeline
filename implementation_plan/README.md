@@ -1,5 +1,7 @@
 # Implementation Plans
 
+- [2026-09-10 uv environment setup](2026-09-10-uv-setup.md)
+
 - [2026-09-10 Kilosort4 partition channel exclusions](2026-09-10-kilosort-partition-channels.md)
 
 - [2026-09-10 resume input identity and manual-session recovery](2026-09-10-resume-input-identity.md)
