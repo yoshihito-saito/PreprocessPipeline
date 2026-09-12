@@ -355,6 +355,8 @@ def _move_local_output_to_storage(
     destination_xml = dst_root / session_xml_name
     destination_has_xml = destination_xml.exists() or destination_xml.is_symlink()
     excluded: dict[str, str] = {
+        ".preprocess-output-backups": "preprocess backups deleted after verified copy",
+        ".preprocess-output-contract.json": "local preprocess contract stays local",
         f"{basename}.rhd": "input metadata already belongs in basepath",
         "@eaDir": "system metadata folder",
     }
@@ -624,6 +626,27 @@ def _move_local_output_to_storage(
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
 
+    # Cleanup is outside the publication rollback boundary: the verified copy
+    # remains valid even if removing obsolete recovery artifacts fails.
+    artifact_cleanup = (
+        dst_root / ".preprocess-output-backups",
+        dst_root / ".preprocess-output-contract.json",
+        src_root / ".preprocess-output-backups",
+    )
+    for artifact in artifact_cleanup:
+        try:
+            if artifact.is_symlink():
+                artifact.unlink()
+            elif artifact.is_dir():
+                shutil.rmtree(artifact)
+            elif artifact.exists():
+                artifact.unlink()
+        except OSError as exc:
+            raise OSError(
+                "Destination publication succeeded, but preprocess artifact cleanup failed "
+                f"for {artifact}; the destination remains valid at {dst_root}: {exc}"
+            ) from exc
+
     cleaned = False
     if clean_after_move:
         try:
@@ -648,7 +671,7 @@ def _move_local_output_to_storage(
                 for item in inventory_move
                 if (src_root / item["name"]) not in publication_skipped_sources
             ],
-            "retain": skipped,
+            "retain": [item for item in skipped if item["name"] != ".preprocess-output-backups"],
             "delete_local": clean_after_move,
         },
         "overwrite": overwrite,
@@ -6361,8 +6384,11 @@ class MainWindow(QMainWindow):
                 selected: list[Path] = []
                 retained: list[Path] = []
                 for item in Path(preview_root).iterdir():
+                    if item.name == ".preprocess-output-backups":
+                        continue
                     keep_local = (
                         item.name == "@eaDir"
+                        or item.name == ".preprocess-output-contract.json"
                         or item.suffix.lower() == ".rhd"
                         or (
                             item.suffix.lower() == ".xml"
@@ -6391,7 +6417,10 @@ class MainWindow(QMainWindow):
                 f"Overwrite existing files: {'yes' if self.move_overwrite.isChecked() else 'no'}\n"
                 "Delete local after verified copy: "
                 f"{'yes' if self.move_clean_local.isChecked() else 'no'}\n\n"
-                f"{inventory_text}"
+                f"{inventory_text}\n\n"
+                "After verified copy, preprocess backups are deleted locally and at storage; "
+                "the storage preprocess contract is also deleted. These items are not copied. "
+                "The local contract is retained unless the entire local folder is deleted."
             )
             answer = QMessageBox.question(self, "Copy outputs to storage", message)
             if answer != QMessageBox.StandardButton.Yes:

@@ -30,3 +30,22 @@ Result: all 16 focused tests passed and compilation completed successfully.
 
 - Internal helper and result-field names retain their existing `move` terminology for compatibility.
 - The copy runs synchronously in the GUI and does not yet expose progress or cancellation controls.
+
+## 2026-09-10: preprocess recovery artifact cleanup
+
+Status: uncommitted. Updated the existing implementation plan linked above.
+
+- Excluded preprocess backups and the output contract from storage transfer, including GUI copy counts and byte estimates.
+- After verified publication and permission updates, delete existing storage backups/contracts and local backups. Retain the local contract for rerun checks unless full local deletion is enabled.
+- Keep cleanup outside publication rollback; report cleanup errors with the failing path and valid destination. Cleanup unlinks symlinks instead of following them.
+- Updated README and GUI confirmation to describe automatic deletion.
+
+Verification:
+
+```text
+/local/workdir/ys2375/miniforge3/envs/phy2/bin/pytest -q tests/preprocess/test_gui_move_outputs.py
+/local/workdir/ys2375/miniforge3/envs/phy2/bin/python -m py_compile src/preprocess/gui/app.py tests/preprocess/test_gui_move_outputs.py
+git diff --check
+```
+
+Result: 21 tests passed, including successful artifact cleanup, copy/validation failure preservation, cleanup failure without publication rollback, and symlink target preservation. Compilation and diff whitespace checks passed. No real session data was modified; interactive GUI operation was not exercised. Cleanup can be partial if a later deletion fails; the reported path identifies the failure.

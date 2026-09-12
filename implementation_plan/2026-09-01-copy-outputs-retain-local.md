@@ -17,7 +17,9 @@ The staged transfer originally deleted selected source items even when `clean_af
 ## Intended behavior
 
 - The storage action remains a staged, content-verified publication.
-- With local deletion disabled, every source item remains unchanged after a successful copy.
+- With local deletion disabled, scientific outputs and the local preprocess contract remain unchanged after a successful copy.
+- Extension (2026-09-10): exclude `.preprocess-output-backups` and `.preprocess-output-contract.json` from transfer. After successful publication, content verification, and permission updates, remove local preprocess backups and both items at the destination (including previously copied instances). Keep the local contract for resume checks. Never follow cleanup symlinks. Report cleanup failure separately from transfer failure, without rolling back verified outputs.
+- The GUI preview excludes these items from copy size/count and explains automatic cleanup. Regression coverage includes successful cleanup, transfer/verification failure preservation, cleanup failure, and symlink safety.
 - With local deletion enabled, the source session directory is removed only after destination verification succeeds.
 - GUI wording describes a copy, and local deletion is disabled by default.
 - After destination verification, the destination root and its complete tree are made world-readable and world-writable; directories also receive traversal permission.

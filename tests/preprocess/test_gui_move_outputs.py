@@ -532,3 +532,86 @@ def test_move_rejects_equal_size_staging_corruption_before_source_deletion(
 
     assert source_file.read_bytes() == b"original"
     assert not (destination / "result.mat").exists()
+
+
+@pytest.mark.parametrize("failure", [None, "copy", "validation", "cleanup"])
+def test_copy_preprocess_artifact_lifecycle(tmp_path: Path, monkeypatch, failure) -> None:
+    import src.preprocess.gui.app as app
+
+    source = tmp_path / "local" / "session"
+    destination = tmp_path / "storage"
+    source.mkdir(parents=True)
+    destination.mkdir()
+    (source / "result.mat").write_bytes(b"result")
+    for root in (source, destination):
+        backup = root / ".preprocess-output-backups" / "old"
+        backup.mkdir(parents=True)
+        (backup / "session.dat").write_bytes(b"old data")
+        (root / ".preprocess-output-contract.json").write_text("{}")
+    real_copy2 = app.shutil.copy2
+    real_rmtree = app.shutil.rmtree
+
+    def copy(source_path, destination_path, *args, **kwargs):
+        assert Path(source_path).name == "result.mat"
+        if failure == "copy":
+            raise OSError("injected copy failure")
+        result = real_copy2(source_path, destination_path, *args, **kwargs)
+        if failure == "validation":
+            Path(destination_path).write_bytes(b"broken")
+        return result
+
+    def remove(path, *args, **kwargs):
+        if failure == "cleanup" and Path(path).name == ".preprocess-output-backups":
+            raise PermissionError("injected cleanup failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(app.shutil, "copy2", copy)
+    monkeypatch.setattr(app.shutil, "rmtree", remove)
+    kwargs = dict(
+        source_dir=source, source_basename="session", move_dat=False,
+        overwrite=False, clean_after_move=False,
+    )
+    settings = PipelineGuiSettings(basepath=str(destination))
+    if failure:
+        message = {
+            "copy": "injected copy failure",
+            "validation": "Staged transfer validation failed",
+            "cleanup": "Destination publication succeeded, but preprocess artifact cleanup failed",
+        }[failure]
+        with pytest.raises(OSError, match=message):
+            _move_local_output_to_storage(settings, **kwargs)
+        for root in (source, destination):
+            assert (root / ".preprocess-output-backups" / "old" / "session.dat").read_bytes() == b"old data"
+            assert (root / ".preprocess-output-contract.json").read_text() == "{}"
+        assert (destination / "result.mat").exists() == (failure == "cleanup")
+    else:
+        result = _move_local_output_to_storage(settings, **kwargs)
+        assert (destination / "result.mat").read_bytes() == b"result"
+        assert {item["name"] for item in result["moved"]} == {"result.mat"}
+        assert not (destination / ".preprocess-output-contract.json").exists()
+        for root in (source, destination):
+            assert not (root / ".preprocess-output-backups").exists()
+    assert (source / ".preprocess-output-contract.json").read_text() == "{}"
+    assert (source / "result.mat").read_bytes() == b"result"
+
+
+def test_copy_artifact_cleanup_does_not_follow_symlinks(tmp_path: Path) -> None:
+    source = tmp_path / "session"
+    destination = tmp_path / "storage"
+    outside = tmp_path / "outside"
+    for path in (source, destination, outside):
+        path.mkdir()
+    (outside / "keep.dat").write_bytes(b"keep")
+    (source / "result.mat").write_bytes(b"result")
+    for root in (source, destination):
+        (root / ".preprocess-output-backups").symlink_to(outside, target_is_directory=True)
+    (destination / ".preprocess-output-contract.json").symlink_to(outside / "keep.dat")
+    _move_local_output_to_storage(
+        PipelineGuiSettings(basepath=str(destination)),
+        source_dir=source, source_basename="session", move_dat=False,
+        overwrite=False, clean_after_move=False,
+    )
+    assert (outside / "keep.dat").read_bytes() == b"keep"
+    for root in (source, destination):
+        assert not (root / ".preprocess-output-backups").is_symlink()
+    assert not (destination / ".preprocess-output-contract.json").is_symlink()
