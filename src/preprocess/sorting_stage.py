@@ -36,7 +36,7 @@ def _resolved_xml_path(config: PreprocessConfig, result: PreprocessResult) -> Pa
     raise FileNotFoundError(f"Sorting requires the session XML for {result.basename}")
 
 
-def _resolved_chanmap_path(config: PreprocessConfig, result: PreprocessResult) -> Path:
+def _resolved_chanmap_path(config: PreprocessConfig, result: PreprocessResult) -> Path | None:
     candidates = [
         Path(result.local_output_dir) / "chanMap.mat",
         Path(config.chanmap_mat_path) if config.chanmap_mat_path is not None else None,
@@ -45,9 +45,9 @@ def _resolved_chanmap_path(config: PreprocessConfig, result: PreprocessResult) -
     for candidate in candidates:
         if candidate is not None and candidate.exists():
             return candidate.resolve()
-    # Preserve the legacy all-channel path: the sorter runner tolerates a missing
-    # optional chanMap, while probe/shank partition validation below requires it.
-    return (Path(result.local_output_dir) / "chanMap.mat").resolve()
+    if config.chanmap_mat_path is not None:
+        raise FileNotFoundError(f"Selected chanMap does not exist: {config.chanmap_mat_path}")
+    return None
 
 
 def run_sorting_stage(
@@ -76,7 +76,7 @@ def run_sorting_stage(
     bad_0 = sorted(set(int(value) for value in preprocess_result.bad_channels_0based))
     sorter_input_is_preprocessed = bool(config.do_preprocess)
     sorter_exclude_channels_0based = (
-        bad_0 if config.bad_channels and bad_0 and not sorter_input_is_preprocessed else None
+        bad_0 if config.bad_channels and bad_0 else None
     )
     partition_excluded = bad_0 if config.bad_channels else []
 
@@ -99,6 +99,10 @@ def run_sorting_stage(
     manifest_path: Path | None = None
     attempt_manifest_name = f"sorter_partition_manifest.attempt-{timestamp}-{uuid.uuid4().hex[:8]}.json"
     for partition in partitions:
+        if partition.status == "skipped":
+            print(f"Skipping sorter partition {partition.name}: {partition.skip_reason}")
+            manifest_partitions.append(partition)
+            continue
         suffix = "" if partition.mode == "all" else f"_{partition.name}"
         output_folder = output_dir / f"{sorter_output_prefix(sorter_label)}_{timestamp}{suffix}"
         if output_folder.exists():

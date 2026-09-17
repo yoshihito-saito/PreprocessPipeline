@@ -360,7 +360,7 @@ def _(pre_config, recording_for_post, result):
         dtype=pre_config.dtype,
         gain_to_uV=pre_config.gain_to_uV,
         offset_to_uV=pre_config.offset_to_uV,
-        chanmap_mat_path=pre_config.chanmap_mat_path,
+        chanmap_mat_path=result.local_output_dir / "chanMap.mat",
         reject_channels=result.bad_channels_0based,
 
         apply_preprocess=False,

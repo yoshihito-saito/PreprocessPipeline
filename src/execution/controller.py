@@ -346,12 +346,15 @@ def create_run(
 
     resolve_existing_session_settings(settings)
     resolved_xml = settings.resolved_xml_path()
-    resolved_chanmap = settings.resolved_chanmap_path()
+    resolved_chanmap = settings.postprocess_chanmap_path() if mode == "postprocess" else settings.resolved_chanmap_path()
     if resolved_xml is not None:
         settings.xml_path = str(resolved_xml.resolve())
     if resolved_chanmap is not None and resolved_chanmap.exists():
         settings.chanmap_path = str(resolved_chanmap.resolve())
     if mode == "postprocess":
+        resolved_dat = settings.postprocess_dat_path()
+        if resolved_dat is not None:
+            settings.postprocess.dat_path = str(resolved_dat.resolve())
         resolved_sorting = settings.postprocess_sorting_folder()
         if resolved_sorting is not None:
             settings.postprocess.sorting_phy_folder = str(resolved_sorting.resolve())
@@ -412,7 +415,7 @@ def create_run(
     if sorter_source_bytes is not None:
         artifact_sha256["sorter_config"] = hashlib.sha256(sorter_source_bytes).hexdigest()
     if mode == "postprocess":
-        chanmap_sha256 = _file_sha256(settings.resolved_chanmap_path())
+        chanmap_sha256 = _file_sha256(settings.postprocess_chanmap_path())
         if chanmap_sha256:
             artifact_sha256["chanmap"] = chanmap_sha256
         artifact_sha256["postprocess_sorting_input"] = _sorting_input_identity(

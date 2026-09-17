@@ -31,6 +31,10 @@ from ..preprocess.recording import (
     select_recording_channels,
 )
 from .metafile import PostprocessConfig, PostprocessResult
+from .phy_export import write_centered_native_templates
+from ..phy_metadata import read_phy_params, resolve_phy_dat_path
+from ..preprocess.channel_layout import NoActiveChannels
+from ..sorting_manifest import all_partitions_skipped
 
 _SORTING_OUTPUT_PATTERNS = (
     "Kilosort_*",
@@ -66,6 +70,8 @@ def _find_sorting_output_dirs_from_manifest(root: Path) -> list[Path]:
     candidates: list[Path] = []
     seen: set[Path] = set()
     for partition in payload.get("partitions", []):
+        if not isinstance(partition, dict) or partition.get("status") not in {None, "completed"}:
+            continue
         folder_text = str(partition.get("output_folder") or "").strip()
         if not folder_text:
             continue
@@ -191,6 +197,14 @@ def _publish_postprocess_attempt(
     restored before the exception is propagated.
     """
     _validate_postprocess_output(staging_folder, metrics_csv_name)
+    params = read_phy_params(staging_folder)
+    dat = resolve_phy_dat_path(staging_folder)
+    if dat is not None and dat.parent == staging_folder.resolve() and Path(str(params.get("dat_path", ""))).is_absolute():
+        _fix_phy_params_file(
+            staging_folder / "params.py", output_folder / dat.name,
+            bool(params.get("hp_filtered", False)), n_channels_dat=params.get("n_channels_dat"),
+            use_relative_path=False,
+        )
     preserved: Path | None = None
     if output_folder.exists():
         preserved = _preserve_or_remove_postprocess_output(output_folder)
@@ -265,9 +279,13 @@ def _resolve_postprocess_targets(config: PostprocessConfig) -> list[Path]:
         return [sorting_phy_folder]
 
     root = _resolve_postprocess_search_root(config)
+    if all_partitions_skipped(root / "sorter_partition_manifest.json"):
+        return []
     manifest_candidates = _find_sorting_output_dirs_from_manifest(root)
     if manifest_candidates:
         return manifest_candidates
+    if (root / "sorter_partition_manifest.json").exists():
+        raise ValueError(f"No completed sorting targets in manifest under {root}; select an input explicitly")
     candidates = [p.resolve() for p in _find_sorting_output_dirs(root)]
     if not candidates:
         raise FileNotFoundError(f"No Kilosort result found under {root}.")
@@ -742,6 +760,11 @@ def _resolve_effective_chanmap_for_postprocess(
     local_output_dir: Path | None = None,
     dat_path: Path | None = None,
 ) -> Path | None:
+    if chanmap_mat_path is not None:
+        path = Path(chanmap_mat_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Selected chanMap does not exist: {path}")
+        return path
     candidates: list[Path] = []
     if local_output_dir is not None:
         candidates.append(Path(local_output_dir) / _CANONICAL_CHANMAP_NAME)
@@ -757,34 +780,63 @@ def _resolve_recording_for_postprocess(config: PostprocessConfig):
     if config.recording is None and config.dat_path is None:
         raise ValueError("Either recording or dat_path must be provided")
 
-    if config.recording is not None:
-        return config.recording
-
-    if config.sampling_frequency is None or config.num_channels is None:
+    if config.recording is None and (config.sampling_frequency is None or config.num_channels is None):
         raise ValueError("sampling_frequency and num_channels are required when dat_path is used")
 
-    rec_raw = se.read_binary(
-        str(Path(config.dat_path)),
-        sampling_frequency=float(config.sampling_frequency),
-        dtype=config.dtype,
-        num_channels=int(config.num_channels),
-        gain_to_uV=config.gain_to_uV,
-        offset_to_uV=config.offset_to_uV,
-    )
+    if config.recording is not None:
+        rec_raw = config.recording
+    else:
+        width_bytes = int(config.num_channels) * np.dtype(config.dtype).itemsize
+        size = Path(config.dat_path).stat().st_size - config.binary_offset
+        if width_bytes <= 0 or size <= 0 or size % width_bytes:
+            raise ValueError("Binary size/offset is incompatible with the configured channel count and dtype")
+        rec_raw = se.read_binary(
+            str(Path(config.dat_path)),
+            sampling_frequency=float(config.sampling_frequency),
+            dtype=config.dtype,
+            num_channels=int(config.num_channels),
+            gain_to_uV=config.gain_to_uV,
+            offset_to_uV=config.offset_to_uV,
+            file_offset=config.binary_offset,
+        )
+    if config.num_channels is not None and hasattr(rec_raw, "annotate"):
+        rec_raw.annotate(binary_num_channels=int(config.num_channels))
+    rejects = set(config.reject_channels)
+    if config.xml_path is not None:
+        from ..preprocess.io import load_session_xml_metadata
+        xml = load_session_xml_metadata(Path(config.xml_path))
+        rejects.update(xml.skipped_channels_0based)
+        if xml.spike_groups_0based:
+            included = {ch for group in xml.spike_groups_0based for ch in group}
+            rejects.update(int(ch) for ch in rec_raw.get_channel_ids() if int(ch) not in included)
     rec_with_probe, bad_0, _ = attach_probe_and_remove_bad_channels(
         recording=rec_raw,
         chanmap_mat_path=_resolve_effective_chanmap_for_postprocess(
             config.chanmap_mat_path,
-            dat_path=Path(config.dat_path),
+            dat_path=Path(config.dat_path) if config.dat_path is not None else None,
         ),
-        reject_channels_0based=sorted(set(config.reject_channels)),
+        reject_channels_0based=sorted(rejects),
+        original_num_channels=config.num_channels,
     )
     if hasattr(rec_with_probe, "get_channel_ids"):
         bad_set = {int(ch) for ch in bad_0}
         all_channels = [int(ch) for ch in rec_with_probe.get_channel_ids()]
         good_channels = [ch for ch in all_channels if ch not in bad_set]
+        if config.sorting_phy_folder is not None:
+            folder = _resolve_sorting_run_root(Path(config.sorting_phy_folder).resolve())
+            manifest = folder.parent / "sorter_partition_manifest.json"
+            if manifest.exists():
+                payload = json.loads(manifest.read_text(encoding="utf-8"))
+                for item in payload.get("partitions", []):
+                    if item.get("output_folder") and Path(item["output_folder"]).resolve() == folder:
+                        scope = {int(ch) for ch in item["channels_0based"]}
+                        good_channels = [ch for ch in good_channels if ch in scope]
+                        break
     else:
         good_channels = []
+
+    if not good_channels:
+        raise NoActiveChannels("All recording channels are excluded; postprocess skipped")
 
     if config.apply_preprocess:
         if good_channels:
@@ -819,6 +871,9 @@ def _fix_phy_params_file(
     *,
     n_channels_dat: int | None,
     use_relative_path: bool,
+    dtype: str | None = None,
+    sample_rate: float | None = None,
+    offset: int | None = None,
 ) -> None:
     content = params_file.read_text(encoding="utf-8")
     dat_path_obj = Path(dat_path)
@@ -830,7 +885,7 @@ def _fix_phy_params_file(
             ).as_posix()
         except Exception:
             dat_value = str(dat_path_obj)
-    dat_line = f"dat_path = r'{dat_value}'"
+    dat_line = f"dat_path = {dat_value!r}"
     if re.search(r"(?m)^dat_path\s*=", content):
         content = re.sub(r"(?m)^dat_path\s*=.*$", lambda _: dat_line, content)
     else:
@@ -848,6 +903,13 @@ def _fix_phy_params_file(
             content = re.sub(r"(?m)^n_channels_dat\s*=.*$", lambda _: n_channels_line, content)
         else:
             content += f"\n{n_channels_line}\n"
+    for key, value in (("dtype", dtype), ("sample_rate", sample_rate), ("offset", offset)):
+        if value is not None:
+            line = f"{key} = {value!r}"
+            if re.search(rf"(?m)^{key}\s*=", content):
+                content = re.sub(rf"(?m)^{key}\s*=.*$", lambda _: line, content)
+            else:
+                content += f"\n{line}\n"
     params_file.write_text(content, encoding="utf-8")
 
 
@@ -872,6 +934,8 @@ def _export_phy_to_output_folder(
     copy_binary: bool,
     use_relative_path: bool,
     job_kwargs: dict[str, Any],
+    binary_dtype: str | None = None,
+    binary_offset: int = 0,
 ) -> None:
     # export_to_phy requires output_folder not to exist. Since we keep output_folder
     # (and optionally analyzer_cache) around, export into a temporary child folder and
@@ -900,6 +964,7 @@ def _export_phy_to_output_folder(
         verbose=True,
         **job_kwargs,
     )
+    write_centered_native_templates(sorting_analyzer, phy_export_tmp, job_kwargs)
     for child in phy_export_tmp.iterdir():
         destination = output_folder / child.name
         if destination.exists():
@@ -911,15 +976,29 @@ def _export_phy_to_output_folder(
     _safe_rmtree(phy_export_tmp)
 
     params_file = output_folder / "params.py"
-    if dat_path is not None:
+    if copy_binary:
+        _fix_phy_params_file(
+            params_file, output_folder / "recording.dat", sorting_analyzer.is_filtered(),
+            n_channels_dat=sorting_analyzer.get_num_channels(),
+            use_relative_path=bool(use_relative_path),
+            dtype=np.dtype(sorting_analyzer.recording.get_dtype()).str,
+            sample_rate=float(sorting_analyzer.sampling_frequency), offset=0,
+        )
+    elif dat_path is not None:
         _fix_phy_params_file(
             params_file=params_file,
             dat_path=Path(dat_path),
             hp_filtered=hp_filtered,
             n_channels_dat=raw_num_channels,
             use_relative_path=bool(use_relative_path),
+            dtype=binary_dtype,
+            sample_rate=float(sorting_analyzer.sampling_frequency) if hasattr(sorting_analyzer, "sampling_frequency") else None,
+            offset=binary_offset,
         )
-    _fix_phy_channel_map_file(output_folder)
+        _fix_phy_channel_map_file(output_folder)
+        channel_map = np.load(output_folder / "channel_map.npy")
+        if raw_num_channels is None or np.any(channel_map < 0) or np.any(channel_map >= raw_num_channels):
+            raise ValueError("Phy channel IDs do not address columns of the referenced binary")
 
 
 def _config_for_sorting_target(
@@ -928,12 +1007,67 @@ def _config_for_sorting_target(
     sorting_phy_folder: Path,
     multiple_targets: bool,
 ) -> PostprocessConfig:
+    config = replace(config, sorting_phy_folder=sorting_phy_folder)
     if not multiple_targets or config.analyzer_cache_dir is None:
         return config
     return replace(
         config,
         analyzer_cache_dir=(Path(config.analyzer_cache_dir).resolve() / _resolve_sorting_run_root(sorting_phy_folder).name),
     )
+
+
+def _analyzer_input_identity(recording, sorting_folder: Path, config: PostprocessConfig) -> str:
+    """Bind reusable features to their lazy signal graph and original sorting."""
+    def normalize(value):
+        if isinstance(value, dict):
+            return {str(key): normalize(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [normalize(item) for item in value]
+        if isinstance(value, np.ndarray):
+            if value.dtype.hasobject:
+                return normalize(value.tolist())
+            return {"shape": value.shape, "dtype": str(value.dtype),
+                    "sha256": hashlib.sha256(np.ascontiguousarray(value).view(np.uint8)).hexdigest()}
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, Path):
+            value = str(value.resolve())
+        if isinstance(value, str) and Path(value).is_absolute() and Path(value).is_file():
+            stat = Path(value).stat()
+            return {"path": str(Path(value).resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        return value
+
+    source_files = {}
+    # Phy extractors also accept CSV labels and arbitrary CSV/TSV properties.
+    names = {"spike_times.npy", "spike_clusters.npy", "spike_templates.npy"}
+    names.update(path.name for suffix in ("*.csv", "*.tsv") for path in sorting_folder.glob(suffix))
+    for name in sorted(names):
+        path = sorting_folder / name
+        if path.is_file():
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            source_files[name] = digest.hexdigest()
+    payload = normalize({
+        "recording": recording.to_dict(recursive=True, include_properties=True),
+        "source_sorting": str(sorting_folder.resolve()),
+        "source_files": source_files,
+        "exclude_cluster_groups": config.exclude_cluster_groups,
+        "low_rate_threshold_hz": config.noise_thresholds.get("firing_rate_lt", 0.01),
+        "n_components": config.n_components,
+        "pc_mode": config.pc_mode,
+    })
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _validate_analyzer_cache_input(folder: Path, identity: str) -> None:
+    path = folder / "pipeline_input_identity.json"
+    if not path.is_file() or json.loads(path.read_text(encoding="utf-8")).get("identity") != identity:
+        raise ValueError(
+            "Cached analyzer input does not match or has no verified provenance. "
+            "Rebuild with skip_curation=False and overwrite=True for the selected recording/sorting."
+        )
 
 
 def _run_postprocess_single_session_impl(
@@ -963,6 +1097,28 @@ def _run_postprocess_single_session_impl(
             metrics_csv_path=metrics_csv_path,
             analyzer_cache_root=analyzer_cache_root,
         )
+    recording_for_post = (_resolve_recording_for_postprocess(config)
+                          if config.dat_path is not None or config.recording is not None else None)
+    source_params = read_phy_params(sorting_phy_folder)
+    rate = source_params.get("sample_rate")
+    if recording_for_post is not None and rate is not None and not np.isclose(
+        float(rate), recording_for_post.get_sampling_frequency(), rtol=1e-5, atol=1e-2
+    ):
+        raise ValueError("Sorting and recording sampling rates disagree")
+    spike_file = sorting_phy_folder / "spike_times.npy"
+    if recording_for_post is not None and spike_file.exists():
+        samples = np.load(spike_file, mmap_mode="r", allow_pickle=False)
+        if samples.size and (samples.min() < 0 or samples.max() >= recording_for_post.get_num_samples()):
+            raise ValueError("Sorting spike samples fall outside the selected recording timeline")
+    if config.dat_path is not None and resolve_phy_dat_path(sorting_phy_folder) == Path(config.dat_path).resolve():
+        expected = {"n_channels_dat": config.num_channels, "dtype": np.dtype(config.dtype),
+                    "offset": config.binary_offset}
+        for key, value in expected.items():
+            actual = source_params.get(key)
+            if key == "dtype" and actual is not None:
+                actual = np.dtype(actual)
+            if key in source_params and value is not None and actual != value:
+                raise ValueError(f"Conflicting {key} metadata for the same binary")
     if _should_skip_postprocess_target(
         config,
         output_folder=output_folder,
@@ -980,6 +1136,10 @@ def _run_postprocess_single_session_impl(
     _assert_postprocess_output_is_writable(
         config, output_folder=output_folder, metrics_csv_path=metrics_csv_path
     )
+    if (config.skip_curation or not overwrite) and config.analyzer_format == "binary_folder" and config.analyzer_cache_dir is not None:
+        split_folder = analyzer_cache_root / "split"
+        if split_folder.exists():
+            _validate_analyzer_cache_input(split_folder, _analyzer_input_identity(recording_for_post, sorting_phy_folder, config))
 
     _log(f"sorting_phy_folder={sorting_phy_folder}")
     canonical_output_folder = output_folder
@@ -1000,8 +1160,6 @@ def _run_postprocess_single_session_impl(
 
     # Container to track intermediate analyzers for cleanup before export
     _intermediate_analyzers: list = []
-
-    recording_for_post = None
 
     def _ensure_recording_for_post():
         nonlocal recording_for_post
@@ -1035,6 +1193,8 @@ def _run_postprocess_single_session_impl(
         )
 
     low_rate_threshold_hz = float(config.noise_thresholds.get("firing_rate_lt", 0.01))
+    # Validate before changing source cluster labels or loading a cached analyzer.
+    recording = _ensure_recording_for_post()
     _log(
         "marking low firing-rate clusters as noise before Phy load "
         f"(threshold={low_rate_threshold_hz:g} Hz)"
@@ -1195,6 +1355,9 @@ def _run_postprocess_single_session_impl(
             pc_mode=config.pc_mode,
             job_kwargs=config.job_kwargs,
         )
+        if config.analyzer_format == "binary_folder" and analyzer_cache_root is not None:
+            identity_path = analyzer_cache_root / "split" / "pipeline_input_identity.json"
+            identity_path.write_text(json.dumps({"identity": _analyzer_input_identity(recording, sorting_phy_folder, config)}), encoding="utf-8")
 
     if not overwrite and metrics_csv_path.exists():
         _log("overwrite=False and quality metrics already exist; skipping metric recomputation")
@@ -1234,13 +1397,12 @@ def _run_postprocess_single_session_impl(
             analyzer_cache_root=analyzer_cache_root,
             dat_path=Path(config.dat_path) if config.dat_path is not None else None,
             hp_filtered=(not bool(config.apply_preprocess)),
-            raw_num_channels=_resolve_phy_n_channels_dat(
-                sorting_phy_folder,
-                fallback_num_channels=config.num_channels,
-            ),
+            raw_num_channels=config.num_channels,
             copy_binary=config.copy_binary,
             use_relative_path=bool(config.use_relative_path),
             job_kwargs=config.job_kwargs,
+            binary_dtype=config.dtype,
+            binary_offset=config.binary_offset,
         )
 
     # export_to_phy can recreate output_folder when remove_if_exists=True.
@@ -1364,12 +1526,17 @@ def run_postprocess_session(config: PostprocessConfig) -> list[PostprocessResult
                 f"[postprocess] [{status} {len(results) + 1}/{len(targets)}] "
                 f"{sorting_phy_folder.name} -> {output_folder.name}"
             )
-        results.append(
-            _run_postprocess_single_session(
+        try:
+            result = _run_postprocess_single_session(
                 target_config,
                 sorting_phy_folder=sorting_phy_folder,
             )
-        )
+        except NoActiveChannels as exc:
+            skipped_count += 1
+            if config.verbose:
+                print(f"[postprocess] skip {sorting_phy_folder.name}: {exc}")
+            continue
+        results.append(result)
         if should_skip:
             skipped_count += 1
     if config.verbose and len(targets) > 1:
@@ -1415,40 +1582,28 @@ def build_preprocessed_recording_from_result(
     if result.dat_path is None:
         raise ValueError("result.dat_path is None. Run preprocess with save_raw=True.")
 
-    rec_raw = se.read_binary(
-        str(result.dat_path),
+    return _resolve_recording_for_postprocess(PostprocessConfig(
+        dat_path=Path(result.dat_path),
         sampling_frequency=result.sr,
         dtype=preprocess_config.dtype,
         num_channels=result.n_channels,
         gain_to_uV=preprocess_config.gain_to_uV,
         offset_to_uV=preprocess_config.offset_to_uV,
-    )
-    rec_with_probe, bad_0, _ = attach_probe_and_remove_bad_channels(
-        recording=rec_raw,
         chanmap_mat_path=_resolve_effective_chanmap_for_postprocess(
-            preprocess_config.chanmap_mat_path,
+            (Path(result.local_output_dir) / _CANONICAL_CHANMAP_NAME
+             if (Path(result.local_output_dir) / _CANONICAL_CHANMAP_NAME).exists()
+             else preprocess_config.chanmap_mat_path),
             local_output_dir=result.local_output_dir,
             dat_path=result.dat_path,
         ),
-        reject_channels_0based=_resolve_bad_channels_for_postprocess(result, preprocess_config),
-    )
-    if hasattr(rec_with_probe, "get_channel_ids"):
-        bad_set = {int(ch) for ch in bad_0}
-        all_channels = [int(ch) for ch in rec_with_probe.get_channel_ids()]
-        good_channels = [ch for ch in all_channels if ch not in bad_set]
-    else:
-        good_channels = []
-
-    rec_processed = apply_preprocessing(
-        recording_raw=rec_with_probe,
+        reject_channels=_resolve_bad_channels_for_postprocess(result, preprocess_config),
+        # The main preprocessing pipeline already wrote its final signal here.
+        apply_preprocess=not preprocess_config.do_preprocess,
         bandpass_min_hz=preprocess_config.bandpass_min_hz,
         bandpass_max_hz=preprocess_config.bandpass_max_hz,
         reference=preprocess_config.reference,
         local_radius_um=preprocess_config.local_radius_um,
-    )
-    if good_channels:
-        return select_recording_channels(rec_processed, good_channels)
-    return rec_processed
+    ))
 
 
 # Short aliases for notebook use

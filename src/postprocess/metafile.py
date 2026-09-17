@@ -111,6 +111,10 @@ class PostprocessConfig:
         }
     )
 
+    # Appended to preserve positional construction of older configurations.
+    xml_path: Path | None = None
+    binary_offset: int = 0
+
 
 @dataclass
 class PostprocessResult:

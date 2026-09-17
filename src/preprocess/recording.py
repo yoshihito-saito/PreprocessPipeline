@@ -39,10 +39,12 @@ def _chanmap_device_channel_indices(mat: dict[str, Any]) -> np.ndarray:
 
 def _build_chanmap_group_properties(chanmap_mat_path: Path, channel_ids: list[int]) -> dict[str, list[int]]:
     mat = loadmat(chanmap_mat_path)
-    required = {"kcoords", "chanMap"}
+    required = {"kcoords"}
     if not required.issubset(set(mat.keys())):
         missing = ", ".join(sorted(required.difference(set(mat.keys()))))
         raise ValueError(f"chanMap is missing required fields: {missing}")
+    if "chanMap" not in mat and "chanMap0ind" not in mat:
+        raise ValueError("chanMap is missing channel IDs")
 
     device_ch_inds = _chanmap_device_channel_indices(mat)
     if device_ch_inds.size == 0:
@@ -92,8 +94,13 @@ def _build_chanmap_group_properties(chanmap_mat_path: Path, channel_ids: list[in
     }
 
 
-def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path) -> Any:
-    mat = loadmat(chanmap_mat_path)
+def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path, *, original_num_channels: int | None = None) -> Any:
+    from .channel_layout import load_channel_layout
+    original_ids = [int(ch) for ch in recording.get_channel_ids()]
+    if original_num_channels is None and hasattr(recording, "get_annotation"):
+        original_num_channels = recording.get_annotation("binary_num_channels")
+    bound = original_num_channels or (max(original_ids) + 1 if original_ids else 0)
+    mat = load_channel_layout(chanmap_mat_path, int(bound))
     required = {"xcoords", "ycoords", "kcoords", "chanMap"}
     if not required.issubset(set(mat.keys())):
         return recording
@@ -126,7 +133,7 @@ def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path) -> Any:
     device_ch_inds = device_ch_inds[:n_contacts]
 
     n_recording_channels = int(recording.get_num_channels())
-    valid_mask = (device_ch_inds >= 0) & (device_ch_inds < n_recording_channels)
+    valid_mask = np.isin(device_ch_inds, original_ids)
     if not np.any(valid_mask):
         warnings.warn(
             "chanMap has no valid device_channel_indices for this recording; "
@@ -135,20 +142,13 @@ def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path) -> Any:
             stacklevel=2,
         )
         return recording
-    if int(np.size(valid_mask)) != int(np.count_nonzero(valid_mask)):
-        dropped = int(np.size(valid_mask) - np.count_nonzero(valid_mask))
-        warnings.warn(
-            f"Dropping {dropped} chanMap contacts outside recording channel range "
-            f"[0, {n_recording_channels - 1}] before probe attachment.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
 
     x = x[valid_mask]
     y = y[valid_mask]
     shank_ids = shank_ids[valid_mask]
     probe_ids = probe_ids[valid_mask]
-    device_ch_inds = device_ch_inds[valid_mask]
+    positions = {channel: index for index, channel in enumerate(original_ids)}
+    device_ch_inds = np.asarray([positions[int(ch)] for ch in device_ch_inds[valid_mask]])
 
     probegroup = ProbeGroup()
     unique_probes = [p for p in np.unique(probe_ids) if p > 0]
@@ -833,9 +833,7 @@ def _load_bad_channels_from_chanmap(chanmap_mat_path: Path) -> list[int]:
     if "connected" not in mat:
         return []
 
-    connected = np.asarray(mat["connected"]).squeeze()
-    if connected.dtype != bool:
-        connected = connected.astype(int) != 0
+    connected = np.asarray(mat["connected"]).reshape(-1).astype(float) > 0
     device_ch_inds = _chanmap_device_channel_indices(mat)
     n = min(connected.size, device_ch_inds.size)
     if n == 0:
@@ -847,6 +845,8 @@ def attach_probe_and_remove_bad_channels(
     recording: Any,
     chanmap_mat_path: Path | None,
     reject_channels_0based: list[int],
+    *,
+    original_num_channels: int | None = None,
 ) -> tuple[Any, list[int], list[int]]:
     bad = set(reject_channels_0based)
 
@@ -854,19 +854,19 @@ def attach_probe_and_remove_bad_channels(
     if chanmap_mat_path is not None and Path(chanmap_mat_path).exists():
         chanmap_path = Path(chanmap_mat_path)
         bad.update(_load_bad_channels_from_chanmap(chanmap_path))
-        recording_with_probe = attach_probe_from_chanmap(recording_with_probe, chanmap_path)
+        recording_with_probe = attach_probe_from_chanmap(
+            recording_with_probe, chanmap_path, original_num_channels=original_num_channels)
 
     if hasattr(recording_with_probe, "get_num_channels"):
-        n_recording_channels = int(recording_with_probe.get_num_channels())
-        invalid_bad = sorted(ch for ch in bad if ch < 0 or ch >= n_recording_channels)
+        # Probe attachment may select a partial map. IDs remain original binary
+        # columns, so the reduced channel count is not a valid ID bound.
+        if original_num_channels is None and hasattr(recording, "get_annotation"):
+            original_num_channels = recording.get_annotation("binary_num_channels")
+        valid_ids = (set(range(original_num_channels)) if original_num_channels is not None
+                     else set(int(ch) for ch in recording.get_channel_ids()))
+        invalid_bad = sorted(bad - valid_ids)
         if invalid_bad:
-            warnings.warn(
-                "Ignoring bad/reject channels outside recording channel range "
-                f"[0, {n_recording_channels - 1}]: {invalid_bad}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            bad = {ch for ch in bad if 0 <= ch < n_recording_channels}
+            raise ValueError(f"Bad/reject channels absent from the input recording: {invalid_bad}")
 
     bad_0 = sorted(bad)
     bad_1 = [b + 1 for b in bad_0]
