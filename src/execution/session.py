@@ -1344,8 +1344,11 @@ def _legacy_preprocess_result(session_dir: Path, settings: Any) -> tuple[dict[st
 
 
 def _sorting_outputs(session_dir: Path) -> tuple[list[Path], Path | None]:
+    from src.sorting_manifest import all_partitions_skipped
     manifest_path = session_dir / "sorter_partition_manifest.json"
     outputs: list[Path] = []
+    if all_partitions_skipped(manifest_path):
+        return [], manifest_path
     if manifest_path.exists():
         payload = read_json(manifest_path)
         for item in payload.get("partitions", []):
@@ -1362,7 +1365,7 @@ def _sorting_outputs(session_dir: Path) -> tuple[list[Path], Path | None]:
                     and ".preserved-" not in candidate.name
                 ):
                     outputs.append(candidate)
-    if not outputs:
+    if not outputs and not manifest_path.exists():
         outputs = sorted(
             (
                 path.resolve()
@@ -1555,11 +1558,15 @@ def _revalidate_previous_outputs(stage: StageName, result: dict[str, Any]) -> li
                 raise RuntimeError("previous preprocess dat has a stale sample count")
         return [str(path.resolve()) for path in required]
     if stage == StageName.SORTING:
+        from src.sorting_manifest import all_partitions_skipped
         output_dirs = [
             Path(value).expanduser().resolve()
             for value in outputs.get("sorter_output_dirs", [])
             if str(value).strip()
         ]
+        skipped_manifest = outputs.get("sorter_partition_manifest_path")
+        if not output_dirs and all_partitions_skipped(Path(skipped_manifest) if skipped_manifest else None):
+            return [str(Path(skipped_manifest).resolve())]
         if not output_dirs:
             raise RuntimeError("previous sorting result has no output directories")
         validated = [item for path in output_dirs for item in _validate_phy_output(path)]
@@ -1585,6 +1592,14 @@ def _revalidate_previous_outputs(stage: StageName, result: dict[str, Any]) -> li
         if isinstance(item, dict) and item.get("output_folder")
     ]
     if not output_dirs:
+        if outputs.get("skip_reason") == "no_active_channels":
+            from src.sorting_manifest import all_partitions_skipped
+            skipped_manifest = outputs.get("sorter_partition_manifest_path")
+            if skipped_manifest and all_partitions_skipped(Path(skipped_manifest)):
+                return [str(Path(skipped_manifest).resolve())]
+            paths = [Path(value) for value in outputs.get("validated_paths", [])]
+            if paths and all(path.is_file() for path in paths):
+                return [str(path.resolve()) for path in paths]
         raise RuntimeError("previous postprocess result has no output directories")
     return [item for path in output_dirs for item in _validate_post_output(path)]
 
@@ -1734,11 +1749,12 @@ def adopt_existing_outputs(store: RunStore) -> dict[str, str]:
         )
     ):
         candidates, manifest_path = _sorting_outputs(session_dir)
+        from src.sorting_manifest import all_partitions_skipped
         try:
             validated = [item for path in candidates for item in _validate_phy_output(path)]
         except (OSError, RuntimeError, ValueError):
             candidates = []
-        if candidates:
+        if candidates or all_partitions_skipped(manifest_path):
             sorting_outputs = candidates
             if manifest_path is not None:
                 validated.append(str(manifest_path.resolve()))

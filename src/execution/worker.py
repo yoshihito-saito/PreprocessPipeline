@@ -72,7 +72,7 @@ def _verify_analysis_artifacts(store: RunStore, stage: StageName) -> None:
         path_text = str(preprocess.get("sorter_config_path", "")).strip()
         _verify_file("sorter_config", Path(path_text) if path_text else None)
     if stage == StageName.POSTPROCESS:
-        _verify_file("chanmap", settings.resolved_chanmap_path())
+        _verify_file("chanmap", settings.postprocess_chanmap_path())
         from .controller import _file_metadata_identity, _sorting_input_identity
 
         expected_sorting = artifacts.get("postprocess_sorting_input")
@@ -179,10 +179,13 @@ def _validate_sorting_output(output_dir: Path) -> list[str]:
 
 
 def _validate_sorter_manifest(path: Path, output_dirs: list[Path]) -> None:
+    from src.sorting_manifest import all_partitions_skipped
     manifest = json.loads(path.read_text(encoding="utf-8"))
     partitions = manifest.get("partitions")
     if not isinstance(partitions, list) or not partitions:
         raise RuntimeError("sorter partition manifest has no partitions")
+    if not output_dirs and not all_partitions_skipped(path):
+        raise RuntimeError("Empty sorting outputs require an explicitly all-skipped manifest")
     completed_dirs = {
         str(Path(item.get("output_folder", "")).resolve())
         for item in partitions
@@ -270,11 +273,22 @@ def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
         "progress_bar": False,
     }
     from .gpu_selection import GpuUsageMonitor, activate_least_used_gpu
+    from src.preprocess.channel_layout import load_channel_layout
+    from src.sorting_manifest import all_partitions_skipped
+
+    map_path = Path(preprocess_fact["outputs"].get("chanmap_path") or
+                    config.chanmap_mat_path or Path(preprocess_result.local_output_dir) / "chanMap.mat")
+    active = set(range(preprocess_result.n_channels))
+    if map_path.exists():
+        layout = load_channel_layout(map_path, preprocess_result.n_channels)
+        active = set(layout["chanMap0ind"][layout["connected"]].tolist())
+    if config.bad_channels:
+        active.difference_update(preprocess_result.bad_channels_0based)
 
     gpu_log_path = store.attempt_dir(spec.stage, spec.attempt) / "gpu-selection.jsonl"
     gpu_selection = activate_least_used_gpu(
         log_path=gpu_log_path
-    )
+    ) if active else {"selected_gpu": None, "skip_reason": "no_active_channels"}
     # Import the sorter only after CUDA visibility has been finalized. Some
     # sorter dependencies initialize CUDA as part of their import path.
     from src.preprocess.sorting_stage import run_sorting_stage
@@ -283,13 +297,14 @@ def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
     if spec.attempt > 1:
         timestamp = f"{timestamp}_a{spec.attempt:03d}"
     selected_gpu = gpu_selection["selected_gpu"]
-    if not isinstance(selected_gpu, dict) or not selected_gpu.get("uuid"):
+    if active and (not isinstance(selected_gpu, dict) or not selected_gpu.get("uuid")):
         raise RuntimeError("GPU selection returned no selected GPU UUID")
     gpu_monitor = GpuUsageMonitor(
         log_path=gpu_log_path,
         selected_gpu_uuid=str(selected_gpu["uuid"]),
-    )
-    gpu_monitor.start()
+    ) if active else None
+    if gpu_monitor is not None:
+        gpu_monitor.start()
     try:
         result = run_sorting_stage(
             config,
@@ -297,12 +312,14 @@ def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
             output_timestamp=timestamp,
         )
     except BaseException:
-        gpu_monitor.stop(final_status="sorter_failed")
+        if gpu_monitor is not None:
+            gpu_monitor.stop(final_status="sorter_failed")
         raise
     else:
-        gpu_monitor.stop(final_status="sorter_finished")
+        if gpu_monitor is not None:
+            gpu_monitor.stop(final_status="sorter_finished")
     output_dirs = [Path(path) for path in result.sorter_output_dirs]
-    if not output_dirs:
+    if not output_dirs and not all_partitions_skipped(result.sorter_partition_manifest_path):
         raise RuntimeError("Sorting completed without an output directory")
     validated: list[str] = []
     for output_dir in output_dirs:
@@ -322,6 +339,7 @@ def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
         "sorter_output_dirs": [str(path) for path in output_dirs],
         "sorter_partition_manifest_path": str(manifest) if manifest else "",
         "gpu_selection": gpu_selection,
+        "skip_reason": "no_active_channels" if not output_dirs else None,
         "validated_paths": validated,
     }
 
@@ -347,6 +365,11 @@ def _run_postprocess(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
     if StageName.SORTING.value in spec.upstream_attempts:
         sorting_fact = _load_upstream_result(store, spec, StageName.SORTING)
         sorting_outputs = sorting_fact["outputs"]
+        from src.sorting_manifest import all_partitions_skipped
+        manifest = sorting_outputs.get("sorter_partition_manifest_path")
+        if all_partitions_skipped(Path(manifest) if manifest else None):
+            return {"postprocess_results": [], "skip_reason": "no_active_channels",
+                    "sorter_partition_manifest_path": manifest, "validated_paths": [manifest]}
         output_dirs = [Path(path) for path in sorting_outputs.get("sorter_output_dirs", [])]
         config.sorting_phy_folder = output_dirs[0] if len(output_dirs) == 1 else None
     candidate_sorting_dirs: list[Path] = []
@@ -367,6 +390,26 @@ def _run_postprocess(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
     }
     results = list(run_postprocess_session(config))
     if not results:
+        from src.postprocess.pipeline import _resolve_recording_for_postprocess, _resolve_postprocess_targets
+        from src.preprocess.channel_layout import NoActiveChannels
+        from src.sorting_manifest import all_partitions_skipped
+        manifest = (Path(config.sorting_search_root) / "sorter_partition_manifest.json"
+                    if config.sorting_search_root is not None else None)
+        if all_partitions_skipped(manifest):
+            return {"postprocess_results": [], "skip_reason": "no_active_channels",
+                    "sorter_partition_manifest_path": str(manifest), "validated_paths": [str(manifest)]}
+        targets = _resolve_postprocess_targets(config)
+        all_bad = bool(targets)
+        for target in targets:
+            try:
+                _resolve_recording_for_postprocess(replace(config, sorting_phy_folder=target))
+            except NoActiveChannels:
+                continue
+            all_bad = False
+            break
+        if all_bad:
+            return {"postprocess_results": [], "skip_reason": "no_active_channels",
+                    "validated_paths": [str(path) for path in (config.dat_path, config.chanmap_mat_path, config.xml_path) if path]}
         raise RuntimeError("Postprocess completed without returning a result")
     validated: list[str] = []
     for result in results:

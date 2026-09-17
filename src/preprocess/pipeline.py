@@ -866,11 +866,20 @@ def run_preprocess_session(config: PreprocessConfig) -> PreprocessResult:
         config.reject_channels,
         reject_channel_remap,
     )
+    xml_rejected = set(xml_meta.skipped_channels_0based)
+    if session_xml_meta.spike_groups_0based:
+        included = {ch for group in session_xml_meta.spike_groups_0based for ch in group}
+        xml_rejected.update(set(range(int(xml_meta.n_channels))) - included)
+    xml_rejected_final = _normalize_reject_channels_for_final_channel_space(
+        sorted(xml_rejected), reject_channel_remap)
     recording_raw, bad_0, bad_1 = attach_probe_and_remove_bad_channels(
         recording=recording_base,
         chanmap_mat_path=effective_chanmap_mat_path,
-        reject_channels_0based=sorted(set(manual_reject_channels_0based + xml_meta.skipped_channels_0based)),
+        reject_channels_0based=sorted(set(manual_reject_channels_0based + xml_rejected_final)),
     )
+
+    if list(recording_raw.get_channel_ids()) != list(recording_base.get_channel_ids()):
+        raise ValueError("Preprocessing requires geometry for every binary column; a partial chanMap would change the saved dat layout")
 
     if hasattr(recording_raw, "get_channel_ids"):
         channel_ids_for_processing = [int(ch) for ch in recording_raw.get_channel_ids()]

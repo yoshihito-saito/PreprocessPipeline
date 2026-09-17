@@ -28,6 +28,8 @@ from spikeinterface.core.job_tools import job_keys as _SI_JOB_KEYS
 from .io import atomic_write_json, load_xml_metadata
 from .paths import find_project_root
 from .recording import apply_preprocessing, attach_probe_from_chanmap, select_recording_channels
+from .channel_layout import NoActiveChannels, load_channel_layout, validate_channel_ids
+from ..phy_metadata import read_phy_params
 from src.worker_defaults import default_worker_count
 
 
@@ -139,6 +141,7 @@ class SorterPartition:
     shank_id: int | None = None
     output_folder: str | None = None
     status: str = "pending"
+    skip_reason: str | None = None
 
 
 def _prepend_to_path(path_to_add: str) -> None:
@@ -1054,7 +1057,10 @@ def _resolve_active_channels_0based(
     all_channels = list(range(int(num_channels)))
     active_from_chanmap: list[int] | None = None
 
-    if chanmap_mat_path is not None and chanmap_mat_path.exists():
+    if chanmap_mat_path is not None:
+        # Validate before the legacy parsing block: malformed maps must not
+        # silently restore channels that connected=False was meant to exclude.
+        load_channel_layout(chanmap_mat_path, int(num_channels))
         try:
             mat = loadmat(str(chanmap_mat_path), simplify_cells=True)
             chanmap_raw = mat.get("chanMap0ind", mat.get("chanMap", None))
@@ -1088,11 +1094,7 @@ def _resolve_active_channels_0based(
             active_from_chanmap = None
 
     if active_channels_0based is not None:
-        allowed = {
-            int(ch)
-            for ch in active_channels_0based
-            if 0 <= int(ch) < int(num_channels)
-        }
+        allowed = set(validate_channel_ids(active_channels_0based, int(num_channels), name="active_channels_0based"))
         if not allowed:
             raise ValueError("active_channels_0based did not contain any valid channels.")
         base_source = active_from_chanmap if active_from_chanmap is not None else all_channels
@@ -1100,21 +1102,17 @@ def _resolve_active_channels_0based(
     else:
         base = active_from_chanmap if active_from_chanmap is not None else all_channels
 
-    excluded_set = {
-        int(ch)
-        for ch in (exclude_channels_0based or [])
-        if 0 <= int(ch) < int(num_channels)
-    }
+    excluded_set = set(validate_channel_ids(exclude_channels_0based or [], int(num_channels), name="exclude_channels_0based"))
     active = [ch for ch in base if ch not in excluded_set]
     if not active:
-        raise ValueError(
+        raise NoActiveChannels(
             "No active channels remain for sorting after applying chanMap/reject channels."
         )
     return active
 
 
 def _chanmap_connected_channels_0based(chanmap_mat_path: Path, num_channels: int) -> list[int]:
-    mat = loadmat(str(chanmap_mat_path), simplify_cells=True)
+    mat = load_channel_layout(chanmap_mat_path, num_channels)
     chanmap_raw = mat.get("chanMap0ind", mat.get("chanMap", None))
     if chanmap_raw is None:
         raw_channels = np.arange(int(num_channels), dtype=np.int64)
@@ -1154,19 +1152,13 @@ def build_sorter_partitions(
     if mode_normalized not in {"all", "probe", "shank"}:
         raise ValueError(f"Unsupported sorter partition mode: {mode}")
 
-    excluded = sorted(
-        {
-            int(ch)
-            for ch in (excluded_channels_0based or [])
-            if 0 <= int(ch) < int(num_channels)
-        }
-    )
+    excluded = sorted(set(validate_channel_ids(excluded_channels_0based or [], int(num_channels), name="excluded_channels_0based")))
     excluded_set = set(excluded)
 
     if mode_normalized == "all":
         channels = (
             _chanmap_connected_channels_0based(Path(chanmap_mat_path), num_channels)
-            if chanmap_mat_path is not None and Path(chanmap_mat_path).exists()
+            if chanmap_mat_path is not None
             else list(range(int(num_channels)))
         )
         active = [ch for ch in channels if ch not in excluded_set]
@@ -1177,13 +1169,15 @@ def build_sorter_partitions(
                 channels_0based=active,
                 channels_1based=[ch + 1 for ch in active],
                 excluded_channels_0based=excluded,
+                status="pending" if active else "skipped",
+                skip_reason=None if active else "no_active_channels",
             )
         ]
 
     if chanmap_mat_path is None or not Path(chanmap_mat_path).exists():
         raise ValueError(f"sorter partition mode '{mode_normalized}' requires chanMap.mat")
 
-    mat = loadmat(str(chanmap_mat_path), simplify_cells=True)
+    mat = load_channel_layout(chanmap_mat_path, num_channels)
     chanmap_raw = mat.get("chanMap0ind", mat.get("chanMap", None))
     if chanmap_raw is None:
         raise ValueError("chanMap.mat must contain chanMap0ind or chanMap for sorter partitioning.")
@@ -1200,8 +1194,8 @@ def build_sorter_partitions(
         channels[:n], probe_ids[:n], shank_ids[:n], connected[:n], strict=True
     ):
         ch_i = int(ch)
-        if not is_connected or ch_i < 0 or ch_i >= int(num_channels):
-            continue
+        if not is_connected:
+            excluded_set.add(ch_i)
         rows.append((ch_i, int(probe_id), int(shank_id)))
 
     if mode_normalized == "probe":
@@ -1236,10 +1230,9 @@ def build_sorter_partitions(
             for (probe_id, shank_id), channels_for_shank in sorted(grouped_shanks.items())
         ]
 
-    partitions = [p for p in partitions if p.channels_0based]
-    if not partitions:
-        raise ValueError("No sorter partitions remain after applying connected and rejected channels.")
-    return partitions
+    from dataclasses import replace
+    return [p if p.channels_0based else replace(p, status="skipped", skip_reason="no_active_channels")
+            for p in partitions]
 
 
 def write_sorter_partition_manifest(
@@ -1269,6 +1262,7 @@ def _patch_params_py(
     dat_path: Path,
     n_channels_dat: int,
     hp_filtered: bool | None = None,
+    dtype: str | None = None,
 ) -> None:
     if not params_path.exists():
         return
@@ -1280,6 +1274,7 @@ def _patch_params_py(
     dat_set = False
     nch_set = False
     hp_set = False
+    dtype_set = False
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("dat_path"):
@@ -1291,6 +1286,9 @@ def _patch_params_py(
         elif stripped.startswith("hp_filtered") and hp_filtered is not None:
             out_lines.append(f"hp_filtered = {bool(hp_filtered)}")
             hp_set = True
+        elif stripped.startswith("dtype") and dtype is not None:
+            out_lines.append(f"dtype = {np.dtype(dtype).str!r}")
+            dtype_set = True
         else:
             out_lines.append(line)
 
@@ -1300,6 +1298,8 @@ def _patch_params_py(
         out_lines.append(f"n_channels_dat = {int(n_channels_dat)}")
     if hp_filtered is not None and not hp_set:
         out_lines.append(f"hp_filtered = {bool(hp_filtered)}")
+    if dtype is not None and not dtype_set:
+        out_lines.append(f"dtype = {np.dtype(dtype).str!r}")
 
     params_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
@@ -1310,6 +1310,7 @@ def _patch_phy_outputs_for_raw_dat(
     raw_dat_path: Path,
     n_channels_dat: int,
     hp_filtered: bool | None = None,
+    dtype: str | None = None,
 ) -> None:
     for params_path in output_folder.rglob("params.py"):
         _patch_params_py(
@@ -1317,6 +1318,7 @@ def _patch_phy_outputs_for_raw_dat(
             dat_path=raw_dat_path,
             n_channels_dat=n_channels_dat,
             hp_filtered=hp_filtered,
+            dtype=dtype,
         )
 
 
@@ -1327,7 +1329,7 @@ def _patch_channel_map_for_raw_dat(
     n_channels_dat: int,
 ) -> None:
     active = np.asarray(active_channels_0based, dtype=np.int64)
-    if active.size == 0 or active.size == int(n_channels_dat):
+    if active.size == 0:
         return
     for channel_map_path in output_folder.rglob("channel_map.npy"):
         try:
@@ -1336,13 +1338,11 @@ def _patch_channel_map_for_raw_dat(
                 continue
             if np.all((channel_map >= 0) & (channel_map < active.size)):
                 mapped = active[channel_map]
-            elif np.all((channel_map >= 0) & (channel_map < int(n_channels_dat))):
-                mapped = channel_map
             else:
-                continue
+                raise ValueError("Native channel_map must index the sorter recording")
             np.save(str(channel_map_path), mapped.astype(np.int64, copy=False))
         except Exception as exc:
-            print(f"Warning: failed to patch channel_map.npy for raw dat: {exc}")
+            raise ValueError(f"Cannot map native Phy channels to binary columns: {channel_map_path}") from exc
 
 
 def _patch_cluster_info_channels_for_raw_dat(
@@ -1352,7 +1352,7 @@ def _patch_cluster_info_channels_for_raw_dat(
     n_channels_dat: int,
 ) -> None:
     active = np.asarray(active_channels_0based, dtype=np.int64)
-    if active.size == 0 or active.size == int(n_channels_dat):
+    if active.size == 0 or np.array_equal(active, np.arange(n_channels_dat)):
         return
     for cluster_info_path in output_folder.rglob("cluster_info.tsv"):
         try:
@@ -1615,8 +1615,10 @@ def _kilosort_chanmap_override(
     *,
     chanmap_mat_path: Path | None,
     ops_overrides: dict[str, Any] | None = None,
+    active_channels_0based: list[int] | None = None,
 ):
-    if (chanmap_mat_path is None or not Path(chanmap_mat_path).exists()) and not ops_overrides:
+    has_map = chanmap_mat_path is not None and Path(chanmap_mat_path).exists()
+    if not has_map and not ops_overrides and active_channels_0based is None:
         yield
         return
 
@@ -1630,15 +1632,22 @@ def _kilosort_chanmap_override(
             if hasattr(_recording, "get_num_channels")
             else None
         )
-        _copy_chanmap_for_kilosort(
-            Path(chanmap_mat_path),
-            dst,
-            n_channels_total=n_channels_total,
-        )
+        if has_map:
+            _copy_chanmap_for_kilosort(
+                Path(chanmap_mat_path), dst, n_channels_total=n_channels_total,
+            )
+        else:
+            original(_recording, sorter_output_folder)
+        if active_channels_0based is not None:
+            mat = loadmat(dst)
+            ids = np.asarray(mat["chanMap0ind"]).reshape(-1)
+            connected = np.asarray(mat.get("connected", np.ones(ids.size))).reshape(-1) > 0
+            mat["connected"] = (connected & np.isin(ids, active_channels_0based)).reshape(-1, 1)
+            savemat(dst, {key: value for key, value in mat.items() if not key.startswith("__")})
 
     def _patched_generate_ops_file(_cls, recording, params, sorter_output_folder, binary_file_path):
         original_ops(recording, params, sorter_output_folder, binary_file_path)
-        if chanmap_mat_path is not None and Path(chanmap_mat_path).exists():
+        if has_map or active_channels_0based is not None:
             _rewrite_kilosort_ops_nchan_from_chanmap(
                 sorter_output_folder=Path(sorter_output_folder),
                 n_channels_total=int(recording.get_num_channels()),
@@ -1649,7 +1658,7 @@ def _kilosort_chanmap_override(
                 ops_overrides=ops_overrides,
             )
 
-    if chanmap_mat_path is not None and Path(chanmap_mat_path).exists():
+    if has_map or active_channels_0based is not None:
         sorter_cls._generate_channel_map_file = staticmethod(_copy_channel_map)
     sorter_cls._generate_ops_file = classmethod(_patched_generate_ops_file)
     try:
@@ -1791,6 +1800,17 @@ def execute_sorting_job(
             f"Unsupported sorter: {sorter}. installed sorter: {installed}"
         )
     sorter_name = _SORTER_ALIASES[sorter_input]
+    # A valid no-work selection must not depend on MATLAB/CUDA availability or
+    # initialize sorter configuration, logs, or output directories.
+    sr, nch = _resolve_sr_nch(sampling_frequency, num_channels, xml_path)
+    if not np.isfinite(sr) or sr <= 0 or nch <= 0:
+        raise ValueError("sampling_frequency must be finite and positive; num_channels must be positive")
+    resolved_active_channels_0based = _resolve_active_channels_0based(
+        num_channels=nch,
+        chanmap_mat_path=Path(chanmap_mat_path) if chanmap_mat_path is not None else None,
+        exclude_channels_0based=exclude_channels_0based,
+        active_channels_0based=active_channels_0based,
+    )
     matlab_cmd: str | None = None
     ks4_auto_geom_enabled = False
     ks4_auto_geom_options: dict[str, Any] = {}
@@ -1863,13 +1883,6 @@ def execute_sorting_job(
         params, ks4_auto_geom_enabled, ks4_auto_geom_options = _pop_kilosort4_auto_geom_options(params)
     print(f"Loaded sorter params: {cfg_path}")
 
-    sr, nch = _resolve_sr_nch(sampling_frequency, num_channels, xml_path)
-    resolved_active_channels_0based = _resolve_active_channels_0based(
-        num_channels=nch,
-        chanmap_mat_path=Path(chanmap_mat_path) if chanmap_mat_path is not None else None,
-        exclude_channels_0based=exclude_channels_0based,
-        active_channels_0based=active_channels_0based,
-    )
     ignored_channels_0based = sorted(set(range(int(nch))) - set(resolved_active_channels_0based))
     # Plain preprocessed full-session runs keep the channel count unchanged so
     # bad channels remain zeroed in the full binary. Explicit partition runs
@@ -1891,6 +1904,11 @@ def execute_sorting_job(
         print(f"Resolved Kilosort params: NT={params.get('NT')} Nfilt={params.get('Nfilt')} ntbuff={params.get('ntbuff')}")
     elif sorter_input in {"kilosort2.5", "kilosort2_5", "kilosort25"}:
         params, ks25_ops_overrides = _normalize_kilosort25_params(params)
+        # The MATLAB skip branch reads fbinary using Nchan, not NchanTOT.
+        # It therefore needs a compact recording when channels are excluded.
+        if params.get("skip_kilosort_preprocessing", False):
+            sorter_active_channels_0based = resolved_active_channels_0based
+            sorter_uses_channel_subset = sorter_active_channels_0based != list(range(int(nch)))
         print("Resolved Kilosort2.5 params")
     elif sorter_input == "kilosort4":
         global _KILOSORT4_ALLOWED_PARAM_KEYS
@@ -1920,12 +1938,25 @@ def execute_sorting_job(
     if chanmap_mat_path is not None and Path(chanmap_mat_path).exists():
         recording = attach_probe_from_chanmap(recording, Path(chanmap_mat_path))
 
+    if hasattr(recording, "get_channel_ids") and list(recording.get_channel_ids()) != list(range(int(nch))):
+        present = set(int(ch) for ch in recording.get_channel_ids())
+        sorter_active_channels_0based = [ch for ch in resolved_active_channels_0based if ch in present]
+
     if len(sorter_active_channels_0based) != int(nch):
         recording = select_recording_channels(recording, sorter_active_channels_0based)
         print(
             "Sorting with active channels only: "
             f"{len(sorter_active_channels_0based)}/{int(nch)}"
         )
+    if hasattr(recording, "get_channel_ids"):
+        sorter_active_channels_0based = [int(ch) for ch in recording.get_channel_ids()]
+        sorter_uses_channel_subset = sorter_active_channels_0based != list(range(int(nch)))
+    if sorter_input == "kilosort4":
+        params["bad_channels"] = [] if sorter_uses_channel_subset else ignored_channels_0based
+    if sorter_input == "kilosort4" and hasattr(recording, "get_property"):
+        shanks = recording.get_property("artifact_group_shank")
+        if shanks is not None:
+            recording.set_property("group", np.asarray(shanks))
     effective_preprocess_for_sorting = bool(preprocess_for_sorting) and not bool(input_is_preprocessed)
     if effective_preprocess_for_sorting:
         recording = apply_preprocessing(
@@ -1973,12 +2004,14 @@ def execute_sorting_job(
                 ss.KilosortSorter,
                 chanmap_mat_path=chanmap_override_path,
                 ops_overrides=None,
+                active_channels_0based=resolved_active_channels_0based if not sorter_uses_channel_subset else None,
             )
         elif sorter_input in {"kilosort2.5", "kilosort2_5", "kilosort25"}:
             override_ctx = _kilosort_chanmap_override(
                 ss.Kilosort2_5Sorter,
                 chanmap_mat_path=chanmap_override_path,
                 ops_overrides=ks25_ops_overrides,
+                active_channels_0based=resolved_active_channels_0based if not sorter_uses_channel_subset else None,
             )
         elif sorter_input == "kilosort4":
             override_ctx = _kilosort4_package_override(
@@ -2072,11 +2105,18 @@ def execute_sorting_job(
         resolved_params=params,
     )
     _flatten_sorter_output_folder(output_folder)
+    if sorter_name == "kilosort2_5" and (output_folder / "params.py").exists():
+        if read_phy_params(output_folder).get("pipeline_phy_export_basis") != "input_binary_v1":
+            raise ValueError(
+                "This Kilosort2.5 exporter has no verified input-binary channel/whitening contract. "
+                "Use the bundled Kilosort2.5 rezToPhy.m; existing native output was not redirected."
+            )
     _patch_phy_outputs_for_raw_dat(
         output_folder=output_folder,
         raw_dat_path=dat_path,
         n_channels_dat=int(nch),
         hp_filtered=bool(input_is_preprocessed),
+        dtype=dtype,
     )
     if sorter_uses_channel_subset:
         _patch_channel_map_for_raw_dat(
@@ -2109,32 +2149,35 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
     if xml_path is None:
         raise ValueError("--xml-path is required")
 
-    _ = execute_sorting_job(
-        sorter=args.sorter,
-        dat_path=Path(args.dat_path),
-        xml_path=xml_path,
-        output_folder=Path(args.output_folder),
-        config_path=Path(args.config) if args.config else None,
-        kilosort1_path=Path(args.kilosort1_path) if args.kilosort1_path else None,
-        kilosort25_path=Path(args.kilosort25_path) if args.kilosort25_path else None,
-        kilosort4_path=Path(args.kilosort4_path) if args.kilosort4_path else None,
-        matlab_path=Path(args.matlab_path) if args.matlab_path else None,
-        matlab_max_workers=int(args.matlab_max_workers),
-        chanmap_mat_path=Path(args.chanmap) if args.chanmap else None,
-        dtype=args.dtype,
-        gain_to_uV=args.gain_to_uV,
-        offset_to_uV=args.offset_to_uV,
-        sampling_frequency=args.sampling_frequency,
-        num_channels=args.num_channels,
-        active_channels_0based=_parse_cli_int_list(args.active_channels),
-        exclude_channels_0based=_parse_cli_int_list(args.exclude_channels),
-        job_kwargs=None,
-        remove_existing_folder=args.remove_existing_folder,
-        docker_image=args.docker_image,
-        preprocess_for_sorting=False,
-        sorter_verbose=bool(args.sorter_verbose),
-        cleanup_temp_wh=not bool(args.keep_temp_wh_dat),
-    )
+    try:
+        _ = execute_sorting_job(
+            sorter=args.sorter,
+            dat_path=Path(args.dat_path),
+            xml_path=xml_path,
+            output_folder=Path(args.output_folder),
+            config_path=Path(args.config) if args.config else None,
+            kilosort1_path=Path(args.kilosort1_path) if args.kilosort1_path else None,
+            kilosort25_path=Path(args.kilosort25_path) if args.kilosort25_path else None,
+            kilosort4_path=Path(args.kilosort4_path) if args.kilosort4_path else None,
+            matlab_path=Path(args.matlab_path) if args.matlab_path else None,
+            matlab_max_workers=int(args.matlab_max_workers),
+            chanmap_mat_path=Path(args.chanmap) if args.chanmap else None,
+            dtype=args.dtype,
+            gain_to_uV=args.gain_to_uV,
+            offset_to_uV=args.offset_to_uV,
+            sampling_frequency=args.sampling_frequency,
+            num_channels=args.num_channels,
+            active_channels_0based=_parse_cli_int_list(args.active_channels),
+            exclude_channels_0based=_parse_cli_int_list(args.exclude_channels),
+            job_kwargs=None,
+            remove_existing_folder=args.remove_existing_folder,
+            docker_image=args.docker_image,
+            preprocess_for_sorting=False,
+            sorter_verbose=bool(args.sorter_verbose),
+            cleanup_temp_wh=not bool(args.keep_temp_wh_dat),
+        )
+    except NoActiveChannels as exc:
+        print(f"Skipping sorter {args.sorter}: reason=no_active_channels ({exc})")
 
 
 def _parse_cli_int_list(text: str | None) -> list[int] | None:

@@ -1364,7 +1364,10 @@ def test_postprocess_config_uses_local_manifest_as_search_root(tmp_path: Path) -
     sorting_folder = local_session / "Kilosort_20260624_probe3"
     basepath.mkdir()
     sorting_folder.mkdir(parents=True)
-    (local_session / "sorter_partition_manifest.json").write_text("{}", encoding="utf-8")
+    (local_session / "sorter_partition_manifest.json").write_text(
+        json.dumps({"partitions": [{"status": "completed", "output_folder": str(sorting_folder)}]}),
+        encoding="utf-8",
+    )
     (local_session / "session.dat").write_bytes(b"\x00\x00")
     _write_session_xml(basepath, sample_rate=20000.0, n_channels=4)
 
@@ -1612,6 +1615,11 @@ def test_load_xml_updates_probe_assignments_and_chanmap_preview(
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
 
+    # Exercise automatic XML geometry independently of a user's saved defaults.
+    monkeypatch.setattr(
+        "src.preprocess.gui.app._load_default_settings", lambda: PipelineGuiSettings()
+    )
+
     basepath = tmp_path / "session"
     basepath.mkdir()
     xml = tmp_path / "selected.xml"
@@ -1641,7 +1649,7 @@ def test_load_xml_updates_probe_assignments_and_chanmap_preview(
         window._load_xml()
 
         assert window.xml_path.text() == str(xml)
-        assert window.reject_channels.text() == "1"
+        assert window.reject_channels.text() == "1, 17, 23"
         assert window._probe_rows_to_assignments() == [
             {"type": "poly2", "groups": [0, 1], "x_offset": 0}
         ]

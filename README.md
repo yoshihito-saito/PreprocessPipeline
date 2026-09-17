@@ -173,6 +173,68 @@ Artifact windows are specified in milliseconds, frequencies in hertz, and local-
 | Noise labeling | `noise_thresholds`, `noise_label_only` | Label clusters using firing rate, ISI, presence ratio, SNR, and amplitude rules. |
 | Existing output | `overwrite` | Reuse a complete output when disabled or replace/version it when enabled. |
 
+For external sorting, choose the matching recording in **Postprocess recording**.
+The default follows the selected sorting's `params.py`, rather than substituting
+a local file with the same basename. An explicit raw or unfiltered concatenated
+recording is supported: enable `apply_preprocess` to filter/reference it lazily.
+Its channel columns, sample order and time origin must match the sorting; 20 kHz
+and 30 kHz are both supported without resampling. A second processed `.dat` is
+not required. The selected chanMap is authoritative; otherwise the map beside
+the selected recording is used. Automatic GUI probe assignments derive all XML
+groups; explicitly saved assignments remain explicit.
+An automatic multi-target invocation represents partitions of one recording
+timeline. Run independent recordings separately; matching sample rates and
+in-range spike samples alone cannot establish that two external binaries share
+the same time origin.
+
+Preprocessing keeps full binary columns and, with `zero_bad=True`, zeroes bad
+columns. Full-width preprocessing requires a complete map. Analysis views may
+select good channels while retaining original column IDs; bad channels do not
+participate in common-median reference. XML skips, channels omitted from nonempty
+XML spike-detection groups, map connectivity and manual exclusions are combined.
+An entirely excluded probe is recorded as skipped; an entirely excluded session
+finishes sorting/postprocessing without invoking the sorter or reusing old runs.
+Direct sorter CLI runs (`python -m src.preprocess.sorter_runner`) also exit
+successfully when the selected channels are all excluded, logging
+`reason=no_active_channels` before MATLAB/sorter setup. This no-work result leaves
+existing output and session manifests untouched and creates no sorter output.
+Invalid channel metadata and other execution errors still fail normally.
+
+Postprocess analysis still uses its original 1 ms before / 2 ms after window and
+microvolt metrics. Phy display templates use a centered window of the same total
+length in native binary units. Spike samples and analysis/PCA data are unchanged.
+When optional in-memory filtering is enabled, display templates retain that
+filtering/reference, while Phy's raw view reads the original binary and applies
+its own display filter; these signal-processing differences are intentional.
+`amplitudes.npy` retains SI's signed spike amplitudes in analyzer units (normally
+microvolts), as do scientific amplitude metrics. These are physical amplitudes,
+not Kilosort's dimensionless fitting coefficients; Phylib's
+`get_amplitudes_true()` coefficient conversion is not applicable to SI exports.
+`copy_binary=True` instead exports the selected processed recording as a compact
+binary with matching compact channel indices. Original IDs remain available in
+`channel_map_si.npy`. With `recording=`, provide `num_channels` for the original
+binary when supplying a selected view and a full chanMap; `apply_preprocess`
+applies to the supplied recording too, so leave it false for prepared inputs.
+`make_post_recording(result, pre_config)` reuses an already preprocessed final
+dat and does not filter it a second time.
+Explicit analyzer caches now record the source sorting and recording identity,
+including channel layout, gain, and the preprocessing graph. `skip_curation=True`
+rejects mismatched or older unverified caches before modifying source labels;
+rebuild those with `skip_curation=False, overwrite=True` once. Binary identity
+uses the resolved path, size and modification time without rereading the entire
+recording; source spike/label arrays are hashed.
+
+The bundled Kilosort2.5 exporter writes input-binary channel/whitening metadata;
+custom KS2.5 installations must use this compatible `rezToPhy.m` before the
+pipeline can redirect native exports. Drift-corrected native templates describe
+the reference position and can differ from individual uncorrected raw snippets.
+KS4 receives separate probe/shank groups. Anatomical CSV columns and rows follow
+XML electrode-group/channel order, including bad channels; loading a CSV does
+not automatically rewrite it.
+KS2.5's `skip_kilosort_preprocessing=True` path uses a compact good-channel input
+so MATLAB's `Nchan` stride agrees with its binary; the original full binary stays
+unchanged. The option still requires an explicit `scaleproc` as required by SI.
+
 Autosplit first identifies feature outliers and then applies waveform and amplitude gates. Noise thresholds ending in `_lt` reject values below the threshold; thresholds ending in `_gt` reject values above it. When both ISI ratio and count thresholds are configured, both conditions must be met to label the unit as noise.
 
 Settings can be saved and restored with **Save config** and **Load config**. **Load config** opens this repository's `config/` directory by default.

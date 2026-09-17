@@ -44,30 +44,41 @@ def _check_path(label: str, path: Path | None, *, must_be_dir: bool = False) -> 
 
 def _bad_channels_from_chanmap(path: Path) -> list[int]:
     data = loadmat(path)
-    connected = np.asarray(data.get("connected", []), dtype=bool).reshape(-1)
+    connected = np.asarray(data.get("connected", []), dtype=float).reshape(-1)
     if connected.size == 0:
         raise ValueError("connected field is missing or empty")
+    if not np.all(np.isfinite(connected)):
+        raise ValueError("connected mask must be finite")
+    connected = connected > 0
     device_ch = np.asarray(
-        data.get("chanMap0ind", np.asarray(data["chanMap"]).reshape(-1) - 1)
+        data["chanMap0ind"] if "chanMap0ind" in data else np.asarray(data["chanMap"]) - 1,
+        dtype=float,
     ).reshape(-1)
-    n = min(len(connected), len(device_ch))
-    return sorted(device_ch[:n][~connected[:n]].astype(int).tolist())
+    if len(connected) != len(device_ch):
+        raise ValueError("connected mask and channel IDs must have equal lengths")
+    if not np.all(np.isfinite(device_ch) & (device_ch >= 0) & (device_ch == np.floor(device_ch))):
+        raise ValueError("channel IDs must be nonnegative integers")
+    if len(np.unique(device_ch)) != len(device_ch):
+        raise ValueError("duplicate channel IDs")
+    if "chanMap" in data and not np.array_equal(np.asarray(data["chanMap"]).reshape(-1) - 1, device_ch):
+        raise ValueError("chanMap and chanMap0ind disagree")
+    return sorted(device_ch[~connected].astype(int).tolist())
 
 
 def _chanmap_bad_channel_check(settings: PipelineGuiSettings, chanmap_path: Path) -> CheckResult:
     try:
         chanmap_bad = _bad_channels_from_chanmap(chanmap_path)
+        data = loadmat(chanmap_path)
+        channel_ids = np.asarray(data["chanMap0ind"] if "chanMap0ind" in data else np.asarray(data["chanMap"]) - 1).reshape(-1)
+        xml_bad = sorted(settings.xml_excluded_channels(channel_ids.tolist()))
     except Exception as exc:
         return CheckResult("chanMap bad channels", "error", f"could not inspect chanMap bad channels: {exc}")
     gui_bad = sorted(set(int(ch) for ch in settings.preprocess.reject_channels))
-    if gui_bad != chanmap_bad:
-        return CheckResult(
-            "chanMap bad channels",
-            "error",
-            "GUI bad channels do not match chanMap disconnected channels: "
-            f"GUI={gui_bad}, chanMap={chanmap_bad}. Load the chanMap or update bad channels before postprocess.",
-        )
-    return CheckResult("chanMap bad channels", "ok", f"matches GUI bad channels: {gui_bad}")
+    excluded = sorted(set(gui_bad) | set(chanmap_bad) | set(xml_bad))
+    return CheckResult(
+        "chanMap bad channels", "ok",
+        f"excluded={excluded}; GUI={gui_bad}, XML={xml_bad}, chanMap={chanmap_bad}",
+    )
 
 
 def _repo_relative_path(text: str) -> Path | None:
@@ -92,24 +103,32 @@ def _has_openephys_recording(basepath: Path) -> bool:
     return False
 
 
-def _local_cmr_check(settings: PipelineGuiSettings) -> CheckResult | None:
+def _local_cmr_check(settings: PipelineGuiSettings, *, apply_preprocess: bool | None = None) -> CheckResult | None:
     p = settings.preprocess
-    if not p.do_preprocess or str(p.reference).strip().lower() != "local":
+    enabled = p.do_preprocess if apply_preprocess is None else apply_preprocess
+    if not enabled or str(p.reference).strip().lower() != "local":
         return None
     basepath = settings.basepath_path
     if basepath is None:
         return None
 
+    use_existing = bool(settings.chanmap_path.strip()) or apply_preprocess is not None
     try:
-        data = build_channel_map_data(
-            basepath=basepath,
-            basename=settings.basename,
-            probe_assignments=p.probe_assignments,
-            reject_channels=p.reject_channels,
-            xml_path=settings.resolved_xml_path(),
-            emit_warnings=False,
-        )
+        if use_existing:
+            path = settings.postprocess_chanmap_path() if apply_preprocess is not None else Path(settings.chanmap_path).expanduser()
+            data = loadmat(path) if path is not None else None
+        else:
+            data = build_channel_map_data(
+                basepath=basepath,
+                basename=settings.basename,
+                probe_assignments=p.probe_assignments,
+                reject_channels=p.reject_channels,
+                xml_path=settings.resolved_xml_path(),
+                emit_warnings=False,
+            )
     except Exception as exc:
+        if use_existing:
+            return CheckResult("Local CMR radius", "error", f"could not inspect selected chanMap geometry: {exc}")
         chanmap_path = settings.resolved_chanmap_path()
         if chanmap_path is not None and chanmap_path.exists():
             try:
@@ -122,13 +141,21 @@ def _local_cmr_check(settings: PipelineGuiSettings) -> CheckResult | None:
     if data is None:
         return None
 
-    x = np.asarray(data["xcoords"]).reshape(-1)
-    y = np.asarray(data["ycoords"]).reshape(-1)
-    connected = np.asarray(data["connected"]).reshape(-1).astype(bool)
-    device_ch = np.asarray(
-        data.get("chanMap0ind", np.asarray(data["chanMap"]).reshape(-1) - 1)
-    ).reshape(-1).astype(int)
-    n = min(x.size, y.size, connected.size, device_ch.size)
+    try:
+        x = np.asarray(data["xcoords"]).reshape(-1)
+        y = np.asarray(data["ycoords"]).reshape(-1)
+        connected = np.asarray(data["connected"], dtype=float).reshape(-1) > 0
+        device_ch = np.asarray(
+            data["chanMap0ind"] if "chanMap0ind" in data else np.asarray(data["chanMap"]) - 1
+        ).reshape(-1).astype(int)
+        n = x.size
+        if len({x.size, y.size, connected.size, device_ch.size}) != 1:
+            raise ValueError("chanMap coordinates, connected mask and channel IDs must have equal lengths")
+        rejected = set(p.reject_channels)
+        rejected.update(settings.xml_excluded_channels(device_ch.tolist()))
+        connected = connected & ~np.isin(device_ch, list(rejected))
+    except (KeyError, OSError, ValueError, SyntaxError) as exc:
+        return CheckResult("Local CMR radius", "error", f"could not inspect chanMap geometry: {exc}")
     if n <= 1:
         return None
 
@@ -174,7 +201,14 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
     checks: list[CheckResult] = []
     basepath = settings.basepath_path
     output_dir = settings.local_output_dir
-    chanmap_path = settings.resolved_chanmap_path()
+    try:
+        chanmap_path = (
+            settings.postprocess_chanmap_path()
+            if mode in ("postprocess", "noise_label") else settings.resolved_chanmap_path()
+        )
+    except (OSError, ValueError, SyntaxError) as exc:
+        chanmap_path = None
+        checks.append(CheckResult("Recording metadata", "error", str(exc)))
 
     checks.append(_check_path("Basepath", basepath, must_be_dir=True))
     if (
@@ -285,7 +319,10 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
                         str(chanmap_path) if chanmap_path.exists() else f"will be generated or expected at: {chanmap_path}",
                     )
                 )
-        local_cmr = _local_cmr_check(settings)
+        local_cmr = _local_cmr_check(
+            settings,
+            apply_preprocess=settings.postprocess.apply_preprocess if mode == "postprocess" else None,
+        )
         if local_cmr is not None:
             checks.append(local_cmr)
         sorter = (
@@ -309,7 +346,12 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
 
     if mode in ("postprocess", "noise_label"):
         phy = settings.postprocess.sorting_phy_folder.strip()
-        sorting_folder = Path(phy) if phy else settings.postprocess_sorting_folder()
+        try:
+            skipped = settings.postprocess_is_skipped()
+            sorting_folder = Path(phy) if phy else settings.postprocess_sorting_folder()
+        except (OSError, ValueError) as exc:
+            skipped, sorting_folder = False, None
+            checks.append(CheckResult("Sorting metadata", "error", str(exc)))
         if phy:
             checks.append(_check_path("Postprocess sorting folder", Path(phy), must_be_dir=True))
         elif sorting_folder is not None:
@@ -320,6 +362,8 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
                     f"default: {sorting_folder}",
                 )
             )
+        elif skipped:
+            checks.append(CheckResult("Postprocess sorting folder", "ok", "all partitions were skipped: no active channels"))
         else:
             checks.append(
                 CheckResult(
@@ -329,7 +373,9 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
                 )
             )
 
-        if mode == "noise_label" or settings.postprocess.noise_label_only:
+        if skipped:
+            checks.append(CheckResult("Postprocess outcome", "ok", "nothing to postprocess; existing older sorting outputs will not be reused"))
+        elif mode == "noise_label" or settings.postprocess.noise_label_only:
             if sorting_folder is not None:
                 post_output = postprocess_output_folder_for_sorting(sorting_folder)
                 metrics_path = post_output / "quality_metrics.csv"
@@ -360,11 +406,16 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
                 checks.append(CheckResult("chanMap", "ok", str(chanmap_path)))
                 checks.append(_chanmap_bad_channel_check(settings, chanmap_path))
 
-            dat_path = settings.postprocess_dat_path()
-            if dat_path.exists():
+            try:
+                dat_path = settings.postprocess_dat_path()
+                settings.to_postprocess_config()
+            except (OSError, ValueError, SyntaxError) as exc:
+                dat_path = None
+                checks.append(CheckResult("Recording metadata", "error", str(exc)))
+            if dat_path is not None and dat_path.exists():
                 detail = str(dat_path)
                 if settings.postprocess.apply_preprocess:
-                    detail += " (raw legacy dat; preprocessing will be applied before postprocess)"
+                    detail += " (raw recording; preprocessing will be applied before postprocess)"
                 else:
                     detail += " (treated as already preprocessed)"
                 checks.append(CheckResult("basename.dat", "ok", detail))
@@ -373,7 +424,7 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
                     CheckResult(
                         "basename.dat",
                         "error",
-                        f"not found: {dat_path}. Set spike sorting to skip/disabled, run preprocess only to create basename.dat, then run postprocess again.",
+                        f"not found: {dat_path or 'not set'}. Select the recording binary corresponding to this sorting.",
                     )
                 )
 

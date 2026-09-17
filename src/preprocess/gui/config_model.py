@@ -7,7 +7,9 @@ from typing import Any, Literal
 
 from src.postprocess import PostprocessConfig
 from src.preprocess import PreprocessConfig
-from src.preprocess.io import load_xml_metadata
+from src.preprocess.io import load_session_xml_metadata, load_xml_metadata
+from src.phy_metadata import read_phy_params, resolve_phy_dat_path
+from src.sorting_manifest import all_partitions_skipped
 from src.preprocess.paths import find_project_root, resolve_project_path
 from src.worker_defaults import default_worker_count, normalize_worker_count
 from src.execution.models import (
@@ -92,6 +94,27 @@ def _repo_path_or_none(value: str | Path | None) -> Path | None:
 def latest_sorting_folder(root: Path | None) -> Path | None:
     if root is None or not root.exists() or not root.is_dir():
         return None
+    if all_partitions_skipped(root / "sorter_partition_manifest.json"):
+        return None
+    manifest = root / "sorter_partition_manifest.json"
+    if manifest.exists():
+        partitions = json.loads(manifest.read_text(encoding="utf-8")).get("partitions")
+        if not isinstance(partitions, list):
+            raise ValueError(f"Invalid sorter partition manifest: {manifest}")
+        completed: list[Path] = []
+        for partition in partitions:
+            if not isinstance(partition, dict) or partition.get("status") != "completed":
+                continue
+            folder_text = str(partition.get("output_folder") or "").strip()
+            folder = Path(folder_text).expanduser().resolve() if folder_text else None
+            if (
+                folder is None or folder.parent != root.resolve() or not folder.is_dir()
+                or not any(folder.match(pattern) for pattern in SORTING_OUTPUT_PATTERNS)
+                or "_spi" in folder.name or ".preserved-" in folder.name
+            ):
+                raise ValueError(f"Invalid completed sorting folder in {manifest}: {folder_text}")
+            completed.append(folder)
+        return max(completed, key=lambda folder: folder.stat().st_mtime) if completed else None
     candidates = [
         p.resolve()
         for pattern in SORTING_OUTPUT_PATTERNS
@@ -103,9 +126,13 @@ def latest_sorting_folder(root: Path | None) -> Path | None:
 
 def latest_sorting_folder_from_roots(roots: list[Path | None]) -> Path | None:
     for root in roots:
+        if root is not None and all_partitions_skipped(root / "sorter_partition_manifest.json"):
+            return None
         candidate = latest_sorting_folder(root)
         if candidate is not None:
             return candidate
+        if root is not None and (root / "sorter_partition_manifest.json").exists():
+            return None
     return None
 
 
@@ -278,15 +305,8 @@ class PreprocessGuiSettings:
     highamp_ms_after: float = 2.0
     highamp_mode: str = "linear"
     reject_channels: list[int] = field(default_factory=list)
-    probe_assignments: list[dict[str, Any]] = field(
-        default_factory=lambda: [
-            {
-                "type": "staggered",
-                "groups": [0, 1, 2, 3, 4, 5, 6, 7],
-                "x_offset": 0,
-            }
-        ]
-    )
+    # Empty means derive geometry and all groups from the selected XML.
+    probe_assignments: list[dict[str, Any]] = field(default_factory=list)
     run_sorter: bool = True
     sorter: str | None = "Kilosort"
     sorter_partition_mode: Literal["all", "probe", "shank"] = "all"
@@ -302,6 +322,7 @@ class PreprocessGuiSettings:
 class PostprocessGuiSettings:
     sorting_phy_folder: str = ""
     sorting_search_root: str = ""
+    dat_path: str = ""
     cell_explorer_sorting_folders: list[str] = field(default_factory=list)
     apply_preprocess: bool = False
     exclude_cluster_groups: list[str] = field(default_factory=lambda: ["noise"])
@@ -464,6 +485,24 @@ class PipelineGuiSettings:
         return (self.local_root_path / self.basename).resolve()
 
     def postprocess_dat_path(self) -> Path | None:
+        explicit = _path_or_none(self.postprocess.dat_path)
+        if explicit is not None:
+            return explicit.resolve()
+        if self.postprocess_is_skipped():
+            return None
+        sorting = self.postprocess_sorting_folder()
+        if sorting is not None:
+            sorting_dat = resolve_phy_dat_path(sorting)
+            if sorting_dat is not None:
+                return sorting_dat
+            run_root = sorting.parent if sorting.name == "sorter_output" else sorting
+            session_roots = {
+                root.resolve() for root in (self.local_output_dir, self.basepath_path) if root is not None
+            }
+            if run_root.parent.resolve() not in session_roots:
+                return None
+        elif self.postprocess.sorting_search_root.strip():
+            return None
         basename = self.basename
         if not basename:
             return None
@@ -483,7 +522,48 @@ class PipelineGuiSettings:
         explicit = _path_or_none(self.postprocess.sorting_phy_folder)
         if explicit is not None:
             return explicit
+        if self.postprocess_is_skipped():
+            return None
+        search_root = _path_or_none(self.postprocess.sorting_search_root)
+        if search_root is not None:
+            return latest_sorting_folder(search_root)
         return latest_sorting_folder_from_roots([self.local_output_dir, self.basepath_path])
+
+    def postprocess_is_skipped(self) -> bool:
+        if self.postprocess.sorting_phy_folder.strip():
+            return False
+        explicit_root = _path_or_none(self.postprocess.sorting_search_root)
+        roots = [explicit_root] if explicit_root is not None else [self.local_output_dir, self.basepath_path]
+        for root in roots:
+            if root is None:
+                continue
+            manifest = root / "sorter_partition_manifest.json"
+            if manifest.exists():
+                return all_partitions_skipped(manifest)
+        return False
+
+    def postprocess_chanmap_path(self) -> Path | None:
+        explicit = _path_or_none(self.chanmap_path)
+        if explicit is not None:
+            return explicit
+        dat_path = self.postprocess_dat_path()
+        return dat_path.parent / "chanMap.mat" if dat_path is not None else None
+
+    def xml_excluded_channels(self, channel_ids: list[int] | None = None) -> set[int]:
+        """Apply XML skips and nonempty spike-detection membership to channel IDs."""
+        xml_path = self.resolved_xml_path()
+        if xml_path is None or not xml_path.exists():
+            return set()
+        metadata = load_session_xml_metadata(xml_path)
+        excluded = set(metadata.skipped_channels_0based)
+        if metadata.spike_groups_0based:
+            included = {ch for group in metadata.spike_groups_0based for ch in group}
+            candidates = (
+                channel_ids if channel_ids is not None
+                else [ch for group in metadata.anatomical_groups_0based for ch in group]
+            )
+            excluded.update(int(ch) for ch in candidates if ch not in included)
+        return excluded
 
     def resolved_chanmap_path(self) -> Path | None:
         explicit = _path_or_none(self.chanmap_path)
@@ -599,25 +679,47 @@ class PipelineGuiSettings:
         pp = self.postprocess
         basename = self.basename
         dat_path = self.postprocess_dat_path()
-        chanmap_path = self.resolved_chanmap_path()
+        chanmap_path = self.postprocess_chanmap_path()
         sampling_frequency, num_channels = _xml_metadata_from_path(self.resolved_xml_path())
         sorting_phy_folder = self.postprocess_sorting_folder()
+        dtype = "int16"
+        binary_offset = 0
+        if sorting_phy_folder is not None and dat_path is not None:
+            sorting_dat = resolve_phy_dat_path(sorting_phy_folder)
+            if sorting_dat is not None and sorting_dat.resolve() == dat_path.resolve():
+                params = read_phy_params(sorting_phy_folder)
+                for name, xml_value in (("sample_rate", sampling_frequency), ("n_channels_dat", num_channels)):
+                    if name in params and xml_value is not None and params[name] != xml_value:
+                        raise ValueError(
+                            f"XML and sorting {name} disagree for the selected binary: "
+                            f"XML={xml_value}, sorting={params[name]}. Select the correct XML/recording pair."
+                        )
+                dtype = str(params.get("dtype", dtype))
+                binary_offset = int(params.get("offset", 0))
+                sampling_frequency = params.get("sample_rate", sampling_frequency)
+                num_channels = params.get("n_channels_dat", num_channels)
         sorting_search_root = _path_or_none(pp.sorting_search_root)
         local_output_dir = self.local_output_dir
-        if (
-            sorting_search_root is None
-            and local_output_dir is not None
-            and (local_output_dir / "sorter_partition_manifest.json").exists()
-        ):
-            sorting_search_root = local_output_dir
+        if sorting_search_root is None:
+            for root in (local_output_dir, self.basepath_path):
+                if root is not None and (root / "sorter_partition_manifest.json").exists():
+                    sorting_search_root = root
+                    break
 
         return PostprocessConfig(
             sorting_phy_folder=sorting_phy_folder,
             sorting_search_root=sorting_search_root,
-            dat_path=dat_path if dat_path is not None and dat_path.exists() else None,
+            dat_path=dat_path,
+            xml_path=self.resolved_xml_path(),
+            dtype=dtype,
+            binary_offset=binary_offset,
             sampling_frequency=sampling_frequency,
             num_channels=num_channels,
-            chanmap_mat_path=chanmap_path if chanmap_path is not None and chanmap_path.exists() else None,
+            chanmap_mat_path=(
+                chanmap_path
+                if self.chanmap_path.strip() or (chanmap_path is not None and chanmap_path.exists())
+                else None
+            ),
             reject_channels=list(self.preprocess.reject_channels),
             apply_preprocess=pp.apply_preprocess,
             bandpass_min_hz=self.preprocess.bandpass_min_hz,
