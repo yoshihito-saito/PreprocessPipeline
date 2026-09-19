@@ -181,6 +181,8 @@ def _allocation_environment() -> dict[str, str | None]:
             "SLURM_JOB_ID",
             "SLURM_JOB_GPUS",
             "SLURM_STEP_GPUS",
+            "PYTORCH_ALLOC_CONF",
+            "PYTORCH_CUDA_ALLOC_CONF",
         )
     }
 

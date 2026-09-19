@@ -83,6 +83,8 @@ def test_gpu_selection_waits_then_activates_least_used_uuid(
     log_path = tmp_path / "gpu-selection.jsonl"
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("SLURM_JOB_ID", "42")
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
 
     selection = gpu_selection.activate_least_used_gpu(
         log_path=log_path,
@@ -99,6 +101,8 @@ def test_gpu_selection_waits_then_activates_least_used_uuid(
     assert [event["status"] for event in events] == ["waiting", "selected"]
     assert events[0]["gpus"][0]["processes"][0]["username"] == "other-user"
     assert events[0]["gpus"][0]["processes"][0]["used_memory_mib"] == 60_000.0
+    assert events[0]["allocation_environment"]["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
+    assert events[0]["allocation_environment"]["PYTORCH_CUDA_ALLOC_CONF"] is None
 
 
 def test_gpu_selection_uses_utilization_and_index_as_tiebreakers(

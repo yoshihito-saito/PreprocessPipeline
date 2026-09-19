@@ -443,6 +443,10 @@ def execute(run_dir: Path, stage: StageName, attempt: int) -> int:
             f"Refusing to execute {stage.value} attempt-{attempt:03d} more than once"
         )
     started_at = _utc_now()
+    allocator_environment = {
+        name: os.environ.get(name)
+        for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+    }
     atomic_write_json(
         attempt_dir / "started.json",
         {
@@ -451,9 +455,15 @@ def execute(run_dir: Path, stage: StageName, attempt: int) -> int:
             "started_at": started_at,
             "hostname": socket.gethostname(),
             "pid": os.getpid(),
+            "allocator_environment": allocator_environment,
         },
     )
     try:
+        if stage == StageName.SORTING:
+            print(
+                "[Torch allocator environment] " + json.dumps(allocator_environment, sort_keys=True),
+                flush=True,
+            )
         if spec.analysis_sha256 != analysis.sha256:
             raise ValueError("AttemptSpec does not match the immutable AnalysisConfig")
         _verify_analysis_artifacts(store, stage)

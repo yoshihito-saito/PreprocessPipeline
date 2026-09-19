@@ -1,5 +1,7 @@
 # Change Log
 
+- [2026-09-19 default PyTorch allocator configuration](2026-09-19-torch-allocator-default.md)
+
 - [2026-09-17 channel consistency and Phy export](2026-09-17-channel-consistency-phy-export.md)
 
 - [2026-09-10 uv environment setup](2026-09-10-uv-setup.md)

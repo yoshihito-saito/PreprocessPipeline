@@ -253,6 +253,24 @@ Run metadata, scheduler job IDs, logs, results, and failures are stored under:
 
 Keep this directory while a Run may need to be inspected or resumed.
 
+New pipeline processes default to `PYTORCH_ALLOC_CONF=expandable_segments:True`
+at package startup, before importing Torch dependencies, to reduce CUDA memory
+fragmentation. This applies to GUI, CLI, local workers and Slurm workers.
+If either this variable or the legacy `PYTORCH_CUDA_ALLOC_CONF` is already set,
+its value is preserved exactly; the default is not added to existing settings.
+For example, set `PYTORCH_ALLOC_CONF=expandable_segments:False` before launching
+the GUI or worker to opt out. Restart the GUI after updating; running workers
+are unaffected. In notebooks, import `src` before Torch or set the variable
+before starting the kernel.
+
+Each worker records both variables under `allocator_environment` in its
+`started.json`. Sorting also prints `[Torch allocator environment]` to
+`stdout.log` and includes both variables in `gpu-selection.jsonl` events.
+These records confirm the worker environment, not driver support or the
+allocator state in a process that already imported Torch. Expandable segments
+cannot guarantee that a dataset fits in VRAM or prevent contention with other
+GPU processes.
+
 ## Resume an existing session
 
 Click **Browse local session to resume** and select the processed session directory, for example:

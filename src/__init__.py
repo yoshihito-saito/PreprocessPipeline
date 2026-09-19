@@ -5,6 +5,11 @@ from typing import TYPE_CHECKING
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
+# Configure fresh pipeline processes before dependencies can import Torch.
+# Preserve either spelling of an explicitly supplied allocator policy.
+if "PYTORCH_ALLOC_CONF" not in os.environ and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 if TYPE_CHECKING:
     from .postprocess import (
         PostprocessConfig,

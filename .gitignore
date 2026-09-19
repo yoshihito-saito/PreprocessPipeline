@@ -51,6 +51,7 @@ tests
 /tests/execution/*
 !/tests/execution/test_local_backend.py
 !/tests/execution/test_gpu_selection.py
+!/tests/execution/test_torch_allocator_default.py
 !/tests/execution/test_input_identity.py
 !/tests/preprocess/
 /tests/preprocess/*
