@@ -58,6 +58,7 @@ tests
 !/tests/preprocess/test_gui_move_outputs.py
 !/tests/preprocess/test_state_scoring_memory.py
 !/tests/preprocess/test_kilosort_partition_channels.py
+!/tests/preprocess/test_mergepoints_foldernames.m
 !/tests/stability/
 /tests/stability/*
 !/tests/stability/test_channel_mad.py

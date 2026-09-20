@@ -367,7 +367,15 @@ end
 segments = repmat(struct('foldername','','datFile','','startSample',0,'endSample',0,'nSamples',0,'fileNChannels',0,'dataChannels',[],'excludedChannels',[],'sourceType',''),1,numel(foldernames));
 for i = 1:numel(foldernames)
     foldername = localEpochNameFromPath(foldernames{i});
-    epochDir = resolveMergePointEpochDir(basepath,foldernames{i});
+    sourcePath = '';
+    if isfield(MergePoints,'folderpaths') && numel(MergePoints.folderpaths) == numel(foldernames)
+        sourcePaths = MergePoints.folderpaths;
+        if isstring(sourcePaths)
+            sourcePaths = cellstr(sourcePaths);
+        end
+        sourcePath = sourcePaths{i};
+    end
+    epochDir = resolveMergePointEpochDir(basepath,foldernames{i},sourcePath);
     datPath = fullfile(epochDir,'amplifier.dat');
     if ~exist(datPath,'file')
         datPath = findOpenEphysContinuousDat(epochDir);
@@ -510,21 +518,6 @@ if ~isempty(idx)
 end
 
 foundFile = fullPaths{1};
-end
-
-function epochDir = resolveMergePointEpochDir(basepath,foldername)
-localFolderName = localEpochNameFromPath(foldername);
-candidates = {
-    fullfile(basepath,localFolderName), ...
-    fullfile(basepath,char(foldername)), ...
-    char(foldername)};
-for i = 1:numel(candidates)
-    if exist(candidates{i},'dir')
-        epochDir = candidates{i};
-        return
-    end
-end
-epochDir = fullfile(basepath,localFolderName);
 end
 
 function epochName = localEpochNameFromPath(foldername)

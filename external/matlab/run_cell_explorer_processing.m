@@ -399,53 +399,6 @@ else
 end
 end
 
-function normalize_mergepoints_to_source(basepath, sourceBasepath, basename)
-mergeFile = fullfile(basepath, [basename, '.MergePoints.events.mat']);
-if exist(mergeFile, 'file') ~= 2
-    warning('MergePoints file is missing; waveform extraction will not be able to use sub-epoch dat files: %s', mergeFile);
-    return
-end
-
-loaded = load(mergeFile, 'MergePoints');
-if ~isfield(loaded, 'MergePoints')
-    warning('MergePoints struct is missing from %s', mergeFile);
-    return
-end
-MergePoints = loaded.MergePoints;
-if ~isfield(MergePoints, 'foldernames')
-    warning('MergePoints.foldernames is missing from %s', mergeFile);
-    return
-end
-
-foldernames = MergePoints.foldernames;
-if isstring(foldernames)
-    foldernames = cellstr(foldernames);
-end
-
-changed = false;
-for i = 1:numel(foldernames)
-    foldername = foldernames{i};
-    if isfolder(foldername)
-        continue
-    end
-    localEpoch = fullfile(basepath, foldername);
-    sourceEpoch = fullfile(sourceBasepath, foldername);
-    if isfolder(localEpoch)
-        continue
-    end
-    if isfolder(sourceEpoch)
-        foldernames{i} = sourceEpoch;
-        changed = true;
-    end
-end
-
-if changed
-    MergePoints.foldernames = foldernames;
-    save(mergeFile, 'MergePoints', '-append');
-    disp(['Updated MergePoints foldernames to source basepath: ', sourceBasepath]);
-end
-end
-
 function session = apply_anatomical_map_csv(session, csvPath)
 if exist(csvPath, 'file') ~= 2
     return
