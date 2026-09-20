@@ -14,7 +14,8 @@ import time
 from typing import Callable
 
 
-GPU_BUSY_PERCENT = 50.0
+# Temporary admission policy: start when a GPU has less than 10% VRAM in use.
+GPU_BUSY_PERCENT = 10.0
 GPU_POLL_SECONDS = 30.0
 GPU_MONITOR_SECONDS = 10.0 * 60.0
 
@@ -292,14 +293,12 @@ def activate_least_used_gpu(
             device
             for device in devices
             if device.memory_percent < float(busy_percent)
-            and device.utilization_percent is not None
-            and device.utilization_percent < float(busy_percent)
         ]
         selected = min(
             candidates,
             key=lambda device: (
-                max(device.memory_percent, float(device.utilization_percent or 0.0)),
                 device.memory_percent,
+                float(device.utilization_percent) if device.utilization_percent is not None else 100.0,
                 device.index,
             ),
             default=None,
@@ -309,6 +308,7 @@ def activate_least_used_gpu(
             "observed_at": _utc_now(),
             "hostname": socket.gethostname(),
             "busy_percent": float(busy_percent),
+            "admission_metric": "memory_percent",
             "poll_seconds": float(poll_seconds),
             "status": "selected" if selected is not None else "waiting",
             "allocation_environment": allocation_environment,
@@ -336,8 +336,8 @@ def activate_least_used_gpu(
             }
 
         print(
-            f"[GPU selection] No GPU is below {float(busy_percent):.1f}% for both "
-            f"memory and utilization; waiting {float(poll_seconds):g} seconds before retry.",
+            f"[GPU selection] No GPU has VRAM usage below {float(busy_percent):.1f}%; "
+            f"waiting {float(poll_seconds):g} seconds before retry.",
             flush=True,
         )
         sleeper(float(poll_seconds))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Literal
@@ -20,7 +21,7 @@ from src.execution.models import (
     ResourceSpec,
     StageName,
 )
-from src.execution.store import RunStore
+from src.execution.store import RunStore, atomic_write_bytes, atomic_write_json
 
 
 RunMode = Literal["all", "preprocess", "postprocess", "noise_label"]
@@ -807,6 +808,101 @@ class PipelineGuiSettings:
         return cls.from_json(path.read_text(encoding="utf-8"))
 
 
+def session_config_path(settings: PipelineGuiSettings) -> Path:
+    if settings.local_output_dir is None:
+        raise ValueError("Select a session before editing or saving its configuration")
+    return settings.local_output_dir / "config" / "pipeline_gui.json"
+
+
+def prepare_session_sorter_config(settings: PipelineGuiSettings) -> Path | None:
+    """Seed an editable session copy once; never overwrite existing edits."""
+    text = settings.preprocess.sorter_config_path.strip()
+    if not text or not settings.preprocess.run_sorter:
+        return None
+    source = resolve_project_path(Path(text).expanduser(), root=REPO_ROOT).resolve()
+    target = session_config_path(settings).parent / source.name
+    if not target.exists():
+        data = source.read_bytes()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(target, data)
+    settings.preprocess.sorter_config_path = str(target.resolve())
+    return target
+
+
+def save_session_settings(
+    settings: PipelineGuiSettings, *, execution: ExecutionConfig | None = None
+) -> None:
+    path = session_config_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.loads(settings.to_json())
+    if execution is not None:
+        payload["execution"] = asdict(_gui_execution_from_snapshot(execution))
+    atomic_write_json(path, payload)
+
+
+def _repair_xml_only_resume_change(settings: PipelineGuiSettings, store: RunStore) -> bool:
+    """Repair the known map-loading bug only with matching prior output evidence."""
+    from src.execution.session import stage_fingerprints
+
+    failures = sorted((store.run_dir / "stages" / "preprocess").glob("attempt-*/failure.json"))
+    if not failures:
+        return False
+    failure = json.loads(failures[-1].read_text(encoding="utf-8"))
+    if "no compatible persistent output contract" not in str(failure.get("message", "")):
+        return False
+    contract_path = settings.local_output_dir / ".preprocess-output-contract.json"
+    if not contract_path.exists():
+        return False
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    analysis = store.load_analysis()
+    xml = settings.resolved_xml_path()
+    if xml is None or not xml.is_file():
+        return False
+    if hashlib.sha256(xml.read_bytes()).hexdigest() != analysis.artifact_sha256.get("xml"):
+        return False
+    current = set(settings.preprocess.reject_channels)
+    xml_bad = set(settings.xml_excluded_channels())
+    run = store.load_run()
+    previous_paths = list(run.get("previous_run_dirs") or [])
+    if run.get("previous_run_dir"):
+        previous_paths.insert(0, run["previous_run_dir"])
+    for path in dict.fromkeys(previous_paths):
+        previous = RunStore(Path(path))
+        if not (previous.run_dir / "analysis_config.json").exists():
+            continue
+        prior = previous.load_analysis()
+        if stage_fingerprints(prior)["preprocess"] != contract.get("stage_fingerprint"):
+            continue
+        prior_manual = list(prior.settings.get("preprocess", {}).get("reject_channels", []))
+        added = current - set(prior_manual)
+        if not added or not set(prior_manual).issubset(current) or not added.issubset(xml_bad):
+            continue
+        candidate = json.loads(settings.to_json())
+        candidate["preprocess"]["reject_channels"] = prior_manual
+        identity = AnalysisConfig.create(candidate, artifact_sha256=analysis.artifact_sha256)
+        if stage_fingerprints(identity)["preprocess"] == contract.get("stage_fingerprint"):
+            settings.preprocess.reject_channels = prior_manual
+            return True
+    return False
+
+
+def _editable_resume_settings(
+    settings: PipelineGuiSettings, session_dir: Path, store: RunStore | None = None
+) -> PipelineGuiSettings:
+    path = session_dir / "config" / "pipeline_gui.json"
+    repaired = False
+    if path.exists():
+        settings = PipelineGuiSettings.load(path)
+        settings.local_root = str(session_dir.parent)
+        settings.existing_session_dir = str(session_dir)
+    elif store is not None:
+        repaired = _repair_xml_only_resume_change(settings, store)
+    prepare_session_sorter_config(settings)
+    if repaired:
+        save_session_settings(settings)
+    return settings
+
+
 @dataclass(frozen=True)
 class LocalSessionResume:
     settings: PipelineGuiSettings
@@ -927,6 +1023,7 @@ def load_local_session_resume(session_dir: Path) -> LocalSessionResume:
                 analysis=analysis,
                 execution=store.load_execution(),
             )
+            settings = _editable_resume_settings(settings, session_dir, store)
             return LocalSessionResume(settings, run_dir, "persistent_run")
         except Exception as exc:
             raise ValueError(
@@ -950,6 +1047,7 @@ def load_local_session_resume(session_dir: Path) -> LocalSessionResume:
                 analysis=AnalysisConfig.from_dict(dict(record["analysis"])),
                 execution=ExecutionConfig.from_dict(dict(record["execution"])),
             )
+            settings = _editable_resume_settings(settings, session_dir)
             return LocalSessionResume(settings, None, "preprocess_run.yaml")
         except Exception as exc:
             raise ValueError(f"Cannot recover completed Run metadata from {final_record}: {exc}") from exc

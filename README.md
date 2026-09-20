@@ -273,6 +273,26 @@ GPU processes.
 
 ## Resume an existing session
 
+GUI parameters are saved to `<session>/config/pipeline_gui.json` when a Run is
+created. **Browse local session to resume** restores these settings, so a
+separate **Load config** step is unnecessary. Change parameters in the GUI and
+start a new Run to update the session settings; running and previous Runs retain
+their immutable snapshots. Changes that affect preprocessing still require
+compatible existing outputs or an explicit overwrite.
+
+**Open config** edits a session-local copy of the selected sorter configuration,
+for example `<session>/config/Kilosort4_config.yaml`. It is copied on first use
+and reused thereafter; edits do not modify repository defaults or previous Run
+snapshots. Save the YAML in your editor before starting the next Run. An existing
+session copy is retained even if the original default later changes. To import
+a different configuration with the same filename, replace the session copy
+explicitly. GUI widget changes are persisted on Run, not on every keystroke.
+
+Older sessions are initialized from their recorded Run settings. Recovery of
+the XML/manual exclusion loading bug is limited to failed contract checks with
+an unchanged XML file and a matching prior preprocess contract; other parameter
+differences are not silently discarded.
+
 Click **Browse local session to resume** and select the processed session directory, for example:
 
 ```text

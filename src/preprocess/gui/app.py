@@ -99,6 +99,7 @@ from .config_model import (
     postprocess_output_folder_for_sorting,
     resolve_existing_session_settings,
     load_local_session_resume,
+    prepare_session_sorter_config,
 )
 from .anatomical_map import (
     AnatomicalChannelGroup,
@@ -3956,7 +3957,9 @@ class MainWindow(QMainWindow):
         self._refresh_suspended = True
         try:
             self.chanmap_path.setText(str(path))
-            self._manual_reject_channels.update(map_bad)
+            # XML exclusions are already applied separately. Loading their
+            # generated map must not turn them into new manual settings.
+            self._manual_reject_channels.update(set(map_bad) - self._xml_skipped_channels)
             bad = set(parse_int_list(self.reject_channels.text())) | set(map_bad)
             self.reject_channels.setText(", ".join(str(v) for v in sorted(bad)))
             if assignments:
@@ -5969,7 +5972,14 @@ class MainWindow(QMainWindow):
         return SORTER_DEFAULTS.get(self.sorter.currentText(), ("", ""))
 
     def _open_sorter_config(self) -> None:
-        path = self._current_sorter_config_path()
+        try:
+            settings = self._collect_settings()
+            path = prepare_session_sorter_config(settings)
+            if path is not None:
+                self.sorter_config_path.setText(str(path))
+        except Exception as exc:
+            QMessageBox.warning(self, "Open config", str(exc))
+            return
         if path is None:
             QMessageBox.information(self, "Open config", "No sorter config is selected.")
             return
@@ -7333,6 +7343,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Persistent Run submission failed", str(exc))
             return
         self._set_active_run(run_dir, session_dir=settings.local_output_dir)
+        self.sorter_config_path.setText(settings.preprocess.sorter_config_path)
         self.execution_resolved.setText(f"Using {resolved.value.capitalize()} for this Run.")
         if not self._launch_persistent_controller([]):
             self._append_warning_log(

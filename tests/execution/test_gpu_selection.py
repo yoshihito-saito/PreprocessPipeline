@@ -76,7 +76,7 @@ def test_gpu_selection_waits_then_activates_least_used_uuid(
                 _device(0, 80.0, processes=(busy_process,)),
                 _device(1, 10.0, utilization=80.0),
             ],
-            [_device(0, 70.0, processes=(busy_process,)), _device(1, 12.0, utilization=5.0)],
+            [_device(0, 70.0, processes=(busy_process,)), _device(1, 9.0, utilization=80.0)],
         ]
     )
     sleeps: list[float] = []
@@ -99,6 +99,8 @@ def test_gpu_selection_waits_then_activates_least_used_uuid(
     assert gpu_selection.os.environ["CUDA_VISIBLE_DEVICES"] == "GPU-uuid-1"
     events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
     assert [event["status"] for event in events] == ["waiting", "selected"]
+    assert events[0]["busy_percent"] == 10.0
+    assert events[0]["admission_metric"] == "memory_percent"
     assert events[0]["gpus"][0]["processes"][0]["username"] == "other-user"
     assert events[0]["gpus"][0]["processes"][0]["used_memory_mib"] == 60_000.0
     assert events[0]["allocation_environment"]["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
@@ -110,8 +112,8 @@ def test_gpu_selection_uses_utilization_and_index_as_tiebreakers(
 ) -> None:
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     devices = [
-        _device(0, 10.0, utilization=30.0),
-        _device(1, 10.0, utilization=5.0),
+        _device(0, 9.0, utilization=30.0),
+        _device(1, 9.0, utilization=5.0),
     ]
 
     selection = gpu_selection.activate_least_used_gpu(

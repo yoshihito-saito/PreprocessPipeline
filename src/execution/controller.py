@@ -342,7 +342,9 @@ def create_run(
     mode: str,
     capabilities: SlurmCapabilities | None = None,
 ) -> Path:
-    from src.preprocess.gui.config_model import resolve_existing_session_settings
+    from src.preprocess.gui.config_model import (
+        resolve_existing_session_settings, prepare_session_sorter_config, save_session_settings,
+    )
 
     resolve_existing_session_settings(settings)
     resolved_xml = settings.resolved_xml_path()
@@ -401,6 +403,7 @@ def create_run(
     )
     try:
         claim = read_json(claim_path)
+        prepare_session_sorter_config(settings)
         sorter_source = _resolve_sorter_config_source(settings)
         sorter_source_bytes = sorter_source.read_bytes() if sorter_source is not None else None
     except BaseException:
@@ -478,6 +481,7 @@ def create_run(
                 "The selected processed session needs a preprocess rerun, but its raw "
                 "source basepath cannot be recovered from persistent or legacy metadata."
             )
+        save_session_settings(settings, execution=execution)
     except BaseException:
         abandon_session_claim(claim_path=claim_path, run_id=run_id)
         raise
