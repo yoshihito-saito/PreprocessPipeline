@@ -1938,6 +1938,64 @@ def _infer_sample_count_from_binary(path: Path, *, n_channels: int, dtype: str) 
     return int(size // frame_bytes)
 
 
+def _validate_intan_recording(path: Path, *, n_channels: int, dtype: str) -> int:
+    """Check each raw recording before trusting XML dimensions or exporting data.
+
+    A session/root header may describe a different epoch, so only an adjacent
+    RHD can validate this recording. File sizes alone cannot prove its width.
+    """
+    directory = path.parent
+    repair_hint = (
+        "Back up the originals and reconcile the raw files, local RHD metadata, "
+        "and XML before rerunning. Do not fix this by changing the XML alone."
+    )
+    rhd_path = _find_local_intan_rhd(directory)
+    if rhd_path is None and list(directory.glob("*.rhd")):
+        raise ValueError(f"Ambiguous local Intan RHD metadata in {directory}. {repair_hint}")
+    if rhd_path is not None:
+        try:
+            header = read_intan_rhd_header(rhd_path)
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot validate Intan channels: unreadable local RHD {rhd_path}: {exc}. {repair_hint}"
+            ) from exc
+        if header.num_amplifier_channels != n_channels:
+            disabled = ", ".join(header.disabled_amplifier_channels) or "none listed"
+            raise ValueError(
+                f"Intan amplifier channel mismatch in {directory}: XML expects {n_channels}, "
+                f"but {rhd_path.name} enables {header.num_amplifier_channels}. "
+                f"Disabled amplifier channels: {disabled}. {repair_hint}"
+            )
+    else:
+        warnings.warn(
+            f"No local RHD in {directory}; cannot independently verify enabled amplifier "
+            f"channels against XML ({n_channels}). Checking available file sizes only.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    samples = _infer_sample_count_from_binary(path, n_channels=n_channels, dtype=dtype)
+    if samples == 0:
+        raise ValueError(f"Empty Intan amplifier recording: {path}. {repair_hint}")
+    # time.dat is int32; digital files pack all enabled bits into one uint16
+    # word per amplifier sample, regardless of the number of enabled lines.
+    for name, width in (("time.dat", 4), ("digitalin.dat", 2), ("digitalout.dat", 2)):
+        sidecar = directory / name
+        if not sidecar.exists():
+            continue
+        size = sidecar.stat().st_size
+        expected = samples * width
+        if size != expected:
+            count, remainder = divmod(size, width)
+            raise ValueError(
+                f"Intan stream length mismatch in {directory}: {path.name} has {samples} "
+                f"samples at {n_channels} channels; {name} has {count} samples "
+                f"and {remainder} trailing bytes ({size} bytes; expected {expected}). "
+                f"Possible channel-count mismatch or incomplete recording. {repair_hint}"
+            )
+    return samples
+
+
 def build_acquisition_catalog(
     amplifier_paths: list[Path],
     n_amplifier_channels: int,
@@ -2019,19 +2077,22 @@ def build_acquisition_catalog(
             )
             continue
 
-        sample_count = _infer_sample_count_from_binary(
-            path,
-            n_channels=n_amplifier_channels,
-            dtype=dtype,
-        )
         d = path.parent
+        wild_info = _resolve_wild_merged_info(d)
+        if wild_info is None:
+            sample_count = _validate_intan_recording(
+                path, n_channels=n_amplifier_channels, dtype=dtype
+            )
+        else:
+            sample_count = _infer_sample_count_from_binary(
+                path, n_channels=n_amplifier_channels, dtype=dtype
+            )
         analog = d / "analogin.dat"
         digital = d / "digitalin.dat"
         aux = d / "auxiliary.dat"
         supply = d / "supply.dat"
         tdat = d / "time.dat"
 
-        wild_info = _resolve_wild_merged_info(d)
         intan_adc_channels = 0
         if analog.exists():
             analogin_paths.append(analog)
