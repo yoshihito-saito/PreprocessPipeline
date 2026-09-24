@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import struct
 
@@ -26,6 +26,7 @@ class IntanRhdHeader:
     num_board_dig_out_channels: int
     board_adc_native_orders: list[int]
     board_dig_in_native_orders: list[int]
+    disabled_amplifier_channels: list[str] = field(default_factory=list)
 
 
 def _read_qstring(fid) -> str:
@@ -79,6 +80,7 @@ def read_intan_rhd_header(rhd_path: Path) -> IntanRhdHeader:
 
         (number_of_signal_groups,) = struct.unpack("<h", fid.read(2))
 
+        disabled_amplifier_channels: list[str] = []
         n_amp = 0
         n_aux = 0
         n_supply = 0
@@ -97,7 +99,7 @@ def read_intan_rhd_header(rhd_path: Path) -> IntanRhdHeader:
                 continue
 
             for _ch in range(signal_group_num_channels):
-                _ = _read_qstring(fid)  # native_channel_name
+                native_channel_name = _read_qstring(fid)
                 _ = _read_qstring(fid)  # custom_channel_name
                 # native_order, custom_order, signal_type, channel_enabled, chip_channel, board_stream
                 native_order, _, signal_type, channel_enabled, _, _ = struct.unpack("<hhhhhh", fid.read(12))
@@ -107,6 +109,8 @@ def read_intan_rhd_header(rhd_path: Path) -> IntanRhdHeader:
                 fid.read(8)
 
                 if not channel_enabled:
+                    if signal_type == 0:
+                        disabled_amplifier_channels.append(native_channel_name)
                     continue
                 if signal_type == 0:
                     n_amp += 1
@@ -125,6 +129,7 @@ def read_intan_rhd_header(rhd_path: Path) -> IntanRhdHeader:
 
     return IntanRhdHeader(
         source_path=rhd_path,
+        disabled_amplifier_channels=disabled_amplifier_channels,
         sample_rate=float(sample_rate),
         amplifier_sample_rate=float(sample_rate),
         aux_input_sample_rate=float(sample_rate) / 4.0,

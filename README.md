@@ -20,6 +20,24 @@ raw recordings
 - **Multi-day processing:** combine selected days and subepochs while preserving their order and per-recording channel metadata.
 - **Persistent execution:** run locally or through Slurm and reconnect from the GUI after it is closed.
 
+## Intan input validation
+
+Before event export or concatenation, each selected raw recording is checked
+against its own adjacent `info.rhd` (or sole local `.rhd`), not a header copied
+from another epoch. Enabled amplifier channels must match the XML channel
+count. Amplifier files must contain complete, nonempty frames, and any
+`time.dat`, `digitalin.dat`, and `digitalout.dat` must have the same sample
+count. A mismatch or unreadable local header stops preprocessing with the
+recording path and conflicting counts. Digital lines are treated as bits in
+one 16-bit word per sample.
+
+If no local RHD exists, processing remains supported with an explicit warning:
+file-size checks cannot independently prove the enabled channel count. These
+checks do not assess signal quality or detect missing samples within a file.
+Back up originals before repairing data and metadata together; changing the
+XML alone cannot restore an unrecorded channel. Rebuild derived outputs after
+repairing raw input files.
+
 ## Installation
 
 ### Requirements
