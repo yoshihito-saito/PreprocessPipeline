@@ -4718,11 +4718,24 @@ class MainWindow(QMainWindow):
                 self.execution_stage_job_labels[stage.value].setText("—")
             self.force_stop.setEnabled(False)
             self._refresh_persistent_run_monitor()
-            detail = " from its completed Run record"
+            if recovered.metadata_source == "preprocess_run.yaml":
+                detail = " from its completed Run record"
+            else:
+                detail = f" from {recovered.metadata_source} (legacy session; no persistent Run)"
         self._auto_load_existing_chanmap()
         self._append_log(
             f"Loaded local session {session_dir}{detail}. No job was started or retried.\n"
         )
+        if recovered.metadata_source not in {"persistent_run", "preprocess_run.yaml"}:
+            missing_postprocess = (
+                " Legacy preprocessSession JSON does not record postprocessing settings."
+                if recovered.metadata_source != "config/pipeline_gui.json" else ""
+            )
+            self._append_warning_log(
+                "Legacy settings loaded with overwrite disabled. Review the settings before "
+                "starting a new Run; existing outputs still require compatibility validation."
+                f"{missing_postprocess}\n"
+            )
         self._schedule_refresh()
 
     def _browse_local_root(self) -> None:
@@ -5974,7 +5987,9 @@ class MainWindow(QMainWindow):
     def _open_sorter_config(self) -> None:
         try:
             settings = self._collect_settings()
-            path = prepare_session_sorter_config(settings)
+            path = prepare_session_sorter_config(
+                settings, missing_source_default=self._current_sorter_defaults()[1]
+            )
             if path is not None:
                 self.sorter_config_path.setText(str(path))
         except Exception as exc:

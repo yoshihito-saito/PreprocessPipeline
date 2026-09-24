@@ -814,7 +814,9 @@ def session_config_path(settings: PipelineGuiSettings) -> Path:
     return settings.local_output_dir / "config" / "pipeline_gui.json"
 
 
-def prepare_session_sorter_config(settings: PipelineGuiSettings) -> Path | None:
+def prepare_session_sorter_config(
+    settings: PipelineGuiSettings, *, missing_source_default: str | None = None
+) -> Path | None:
     """Seed an editable session copy once; never overwrite existing edits."""
     text = settings.preprocess.sorter_config_path.strip()
     if not text or not settings.preprocess.run_sorter:
@@ -822,6 +824,10 @@ def prepare_session_sorter_config(settings: PipelineGuiSettings) -> Path | None:
     source = resolve_project_path(Path(text).expanduser(), root=REPO_ROOT).resolve()
     target = session_config_path(settings).parent / source.name
     if not target.exists():
+        if not source.exists() and missing_source_default is not None:
+            source = resolve_project_path(
+                Path(missing_source_default).expanduser(), root=REPO_ROOT
+            ).resolve()
         data = source.read_bytes()
         target.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_bytes(target, data)
@@ -962,8 +968,138 @@ def _settings_from_resume_snapshots(
     return settings
 
 
+def _legacy_session_resume(session_dir: Path) -> LocalSessionResume | None:
+    """Recover settings only; output adoption remains the Run controller's job."""
+    gui_path = session_dir / "config" / "pipeline_gui.json"
+    params_path = session_dir / "preprocessSession_params.json"
+    manifest_path = session_dir / "preprocessSession_manifest.json"
+    if not any(path.exists() for path in (gui_path, params_path, manifest_path)):
+        return None
+
+    if gui_path.exists():
+        settings = PipelineGuiSettings.load(gui_path)
+        if not settings.basepath.strip() or settings.basename != session_dir.name:
+            raise ValueError("Saved GUI settings do not match the selected session basename")
+        if settings.multi_day_enabled and not settings.multi_day_session_paths:
+            raise ValueError("Saved multi-day settings are incomplete")
+        if not settings.multi_day_enabled and settings.source_basepath.strip():
+            if Path(settings.source_basepath).name != settings.basename:
+                raise ValueError("Saved source and output basenames do not match")
+            # The GUI recollects basepath but has no source_basepath widget.
+            settings.basepath = settings.source_basepath
+        metadata_source = "config/pipeline_gui.json"
+    else:
+        if not params_path.is_file() or not manifest_path.is_file():
+            raise ValueError(
+                "Legacy recovery requires both preprocessSession_params.json and "
+                "preprocessSession_manifest.json. Load the original GUI config if available."
+            )
+        params = json.loads(params_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(params, dict) or not isinstance(manifest, dict):
+            raise ValueError("Legacy parameters and manifest must be JSON objects")
+        source = str(params.get("basepath") or "").strip()
+        manifest_source = str(manifest.get("basepath") or "").strip()
+        if (
+            not source or not manifest_source
+            or Path(source).expanduser().resolve() != Path(manifest_source).expanduser().resolve()
+            or manifest.get("basename") != session_dir.name
+            or Path(source).name != session_dir.name
+        ):
+            raise ValueError("Legacy parameters and manifest do not identify the selected session")
+
+        # Most producer fields have the same name as their GUI counterpart.
+        # TTL fields predate the GUI's lower-case names.
+        aliases = {
+            "artifact_ttl_channel": "artifact_TTL_channel",
+            "artifact_ttl_include_offset": "artifact_TTL_include_offset",
+            "artifact_ttl_ms_before": "artifact_TTL_ms_before",
+            "artifact_ttl_ms_after": "artifact_TTL_ms_after",
+            "artifact_ttl_mode": "artifact_TTL_mode",
+        }
+        derived_fields = {
+            "remove_ttl_artifacts", "remove_highamp_artifacts", "run_sorter",
+            "probe_assignments", "preprocess_worker_count", "sorter_worker_count", "overwrite",
+        }
+        path_fields = {"sorter_path", "sorter_config_path", "matlab_path"}
+        preprocess: dict[str, Any] = {}
+        missing: list[str] = []
+        for item in fields(PreprocessGuiSettings):
+            if item.name in derived_fields:
+                continue
+            key = aliases.get(item.name, item.name)
+            if key in params:
+                preprocess[item.name] = params[key]
+            elif item.name not in path_fields:
+                missing.append(key)
+        if missing:
+            raise ValueError(
+                "Legacy parameters lack settings needed for automatic recovery: "
+                + ", ".join(missing)
+                + ". Load the original GUI config instead."
+            )
+        for name in path_fields:
+            preprocess[name] = str(params.get(name) or "")
+        for name in ("sw_channels", "theta_channels", "reject_channels"):
+            preprocess[name] = list(preprocess[name] or [])
+        preprocess["artifact_ttl_channel"] = preprocess["artifact_ttl_channel"] or 0
+        preprocess["remove_ttl_artifacts"] = preprocess["artifact_ttl_group_mode"] != "none"
+        preprocess["remove_highamp_artifacts"] = preprocess["artifact_highamp_group_mode"] != "none"
+        preprocess["run_sorter"] = bool(
+            preprocess["sorter"] and str(preprocess["sorter"]).lower() != "disabled"
+        )
+        preprocess["preprocess_worker_count"] = normalize_worker_count(
+            (params.get("job_kwargs") or {}).get("n_jobs")
+        )
+        preprocess["sorter_worker_count"] = normalize_worker_count(params.get("matlab_max_workers"))
+        settings = PipelineGuiSettings.from_json(json.dumps({
+            "basepath": source,
+            "subsession_order": list(params.get("subsession_order") or []),
+            "xml_path": str(params.get("xml_path") or ""),
+            "chanmap_path": str(params.get("chanmap_mat_path") or ""),
+            "preprocess": preprocess,
+        }))
+        multiday_path = session_dir / "multi_day_manifest.json"
+        if multiday_path.exists():
+            multiday = json.loads(multiday_path.read_text(encoding="utf-8"))
+            sessions = multiday.get("source_sessions")
+            subepochs = multiday.get("subepochs")
+            if (
+                multiday.get("name") != session_dir.name
+                or not isinstance(sessions, list) or len(sessions) < 2
+                or not all(isinstance(path, str) and path.strip() for path in sessions)
+                or not isinstance(subepochs, list) or not subepochs
+                or not all(
+                    isinstance(item, dict) and isinstance(item.get("source_subepoch_path"), str)
+                    and item["source_subepoch_path"].strip()
+                    for item in subepochs
+                )
+            ):
+                raise ValueError("Legacy multi-day manifest has incomplete session/subepoch selections")
+            settings.multi_day_enabled = True
+            settings.multi_day_name = session_dir.name
+            settings.multi_day_session_paths = sessions
+            settings.multi_day_selected_subepoch_paths = [
+                item["source_subepoch_path"] for item in subepochs
+            ]
+        metadata_source = "preprocessSession_params.json + preprocessSession_manifest.json"
+
+    settings.local_root = str(session_dir.parent)
+    settings.existing_session_dir = str(session_dir)
+    # Loading legacy settings must not carry a producer's old overwrite=True
+    # into a new Run. It does not certify that any existing output is complete.
+    settings.preprocess.overwrite = False
+    settings.postprocess.overwrite = False
+    settings.behavior.overwrite = False
+    for attribute, name in (("xml_path", f"{settings.basename}.xml"), ("chanmap_path", "chanMap.mat")):
+        local_path = session_dir / name
+        if local_path.is_file():
+            setattr(settings, attribute, str(local_path))
+    return LocalSessionResume(settings, None, metadata_source)
+
+
 def load_local_session_resume(session_dir: Path) -> LocalSessionResume:
-    """Load validated GUI settings from one local persistent session output."""
+    """Load saved settings from a persistent or legacy local session output."""
     session_dir = Path(session_dir).expanduser().resolve()
     if not session_dir.is_dir():
         raise NotADirectoryError(f"Local session folder does not exist: {session_dir}")
@@ -1052,7 +1188,16 @@ def load_local_session_resume(session_dir: Path) -> LocalSessionResume:
         except Exception as exc:
             raise ValueError(f"Cannot recover completed Run metadata from {final_record}: {exc}") from exc
 
+    try:
+        recovered = _legacy_session_resume(session_dir)
+        if recovered is not None:
+            return recovered
+    except Exception as exc:
+        raise ValueError(f"Cannot recover legacy session settings from {session_dir}: {exc}") from exc
+
     raise FileNotFoundError(
         "The selected folder has neither .pipeline-active-run.json nor preprocess_run.yaml: "
-        f"{session_dir}"
+        f"{session_dir}. No config/pipeline_gui.json or legacy preprocessSession "
+        "parameter/manifest JSON was found. Select the session output folder, "
+        "or load the original GUI config."
     )

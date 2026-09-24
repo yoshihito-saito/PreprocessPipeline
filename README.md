@@ -311,6 +311,18 @@ the XML/manual exclusion loading bug is limited to failed contract checks with
 an unchanged XML file and a matching prior preprocess contract; other parameter
 differences are not silently discarded.
 
+For sessions predating persistent Runs, the same resume button can load
+`config/pipeline_gui.json`, or restore preprocessing settings from the pair
+`preprocessSession_params.json` and `preprocessSession_manifest.json`.
+The recorded basename must match the selected folder. A local
+`multi_day_manifest.json` also restores the source sessions and selected subepochs.
+Legacy recovery disables overwrite and loads settings without creating Run
+metadata or marking outputs complete. Review sorting and postprocessing settings
+before starting a new Run: legacy preprocessing JSON does not contain
+postprocessing settings. Missing scientific settings require the original GUI
+config; a manifest alone is insufficient. Existing output compatibility checks
+still apply, so incomplete legacy outputs may not support automatic continuation.
+
 Click **Browse local session to resume** and select the processed session directory, for example:
 
 ```text
