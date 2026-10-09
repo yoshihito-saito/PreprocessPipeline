@@ -295,6 +295,7 @@ class PreprocessGuiSettings:
     remove_ttl_artifacts: bool = False
     artifact_ttl_group_mode: str = "none"
     artifact_ttl_channel: int = 0
+    export_opto_events: bool = False
     artifact_ttl_include_offset: bool = False
     artifact_ttl_ms_before: float = 0.5
     artifact_ttl_ms_after: float = 2.0
@@ -634,6 +635,7 @@ class PipelineGuiSettings:
             local_radius_um=p.local_radius_um,
             artifact_ttl_group_mode=ttl_group_mode,  # type: ignore[arg-type]
             artifact_TTL_channel=p.artifact_ttl_channel,
+            export_opto_events=p.export_opto_events,
             artifact_TTL_include_offset=p.artifact_ttl_include_offset,
             artifact_TTL_ms_before=p.artifact_ttl_ms_before,
             artifact_TTL_ms_after=p.artifact_ttl_ms_after,

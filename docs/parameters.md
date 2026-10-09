@@ -88,6 +88,7 @@ the other modes choose the scope over which events are applied/detected.
 | `remove_ttl_artifacts` | `false` | Enable TTL-driven artifact removal. Otherwise the effective group mode is `none`. |
 | `artifact_ttl_group_mode` | `"none"` | TTL removal scope. Set a non-`none` mode as well as enabling removal. |
 | `artifact_ttl_channel` | `0` | Digital bit index, 0–15, supplying artifact triggers. |
+| `export_opto_events` | `false` | Save that TTL channel as `<basename>.opto.manipulation.mat`, including when artifact removal is disabled. |
 | `artifact_ttl_include_offset` | `false` | Remove windows around falling edges as well as rising edges. |
 | `artifact_ttl_ms_before` | `0.5` | Removal window before each trigger, ms. |
 | `artifact_ttl_ms_after` | `2.0` | Removal window after each trigger, ms. |

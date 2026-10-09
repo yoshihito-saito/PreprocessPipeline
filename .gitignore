@@ -73,6 +73,7 @@ tests
 !/tests/preprocess/test_state_scoring_memory.py
 !/tests/preprocess/test_kilosort_partition_channels.py
 !/tests/preprocess/test_flex_g5_ver2.py
+!/tests/preprocess/test_opto_event_export.py
 !/tests/stability/
 /tests/stability/*
 !/tests/stability/test_channel_mad.py

@@ -69,6 +69,7 @@ class PreprocessConfig:
 
     analog_inputs: bool = False
     digital_inputs: bool = False
+    export_opto_events: bool = False
 
     chanmap_mat_path: Path | None = None
     xml_path: Path | None = None
