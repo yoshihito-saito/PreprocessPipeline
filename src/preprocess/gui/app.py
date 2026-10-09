@@ -3230,6 +3230,7 @@ class MainWindow(QMainWindow):
         self.ttl_group = NoWheelComboBox()
         self.ttl_group.addItems(["all", "probe", "shank"])
         self.ttl_channel = self._spin(0, 15, 0)
+        self.export_opto_events = QCheckBox("Export optogenetic TTL events")
         self.ttl_include_offset = QCheckBox("Include TTL offset")
         self.ttl_before = self._double_spin(0.0, 1000.0, 0.5)
         self.ttl_after = self._double_spin(0.0, 1000.0, 2.0)
@@ -3238,6 +3239,7 @@ class MainWindow(QMainWindow):
         ttl_form.addRow(self.remove_ttl_artifacts)
         ttl_form.addRow("TTL group mode", self.ttl_group)
         ttl_form.addRow("TTL channel", self.ttl_channel)
+        ttl_form.addRow(self.export_opto_events)
         ttl_form.addRow(self.ttl_include_offset)
         ttl_form.addRow("TTL ms before", self.ttl_before)
         ttl_form.addRow("TTL ms after", self.ttl_after)
@@ -3326,6 +3328,7 @@ class MainWindow(QMainWindow):
             self.state_microarousal_sec,
             self.state_block_wake_to_rem,
             self.remove_ttl_artifacts,
+            self.export_opto_events,
             self.ttl_group,
             self.ttl_channel,
             self.ttl_include_offset,
@@ -6247,6 +6250,7 @@ class MainWindow(QMainWindow):
             remove_ttl_artifacts=self.remove_ttl_artifacts.isChecked(),
             artifact_ttl_group_mode=self.ttl_group.currentText(),
             artifact_ttl_channel=self.ttl_channel.value(),
+            export_opto_events=self.export_opto_events.isChecked(),
             artifact_ttl_include_offset=self.ttl_include_offset.isChecked(),
             artifact_ttl_ms_before=self.ttl_before.value(),
             artifact_ttl_ms_after=self.ttl_after.value(),
@@ -6412,6 +6416,7 @@ class MainWindow(QMainWindow):
             self.remove_ttl_artifacts.setChecked(p.remove_ttl_artifacts and p.artifact_ttl_group_mode != "none")
             self.ttl_group.setCurrentText("all" if p.artifact_ttl_group_mode == "none" else p.artifact_ttl_group_mode)
             self.ttl_channel.setValue(p.artifact_ttl_channel)
+            self.export_opto_events.setChecked(p.export_opto_events)
             self.ttl_include_offset.setChecked(p.artifact_ttl_include_offset)
             self.ttl_before.setValue(p.artifact_ttl_ms_before)
             self.ttl_after.setValue(p.artifact_ttl_ms_after)

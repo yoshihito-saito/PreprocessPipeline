@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from scipy.io import loadmat, savemat
@@ -480,6 +481,49 @@ def _artifact_windows_from_peaks(
     return timestamps, peaks, duration
 
 
+def _build_opto_manipulation_struct_from_ttl(
+    digital_in: dict[str, Any], *, ttl_channel_0based: int
+) -> dict[str, Any]:
+    def channel_times(key: str) -> np.ndarray:
+        cells = np.asarray(digital_in.get(key, []), dtype=object).reshape(-1)
+        if ttl_channel_0based >= cells.size:
+            raise ValueError(f"digitalIn.{key} does not contain TTL channel {ttl_channel_0based}")
+        values = np.asarray(cells[ttl_channel_0based], dtype=np.float64).reshape(-1)
+        return np.sort(values[np.isfinite(values)])
+
+    on = channel_times("timestampsOn")
+    off = channel_times("timestampsOff")
+    ends = on.copy()
+    off_index = 0
+    for index, start in enumerate(on):
+        while off_index < off.size and off[off_index] < start:
+            off_index += 1
+        next_start = on[index + 1] if index + 1 < on.size else np.inf
+        if off_index < off.size and off[off_index] < next_start:
+            ends[index] = off[off_index]
+            off_index += 1
+
+    timestamps = np.column_stack((on, ends))
+    peaks = timestamps.mean(axis=1).reshape(-1, 1)
+    labels = np.full((on.size, 1), "opto", dtype=object)
+    return {
+        "timestamps": timestamps,
+        "peaks": peaks,
+        "amplitude": np.ones((on.size, 1), dtype=np.float64),
+        "amplitudeUnits": "binary",
+        "eventID": np.ones((on.size, 1), dtype=np.int16),
+        "eventIDlabels": labels,
+        "eventIDbinary": False,
+        "center": peaks,
+        "duration": (ends - on).reshape(-1, 1),
+        "detectorinfo": {
+            "source": "digitalIn.timestampsOn/timestampsOff",
+            "channel": float(ttl_channel_0based + 1),
+            "sourceType": "ttl",
+        },
+    }
+
+
 def _load_artifact_event_peaks_sec(event_path: Path, struct_name: str) -> np.ndarray:
     loaded = loadmat(event_path, simplify_cells=True)
     event_struct = loaded.get(struct_name)
@@ -537,7 +581,7 @@ def run_preprocess_session(
     config: PreprocessConfig, *, sorter_for_disk_check: str | None = None,
 ) -> PreprocessResult:
     step_idx = 0
-    total_steps = 17
+    total_steps = 18
 
     def _step(label: str) -> None:
         nonlocal step_idx
@@ -697,10 +741,10 @@ def run_preprocess_session(
     save_mergepoints_events_mat(mergepoints_path, merge_data, overwrite=config.overwrite)
 
     ttl_channel_0based: int | None = None
-    if ttl_artifact_enabled:
+    if ttl_artifact_enabled or config.export_opto_events:
         if config.artifact_TTL_channel is None:
             raise ValueError(
-                "artifact_ttl_group_mode != 'none' requires artifact_TTL_channel to be specified."
+                "TTL artifact removal or opto export requires artifact_TTL_channel."
             )
         ttl_channel_0based = _normalize_artifact_ttl_channel(config.artifact_TTL_channel)
 
@@ -708,7 +752,9 @@ def run_preprocess_session(
     # instead of re-parsing digitalin binary separately.
     _step("Prepare sidecar dat files")
     intermediate_dat_paths: dict[str, Path] = {}
-    need_sidecar_for_events = bool(config.analog_inputs or config.digital_inputs or ttl_artifact_enabled)
+    need_sidecar_for_events = bool(
+        config.analog_inputs or config.digital_inputs or ttl_artifact_enabled or config.export_opto_events
+    )
     if config.export_intermediate_dat or need_sidecar_for_events:
         analog_ch = (
             int(catalog.board_adc_channels)
@@ -796,7 +842,9 @@ def run_preprocess_session(
         if int(catalog.board_digital_word_channels) > 0
         else 1
     )
-    digital_inputs_for_export = bool(config.digital_inputs or ttl_artifact_enabled)
+    digital_inputs_for_export = bool(
+        config.digital_inputs or ttl_artifact_enabled or config.export_opto_events
+    )
     digital_channels_for_export: list[int] | None = None
     if ttl_channel_0based is not None:
         if digital_channels_for_export is None:
@@ -850,6 +898,24 @@ def run_preprocess_session(
         camera_pulses_delta_range=config.camera_pulses_delta_range,
         camera_fps_by_epoch=camera_fps_by_epoch,
     )
+
+    _step("Save opto manipulation events (optional)")
+    if config.export_opto_events:
+        if ttl_channel_0based is None:
+            raise ValueError("Internal error: TTL channel was not initialized.")
+        opto_path = output_dir / f"{basename}.opto.manipulation.mat"
+        if not opto_path.exists() or config.overwrite:
+            digital_path = next((p for p in digital_event_paths if p.name == "digitalIn.events.mat"), None)
+            if digital_path is None:
+                raise ValueError("Opto export requested but digitalIn.events.mat was not generated.")
+            digital_in = loadmat(digital_path, simplify_cells=True).get("digitalIn")
+            if not isinstance(digital_in, dict):
+                raise ValueError(f"Invalid digitalIn structure in {digital_path}")
+            opto = _build_opto_manipulation_struct_from_ttl(
+                digital_in, ttl_channel_0based=ttl_channel_0based
+            )
+            atomic_savemat(opto_path, {"opto": opto}, required_key="opto")
+        intermediate_dat_paths["opto_manipulation"] = opto_path
 
     _step("Load and concatenate amplifier dat")
     ephys_channel_indices_by_subsession = getattr(catalog, "ephys_channel_indices_by_subsession", None)
