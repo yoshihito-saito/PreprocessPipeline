@@ -278,3 +278,45 @@ historical 33/61-sample projections and explicit errors when initialization,
 completed template fitting, or final matching detects no spikes. They do not
 exercise CUDA MEX binaries or full-session sorting. A proposed alignment change
 and first-pass abort were withdrawn after review of the legacy behavior.
+
+### Standalone KiloSort1 GPU diagnostic
+
+Run this on a GPU compute node using the same MATLAB installation/environment
+as the failed sorter. `SORTER_OUTPUT` is the failed attempt's `sorter_output`
+directory containing `ops.mat`, `chanMap.mat`, and retained `temp_wh.dat`.
+
+```matlab
+addpath('tools');
+report = diagnose_kilosort1(SORTER_OUTPUT, fullfile(pwd,'sorter','KiloSort1'), ...
+    'OutputFile', '/tmp/kilosort1-diagnostic.json');
+```
+
+The diagnostic tests two known synthetic spikes using the CPU reference and
+all three loaded CUDA MEX functions. It then reads one saved batch in the exact
+`NT`-by-`Nchan` column-major format used by KiloSort, initializes a reduced
+64-template bank, and compares CPU/GPU matching with common templates and
+native GPU initialization. The historical waveform window and thresholds are
+retained. The report records effective/original template counts, MATLAB/GPU
+details, loaded MEX paths, source hashes, signal statistics and exception stacks.
+
+The diagnostic does not run raw preprocessing, iterative template training,
+full-size memory tests or a complete sort. It writes only a new JSON file and
+refuses to replace an existing file. `UseGPU=false` supports CPU-only checks.
+An optional `LegacyRoot` uses a supplied reference MATLAB source tree on the
+same saved batch, options and current server MEX binaries. That comparison
+does not establish equivalence of the raw preprocessing or full-session
+initialization sampling.
+
+If CPU synthetic matching succeeds but GPU synthetic matching fails, check the
+selected MEX binaries, CUDA error and GPU compatibility before rerunning the
+session. If synthetic matching passes but recorded CPU/GPU results diverge,
+inspect common-template matching versus GPU initialization. If those pass,
+compare legacy/current preprocessing on a short raw-data crop, then verify
+full-size training/allocation behavior before attempting a full session.
+
+The standalone diagnostic has separate CPU tests:
+
+```matlab
+results = runtests(fullfile('tests','matlab','test_kilosort1_diagnostic.m'));
+assertSuccess(results);
+```
