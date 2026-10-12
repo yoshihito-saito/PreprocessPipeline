@@ -166,6 +166,18 @@ explains detection thresholds, drift correction, geometry, whitening, clustering
 and runtime options inline. These options are version-specific; changing the
 pipeline's bandpass/reference does not automatically rewrite the sorter config.
 
+For Kilosort1, `wave_length` is the number of samples in its waveform model.
+The bundled initialization scales its peak window with that length; earlier
+versions always used the 61-sample offset, misaligning shorter windows such as
+33 samples with their PCA basis. The 61-sample window remains unchanged.
+Kilosort1 now stops with an explicit error if initialization finds no isolated
+spikes, the first complete fitting pass detects zero spikes, or final matching
+finds zero spikes. Fitting checks actual detections, because cluster replacement
+can populate its progress counters even when no spikes were detected. Check
+the input, initialization, thresholds and CUDA MEX installation before retrying
+a zero-detection run. Correcting this sorter initialization does not require
+rerunning valid pipeline preprocessing.
+
 ## Postprocessing
 
 These keys belong inside `postprocess`. The recording's sample order, time origin,

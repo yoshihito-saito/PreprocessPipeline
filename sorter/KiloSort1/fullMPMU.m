@@ -202,6 +202,15 @@ for ibatch = 1:Nbatch
     end
 end
 %%
+if isempty(st3)
+    if Nbatch_buff < Nbatch
+        fclose(fid);
+    end
+    error('KiloSort:NoSpikesFound', ...
+        ['KiloSort1 found zero spikes in the final matching pass. ' ...
+        'Check the input signal, template initialization and final Th/lam ' ...
+        'before retrying sorting. No Phy output was produced.']);
+end
 [~, isort]      = sort(st3(:,1), 'ascend');
 st3             = st3(isort,:);
 

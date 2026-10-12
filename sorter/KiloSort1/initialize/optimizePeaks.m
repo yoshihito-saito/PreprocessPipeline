@@ -4,6 +4,11 @@ nt0             = ops.nt0;
 
 nProj           = size(uproj,2);
 nspike = size(uproj, 1);
+if nspike == 0
+    error('KiloSort:NoInitializationSpikes', ...
+        ['KiloSort1 found no isolated spikes for template initialization. ' ...
+        'Check the input signal and detect_threshold before retrying sorting.']);
+end
 nSpikesPerBatch = 4000;
 nbatch = ceil(nspike / nSpikesPerBatch);
 

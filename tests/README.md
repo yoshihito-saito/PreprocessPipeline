@@ -266,7 +266,15 @@ From the repository root in MATLAB:
 ```matlab
 results = runtests(fullfile('tests', 'matlab', 'test_mergepoints_foldernames.m'));
 assertSuccess(results);
+results = runtests(fullfile('tests', 'matlab', 'test_kilosort1_waveforms.m'));
+assertSuccess(results);
 ```
 
 The existing test adds its bundled helper paths temporarily and restores the
 MATLAB path at teardown. Its synthetic files live in a MATLAB temporary folder.
+
+The KiloSort1 tests run on CPU with tiny synthetic batches. They verify peak
+alignment for 21/33/61/81-sample PCA windows, unchanged 61-sample projections,
+batch-boundary errors, and explicit errors when initialization, template
+fitting, or final matching detects no spikes. They do not exercise CUDA MEX
+binaries or full-session sorting.

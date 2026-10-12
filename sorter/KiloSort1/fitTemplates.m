@@ -109,8 +109,20 @@ end
 
 nswitch = [0];
 msg = [];
+nDetected = 0;
 fprintf('Time %3.0fs. Optimizing templates ...\n', toc)
 while (i<=Nbatch * ops.nfullpasses+1)
+    % replace_clusters can seed nspikes with artificial counts. Only actual
+    % matcher detections establish whether the first full pass succeeded.
+    if i == Nbatch + 1 && nDetected == 0
+        if Nbatch_buff < Nbatch
+            fclose(fid);
+        end
+        error('KiloSort:NoTemplateMatches', ...
+            ['KiloSort1 detected zero spikes during the first full template-fitting pass. ' ...
+            'Check initialization, wave_length, Th/lam and the CUDA MEX installation ' ...
+            'before retrying sorting.']);
+    end
     % set the annealing parameters
     if i<Nbatch*ops.nannealpasses
         Th      = Thi(i);
@@ -215,6 +227,7 @@ while (i<=Nbatch * ops.nfullpasses+1)
     end
     
     dbins = .9975 * dbins;  % this is a hard-coded forgetting factor, needs to become an option
+    nDetected = nDetected + numel(id);
     if ~isempty(id)
         % compute numbers of spikes
         nsp                = gather_try(nsp(:));
@@ -248,6 +261,12 @@ end
 if Nbatch_buff<Nbatch
     fclose(fid);
 end
+
+if nDetected == 0
+    error('KiloSort:NoTemplateMatches', ...
+        'KiloSort1 template fitting finished without detecting any spikes.');
+end
+rez.nTemplateMatches = nDetected;
 
 if ~ops.GPU
    rez.fW = fW; % save fourier space templates if on CPU
