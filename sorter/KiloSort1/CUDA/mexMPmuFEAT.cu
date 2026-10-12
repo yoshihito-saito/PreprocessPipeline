@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "mex.h"
 #include "gpu/mxGPUArray.h"
+#include "ks_cuda_checks.h"
 #include <cstdlib>
 #include <algorithm>
 #include <iostream>
@@ -275,16 +276,18 @@ __global__ void getUgradient(const double *Params, const int *st, const int *id,
 /*
  * Host code
  */
-void mexFunction(int nlhs, mxArray *plhs[],
+static void ksMexImpl(int nlhs, mxArray *plhs[],
                  int nrhs, mxArray const *prhs[])
 {
+  KsCudaResources resources;
+
   /* Declare input variables*/
   double *Params, *d_Params;
   int nt0, blocksPerGrid, NT, maxFR, Nchan;
   int const threadsPerBlock = Nthreads;
 
   /* Initialize the MathWorks GPU API. */
-  mxInitGPU();
+  if (mxInitGPU() != MX_GPU_SUCCESS) throw std::runtime_error("MathWorks GPU initialization failed.");
 
   /* read Params and copy to GPU */
   Params  	= (double*) mxGetData(prhs[0]);
@@ -294,90 +297,95 @@ void mexFunction(int nlhs, mxArray *plhs[],
   Nchan     = (int) Params[5];
   nt0       = (int) Params[9];
 
-  cudaMalloc(&d_Params,      sizeof(double)*mxGetNumberOfElements(prhs[0]));
-  cudaMemcpy(d_Params,Params,sizeof(double)*mxGetNumberOfElements(prhs[0]),cudaMemcpyHostToDevice);
+  KS_CUDA(resources.allocate(&d_Params,      sizeof(double)*mxGetNumberOfElements(prhs[0])));
+  KS_CUDA(cudaMemcpy(d_Params,Params,sizeof(double)*mxGetNumberOfElements(prhs[0]),cudaMemcpyHostToDevice));
 
   /* collect input GPU variables*/
   mxGPUArray const  *W,   *data,   *WtW, *mu,   *lam, *nu;
   const float     *d_W, *d_data, *d_WtW,  *d_mu, *d_lam, *d_nu;
-  
-  data       = mxGPUCreateFromMxArray(prhs[1]);
+
+  data       = resources.gpu(mxGPUCreateFromMxArray(prhs[1]));
   d_data     = (float const *)(mxGPUGetDataReadOnly(data));
-  W             = mxGPUCreateFromMxArray(prhs[2]);
+  W             = resources.gpu(mxGPUCreateFromMxArray(prhs[2]));
   d_W        	= (float const *)(mxGPUGetDataReadOnly(W));
-  WtW       	= mxGPUCreateFromMxArray(prhs[3]);
+  WtW       	= resources.gpu(mxGPUCreateFromMxArray(prhs[3]));
   d_WtW     	= (float const *)(mxGPUGetDataReadOnly(WtW));
-  mu            = mxGPUCreateFromMxArray(prhs[4]);
+  mu            = resources.gpu(mxGPUCreateFromMxArray(prhs[4]));
   d_mu          = (float const *)(mxGPUGetDataReadOnly(mu));
-  lam       	= mxGPUCreateFromMxArray(prhs[5]);
+  lam       	= resources.gpu(mxGPUCreateFromMxArray(prhs[5]));
   d_lam     	= (float const *)(mxGPUGetDataReadOnly(lam));
-  nu            = mxGPUCreateFromMxArray(prhs[6]);
+  nu            = resources.gpu(mxGPUCreateFromMxArray(prhs[6]));
   d_nu          = (float const *)(mxGPUGetDataReadOnly(nu));
-  
-  /* allocate new GPU variables*/  
+
+  /* allocate new GPU variables*/
   float *d_err,*d_C, *d_xbest, *d_x, *d_dout, *d_feat;
   int *d_st,  *d_ftype,  *d_id, *d_counter;
 
-  cudaMalloc(&d_dout,   NT * blocksPerGrid* sizeof(float));
+  KS_CUDA(resources.allocate(&d_dout,   NT * blocksPerGrid* sizeof(float)));
 
-  cudaMalloc(&d_err,   NT * sizeof(float));
-  cudaMalloc(&d_xbest,   NT * sizeof(float));
-  cudaMalloc(&d_ftype, NT * sizeof(int));
-  cudaMalloc(&d_st,    maxFR * sizeof(int));
-  cudaMalloc(&d_id,    maxFR * sizeof(int));
-  cudaMalloc(&d_x,     maxFR * sizeof(float));
-  cudaMalloc(&d_C,     maxFR * sizeof(float));
-  cudaMalloc(&d_counter,   2*sizeof(int));
-  cudaMalloc(&d_feat,     maxFR * blocksPerGrid * sizeof(float));
-  
-  cudaMemset(d_dout,    0, NT * blocksPerGrid * sizeof(float));
-  cudaMemset(d_counter, 0, 2*sizeof(int));
-  cudaMemset(d_st,      0, maxFR *   sizeof(int));
-  cudaMemset(d_id,      0, maxFR *   sizeof(int));
-  cudaMemset(d_x,       0, maxFR *    sizeof(float));
-  cudaMemset(d_C,       0, maxFR *    sizeof(float));
-  cudaMemset(d_feat,       0, maxFR * blocksPerGrid *   sizeof(float));
+  KS_CUDA(resources.allocate(&d_err,   NT * sizeof(float)));
+  KS_CUDA(resources.allocate(&d_xbest,   NT * sizeof(float)));
+  KS_CUDA(resources.allocate(&d_ftype, NT * sizeof(int)));
+  KS_CUDA(resources.allocate(&d_st,    maxFR * sizeof(int)));
+  KS_CUDA(resources.allocate(&d_id,    maxFR * sizeof(int)));
+  KS_CUDA(resources.allocate(&d_x,     maxFR * sizeof(float)));
+  KS_CUDA(resources.allocate(&d_C,     maxFR * sizeof(float)));
+  KS_CUDA(resources.allocate(&d_counter,   2*sizeof(int)));
+  KS_CUDA(resources.allocate(&d_feat,     maxFR * blocksPerGrid * sizeof(float)));
+
+  KS_CUDA(cudaMemset(d_dout,    0, NT * blocksPerGrid * sizeof(float)));
+  KS_CUDA(cudaMemset(d_counter, 0, 2*sizeof(int)));
+  KS_CUDA(cudaMemset(d_st,      0, maxFR *   sizeof(int)));
+  KS_CUDA(cudaMemset(d_id,      0, maxFR *   sizeof(int)));
+  KS_CUDA(cudaMemset(d_x,       0, maxFR *    sizeof(float)));
+  KS_CUDA(cudaMemset(d_C,       0, maxFR *    sizeof(float)));
+  KS_CUDA(cudaMemset(d_feat,       0, maxFR * blocksPerGrid *   sizeof(float)));
 
   int *counter;
-  counter = (int*) calloc(1,sizeof(int));
- 
+  counter = resources.host((int*) calloc(1,sizeof(int)));
+
   // filter the data with the temporal templates
-  Conv1D<<<blocksPerGrid,threadsPerBlock>>>(d_Params, d_data, d_W, d_dout); 
+  Conv1D<<<blocksPerGrid,threadsPerBlock>>>(d_Params, d_data, d_W, d_dout);
+  KS_KERNEL("Conv1D");
   for(int k=0;k<(int) Params[4];k++){
-    cudaMemset(d_err,     0, NT * sizeof(float));
-    cudaMemset(d_ftype,   0, NT * sizeof(int));
-    cudaMemset(d_xbest,   0, NT * sizeof(float));
+    KS_CUDA(cudaMemset(d_err,     0, NT * sizeof(float)));
+    KS_CUDA(cudaMemset(d_ftype,   0, NT * sizeof(int)));
+    KS_CUDA(cudaMemset(d_xbest,   0, NT * sizeof(float)));
 
     // compute the best filter
-    bestFilter<<<NT/Nthreads,threadsPerBlock>>>(    d_Params, 
+    bestFilter<<<NT/Nthreads,threadsPerBlock>>>(    d_Params,
             d_dout, d_mu, d_lam, d_nu, d_xbest, d_err, d_ftype);
-    
+    KS_KERNEL("bestFilter");
+
     // ignore peaks that are smaller than another nearby peak
-    cleanup_spikes<<<NT/Nthreads,threadsPerBlock>>>(d_Params, 
+    cleanup_spikes<<<NT/Nthreads,threadsPerBlock>>>(d_Params,
             d_xbest, d_err, d_ftype, d_st, d_id, d_x, d_C, d_counter);
- 
+    KS_KERNEL("cleanup_spikes");
+
     // add new spikes to 2nd counter
-    cudaMemcpy(counter, d_counter, sizeof(int), cudaMemcpyDeviceToHost);
+    KS_CUDA(cudaMemcpy(counter, d_counter, sizeof(int), cudaMemcpyDeviceToHost));
     if (counter[0]>maxFR){
       counter[0] = maxFR;
-      cudaMemcpy(d_counter, counter, sizeof(int), cudaMemcpyHostToDevice);      
+      KS_CUDA(cudaMemcpy(d_counter, counter, sizeof(int), cudaMemcpyHostToDevice));
     }
-    
+
     // extract template features before subtraction
-    extractFEAT<<<blocksPerGrid, threadsPerBlock>>>(d_Params, d_st, d_id, 
+    extractFEAT<<<blocksPerGrid, threadsPerBlock>>>(d_Params, d_st, d_id,
             d_x, d_counter, d_dout, d_WtW, d_lam, d_mu,d_feat);
-    
+    KS_KERNEL("extractFEAT");
+
     // subtract the detected spikes
-    subSpikes<<<blocksPerGrid, 2*nt0-1>>>(d_Params, d_st, d_id, 
+    subSpikes<<<blocksPerGrid, 2*nt0-1>>>(d_Params, d_st, d_id,
             d_x, d_counter, d_dout, d_WtW);
+    KS_KERNEL("subSpikes");
 
     // update 1st counter from 2nd counter
-    cudaMemcpy(d_counter+1, d_counter, sizeof(int), cudaMemcpyDeviceToDevice);
+    KS_CUDA(cudaMemcpy(d_counter+1, d_counter, sizeof(int), cudaMemcpyDeviceToDevice));
 
     if(counter[0]==maxFR)
       break;
   }
-  
+
 //  extractFEAT<<<blocksPerGrid, blocksPerGrid>>>(d_Params, d_st, d_id, d_x, d_counter, d_dout, d_WtW,   d_feat);
 
   float *x, *C, *feat;
@@ -385,7 +393,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
   int minSize;
   if (counter[0]<maxFR)  minSize = counter[0];
   else                   minSize = maxFR;
-  const mwSize dimst[] 	= {minSize,1}; 
+  const mwSize dimst[] 	= {minSize,1};
   plhs[0] = mxCreateNumericArray(2, dimst, mxINT32_CLASS, mxREAL);
   st = (int*) mxGetData(plhs[0]);
   plhs[1] = mxCreateNumericArray(2, dimst, mxINT32_CLASS, mxREAL);
@@ -394,33 +402,42 @@ void mexFunction(int nlhs, mxArray *plhs[],
   x =  (float*) mxGetData(plhs[2]);
   plhs[3] = mxCreateNumericArray(2, dimst, mxSINGLE_CLASS, mxREAL);
   C =  (float*) mxGetData(plhs[3]);
-  
-  const mwSize dimsf[] 	= {blocksPerGrid, minSize}; 
+
+  const mwSize dimsf[] 	= {blocksPerGrid, minSize};
   plhs[4] = mxCreateNumericArray(2, dimsf, mxSINGLE_CLASS, mxREAL);
   feat =  (float*) mxGetData(plhs[4]);
-  
-  cudaMemcpy(st, d_st, minSize * sizeof(int),   cudaMemcpyDeviceToHost);
-  cudaMemcpy(id, d_id, minSize * sizeof(int),   cudaMemcpyDeviceToHost);
-  cudaMemcpy(x,   d_x, minSize * sizeof(float), cudaMemcpyDeviceToHost);
-  cudaMemcpy(C,   d_C, minSize * sizeof(float), cudaMemcpyDeviceToHost);
-  cudaMemcpy(feat,   d_feat, minSize * blocksPerGrid*sizeof(float), cudaMemcpyDeviceToHost);
 
-  cudaFree(d_ftype);
-  cudaFree(d_err);
-  cudaFree(d_xbest);
-  cudaFree(d_st);
-  cudaFree(d_id);
-  cudaFree(d_x);
-  cudaFree(d_feat);
-  cudaFree(d_C);
-  cudaFree(d_counter);
-  cudaFree(d_Params);
+  KS_CUDA(cudaMemcpy(st, d_st, minSize * sizeof(int),   cudaMemcpyDeviceToHost));
+  KS_CUDA(cudaMemcpy(id, d_id, minSize * sizeof(int),   cudaMemcpyDeviceToHost));
+  KS_CUDA(cudaMemcpy(x,   d_x, minSize * sizeof(float), cudaMemcpyDeviceToHost));
+  KS_CUDA(cudaMemcpy(C,   d_C, minSize * sizeof(float), cudaMemcpyDeviceToHost));
+  KS_CUDA(cudaMemcpy(feat,   d_feat, minSize * blocksPerGrid*sizeof(float), cudaMemcpyDeviceToHost));
 
-  cudaFree(d_dout);
+  KS_CUDA(resources.releaseDevice(d_ftype));
+  KS_CUDA(resources.releaseDevice(d_err));
+  KS_CUDA(resources.releaseDevice(d_xbest));
+  KS_CUDA(resources.releaseDevice(d_st));
+  KS_CUDA(resources.releaseDevice(d_id));
+  KS_CUDA(resources.releaseDevice(d_x));
+  KS_CUDA(resources.releaseDevice(d_feat));
+  KS_CUDA(resources.releaseDevice(d_C));
+  KS_CUDA(resources.releaseDevice(d_counter));
+  KS_CUDA(resources.releaseDevice(d_Params));
 
-  mxGPUDestroyGPUArray(data);
-  mxGPUDestroyGPUArray(WtW);
-  mxGPUDestroyGPUArray(W);
-  mxGPUDestroyGPUArray(mu);
-  mxGPUDestroyGPUArray(lam);
+  KS_CUDA(resources.releaseDevice(d_dout));
+
+  resources.releaseGpu(data);
+  resources.releaseGpu(WtW);
+  resources.releaseGpu(W);
+  resources.releaseGpu(mu);
+  resources.releaseGpu(lam);
+  KS_CUDA(cudaDeviceSynchronize());
+}
+
+void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]) {
+    if (nrhs != 7 || nlhs != 5)
+        mexErrMsgIdAndTxt("KiloSort:MexArguments", "mexMPmuFEAT requires 7 inputs and 5 outputs.");
+    try { ksMexImpl(nlhs, plhs, nrhs, prhs); }
+    catch (const KsCudaError &error) { mexErrMsgIdAndTxt("KiloSort:CUDAError", "%s", error.what()); }
+    catch (const std::exception &error) { mexErrMsgIdAndTxt("KiloSort:MexRuntime", "%s", error.what()); }
 }

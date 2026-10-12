@@ -49,6 +49,7 @@ tests
 /tests/cli/*
 !/tests/cli/test_sorter_runner.py
 !/tests/cli/test_pipeline_channels.py
+!/tests/cli/test_kilosort_cuda_checks.py
 !/tests/gui/
 /tests/gui/*
 !/tests/gui/test_gui_config_model.py

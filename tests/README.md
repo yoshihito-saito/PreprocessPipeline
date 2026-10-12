@@ -286,6 +286,7 @@ as the failed sorter. `SORTER_OUTPUT` is the failed attempt's `sorter_output`
 directory containing `ops.mat`, `chanMap.mat`, and retained `temp_wh.dat`.
 
 ```matlab
+parallel.gpu.enableCUDAForwardCompatibility(true); % needed for Blackwell on R2024b
 addpath('tools');
 report = diagnose_kilosort1(SORTER_OUTPUT, fullfile(pwd,'sorter','KiloSort1'), ...
     'OutputFile', '/tmp/kilosort1-diagnostic.json');
@@ -298,6 +299,8 @@ all three loaded CUDA MEX functions. It then reads one saved batch in the exact
 native GPU initialization. The historical waveform window and thresholds are
 retained. The report records effective/original template counts, MATLAB/GPU
 details, loaded MEX paths, source hashes, signal statistics and exception stacks.
+The diagnostic requests the same six/five matcher outputs as the production
+callers; older MEX entry points write every output slot unconditionally.
 
 The diagnostic does not run raw preprocessing, iterative template training,
 full-size memory tests or a complete sort. It writes only a new JSON file and
@@ -319,4 +322,63 @@ The standalone diagnostic has separate CPU tests:
 ```matlab
 results = runtests(fullfile('tests','matlab','test_kilosort1_diagnostic.m'));
 assertSuccess(results);
+```
+
+### Private checked CUDA build for the Blackwell failure
+
+The server diagnostic found that both CPU matchers detect the two synthetic
+events, while the loaded GPU matchers detect zero and template correlation is
+incorrect. The loaded binaries come from the external `neurocode` installation.
+Inspection of their ELF CUDA sections found only `sm_80` and `sm_90` cubins,
+with no PTX, and a dependency on `libcudart.so.13`. Neither cubin can execute on
+the server's compute-capability-12.0 GPU. MATLAB R2024b uses CUDA 12.2; its own
+GPU PCA succeeds under forward compatibility. Enabling MATLAB forward
+compatibility does not add missing PTX to a custom MEX binary. See
+[NVIDIA's Blackwell compatibility guide](https://docs.nvidia.com/cuda/archive/12.8.1/blackwell-compatibility-guide/index.html)
+and [MathWorks' CUDA version table](https://www.mathworks.com/help/parallel-computing/run-mex-functions-containing-cuda-code.html).
+
+`tools/build_kilosort1_cuda.m` builds all three MEX files in a **new private
+directory**, using MATLAB's bundled compiler/configuration and runtime. It
+explicitly includes `sm_90` cubins and `compute_90` PTX, which can be JIT-compiled
+for newer GPUs. This controlled helper supports Linux x86-64 and searches for
+a GCC 6--12 host compiler, as supported by R2024b's CUDA 12.2. An explicit
+`HostCompiler` path may be supplied if necessary. The resulting binaries target
+Hopper and newer GPUs; they are not intended for older GPU architectures.
+
+The three CUDA kernel bodies and sorting calculations are unchanged. Their
+host entry points now check CUDA allocations, transfers and kernel launches;
+CUDA exceptions release tracked resources before raising `KiloSort:CUDAError`
+with the failed operation, error name/code and source line. The private build
+also synchronizes after each kernel to identify asynchronous failures. It
+does not replace installed MEX files or change MATLAB's persistent path, GPU
+selection or sorting parameters.
+
+```matlab
+addpath('tools');
+build_kilosort1_cuda(fullfile(pwd,'sorter','KiloSort1'), ...
+    fullfile(pwd,'diagnostics','kilosort1','cuda-r2024b'));
+parallel.gpu.enableCUDAForwardCompatibility(true);
+report = diagnose_kilosort1(SORTER_OUTPUT,fullfile(pwd,'sorter','KiloSort1'), ...
+    'MexDirectory',fullfile(pwd,'diagnostics','kilosort1','cuda-r2024b'), ...
+    'OutputFile',fullfile(pwd,'diagnostics','kilosort1','report-003.json'));
+```
+
+`MexDirectory` requires MATLAB to select all three binaries from that folder;
+otherwise the report includes an explicit error. Build output includes verbose
+compiler/link commands in `build.log` and successful build metadata in
+`build-info.json`. Failed builds may leave a partial private directory; choose
+a fresh directory for another attempt. Existing report files are also preserved.
+
+Require `synthetic.gpu_known_signal_passed=true`, no CUDA errors, and review the
+saved-batch CPU/GPU comparisons before a full-session rerun. Compilation,
+binary inspection and CPU tests do not establish GPU execution or scientific
+equivalence of an entire sorting run. Forward compatibility still requires
+validation on the actual GPU.
+
+The CUDA error/cleanup helper has host-side fault-injection tests, requiring
+only a C++ compiler. These simulate launch, asynchronous execution and
+allocation failures; they do not execute CUDA kernels:
+
+```bash
+python -m pytest -q tests/cli/test_kilosort_cuda_checks.py
 ```

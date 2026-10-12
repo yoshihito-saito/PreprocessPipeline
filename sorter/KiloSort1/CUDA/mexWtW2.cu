@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "mex.h"
 #include "gpu/mxGPUArray.h"
+#include "ks_cuda_checks.h"
 #include <cstdlib>
 #include <algorithm>
 #include <iostream>
@@ -62,53 +63,65 @@ __global__ void	crossFilter(const double *Params, const float *W1, const float *
 /*
  * Host code
  */
-void mexFunction(int nlhs, mxArray *plhs[],
+static void ksMexImpl(int nlhs, mxArray *plhs[],
                  int nrhs, mxArray const *prhs[])
 {
+  KsCudaResources resources;
+
     /* Declare input variables*/
   double *Params, *d_Params;
   int nt0, Nfilt, NT;
 
   /* Initialize the MathWorks GPU API. */
-  mxInitGPU();
+  if (mxInitGPU() != MX_GPU_SUCCESS) throw std::runtime_error("MathWorks GPU initialization failed.");
 
   /* read Params and copy to GPU */
   Params  	= (double*) mxGetData(prhs[0]);
   NT		= (int) Params[0];
   Nfilt		= (int) Params[1];
   nt0       = (int) Params[9];
-  
-  cudaMalloc(&d_Params,      sizeof(double)*mxGetNumberOfElements(prhs[0]));
-  cudaMemcpy(d_Params,Params,sizeof(double)*mxGetNumberOfElements(prhs[0]),cudaMemcpyHostToDevice);
+
+  KS_CUDA(resources.allocate(&d_Params,      sizeof(double)*mxGetNumberOfElements(prhs[0])));
+  KS_CUDA(cudaMemcpy(d_Params,Params,sizeof(double)*mxGetNumberOfElements(prhs[0]),cudaMemcpyHostToDevice));
 
   /* collect input GPU variables*/
   mxGPUArray const  *W1, *W2,   *UtU;
   const float     *d_W1,*d_W2, *d_UtU;
-  
-  W1             = mxGPUCreateFromMxArray(prhs[1]);
+
+  W1             = resources.gpu(mxGPUCreateFromMxArray(prhs[1]));
   d_W1        	= (float const *)(mxGPUGetDataReadOnly(W1));
-  W2             = mxGPUCreateFromMxArray(prhs[2]);
+  W2             = resources.gpu(mxGPUCreateFromMxArray(prhs[2]));
   d_W2        	= (float const *)(mxGPUGetDataReadOnly(W2));
-  UtU       	= mxGPUCreateFromMxArray(prhs[3]);
+  UtU       	= resources.gpu(mxGPUCreateFromMxArray(prhs[3]));
   d_UtU     	= (float const *)(mxGPUGetDataReadOnly(UtU));
 
 
   mxGPUArray *WtW;
   float  *d_WtW;
-  const mwSize dimsu[] 	= {Nfilt, Nfilt, 2*nt0-1}; 
-  WtW 		= mxGPUCreateGPUArray(3, dimsu, mxSINGLE_CLASS, mxREAL, MX_GPU_DO_NOT_INITIALIZE);  
+  const mwSize dimsu[] 	= {Nfilt, Nfilt, 2*nt0-1};
+  WtW 		= resources.gpu(mxGPUCreateGPUArray(3, dimsu, mxSINGLE_CLASS, mxREAL, MX_GPU_DO_NOT_INITIALIZE));
   d_WtW 		= (float *)(mxGPUGetData(WtW));
 
   dim3 grid(Nfilt/nblock, Nfilt/nblock);
   dim3 block(nblock, nblock);
-  crossFilter<<<grid, block>>>(d_Params, d_W1, d_W2, d_UtU, d_WtW); 
+  crossFilter<<<grid, block>>>(d_Params, d_W1, d_W2, d_UtU, d_WtW);
+  KS_KERNEL("crossFilter");
 
   plhs[0] 	= mxGPUCreateMxArrayOnGPU(WtW);
 
-  cudaFree(d_Params);
-  mxGPUDestroyGPUArray(WtW);
-  mxGPUDestroyGPUArray(W1);
-  mxGPUDestroyGPUArray(W2);
-  mxGPUDestroyGPUArray(UtU);
-  
+  KS_CUDA(resources.releaseDevice(d_Params));
+  resources.releaseGpu(WtW);
+  resources.releaseGpu(W1);
+  resources.releaseGpu(W2);
+  resources.releaseGpu(UtU);
+
+  KS_CUDA(cudaDeviceSynchronize());
+}
+
+void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]) {
+    if (nrhs != 4 || nlhs != 1)
+        mexErrMsgIdAndTxt("KiloSort:MexArguments", "mexWtW2 requires 4 inputs and 1 output.");
+    try { ksMexImpl(nlhs, plhs, nrhs, prhs); }
+    catch (const KsCudaError &error) { mexErrMsgIdAndTxt("KiloSort:CUDAError", "%s", error.what()); }
+    catch (const std::exception &error) { mexErrMsgIdAndTxt("KiloSort:MexRuntime", "%s", error.what()); }
 }

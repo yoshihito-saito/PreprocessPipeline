@@ -7,7 +7,8 @@ function report = diagnose_kilosort1(sorterOutput, kilosortRoot, varargin)
 %
 % diagnose_kilosort1(out, ks, 'OutputFile', '/tmp/ks-diagnostic.json')
 % Optional: 'UseGPU', false; 'BatchIndex', 0; 'TemplateLimit', 64;
-% 'LegacyRoot', path to a known-working KiloSort1 source tree.
+% 'LegacyRoot', path to a known-working KiloSort1 source tree;
+% 'MexDirectory', a private directory containing all three compiled MEX files.
 % The recorded test uses one disk-stored batch and a reduced template bank;
 % it does not validate full-size allocations, training or preprocessing.
 p = inputParser;
@@ -16,6 +17,7 @@ addParameter(p, 'UseGPU', true, @(x) islogical(x) && isscalar(x));
 addParameter(p, 'BatchIndex', 0, @(x) isscalar(x) && x >= 0 && x == floor(x));
 addParameter(p, 'TemplateLimit', 64, @(x) isscalar(x) && isfinite(x) && x >= 32);
 addParameter(p, 'LegacyRoot', '');
+addParameter(p, 'MexDirectory', '');
 parse(p, varargin{:});
 options = p.Results;
 if exist(options.OutputFile, 'file')
@@ -34,15 +36,29 @@ report.run_ops_note = 'JSON encodes Inf/NaN as null; ops.mat remains authoritati
 gpuFns = struct;
 if options.UseGPU
     try
+        report.forward_compatibility = parallel.gpu.enableCUDAForwardCompatibility;
         device = gpuDevice; % no reset and no device change
         report.gpu = struct('name', device.Name, ...
             'compute_capability', device.ComputeCapability, ...
             'available_memory', device.AvailableMemory, 'total_memory', device.TotalMemory);
         names = {'mexMPregMU', 'mexMPmuFEAT', 'mexWtW2'};
+        if ~isempty(options.MexDirectory)
+            if ~isfolder(options.MexDirectory)
+                error('Diagnostic:MexDirectory','Missing MEX directory: %s',options.MexDirectory);
+            end
+            addpath(options.MexDirectory,'-begin');
+        end
         for i = 1:numel(names)
             report.mex.(names{i}) = which(names{i}, '-all');
             if exist(names{i}, 'file') ~= 3
                 error('Diagnostic:MissingMex', 'Compiled %s is missing; inspect MATLAB path.', names{i});
+            end
+            if ~isempty(options.MexDirectory)
+                expected = canonicalPath(fullfile(options.MexDirectory,[names{i} '.' mexext]));
+                selected = canonicalPath(which(names{i}));
+                if ~strcmp(expected,selected)
+                    error('Diagnostic:WrongMex','Expected %s, but MATLAB selected %s.',expected,selected);
+                end
             end
         end
         % Bind the current server binaries before any legacy-source comparison.
@@ -231,7 +247,9 @@ catch ME
     return;
 end
 try
-    [~,st] = gpuFns.reg(params,gData,W,gProjection,UtU,mu,lam,dWU,nu);
+    % Legacy MEX entry points write every output slot unconditionally.
+    % Request the same six/five outputs as the production caller.
+    [~,st,~,~,~,~] = gpuFns.reg(params,gData,W,gProjection,UtU,mu,lam,dWU,nu);
     wait(gpuDevice);
     result.gpu_training = numel(st);
 catch ME
@@ -248,7 +266,7 @@ try
     wait(gpuDevice);
     difference = gather(gWtw) - wtw;
     result.gpu_correlation_max_error = double(max(abs(difference(:))));
-    st = gpuFns.final(paramsFinal,gProjection,W,gWtw,mu,lamFinal,nu);
+    [st,~,~,~,~] = gpuFns.final(paramsFinal,gProjection,W,gWtw,mu,lamFinal,nu);
     wait(gpuDevice);
     result.gpu_final = numel(st);
 catch ME
@@ -259,6 +277,11 @@ end
 function out = exceptionInfo(ME)
 out = struct('identifier',ME.identifier,'message',ME.message, ...
     'stack',getReport(ME,'extended','hyperlinks','off'));
+end
+
+function result = canonicalPath(file)
+if ~java.io.File(file).isAbsolute, file = fullfile(pwd,file); end
+result = char(java.io.File(file).getCanonicalPath());
 end
 
 function sha = fileHash(file)
