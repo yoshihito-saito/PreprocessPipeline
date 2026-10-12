@@ -12,38 +12,22 @@ function teardownOnce(testCase)
 path(testCase.TestData.oldPath);
 end
 
-function testShortWaveformRetainsDetectedPeak(testCase)
-% The old fixed offset put this peak at sample 21, outside the short PCA
-% component's peak. That silently projected a nonzero spike to zero.
-for nt0 = [21 33 61 81]
-    wPCA = zeros(nt0, 1, 'single');
-    wPCA(ceil(20 * nt0 / 61) + 1) = 1;
-    data = zeros(200, 3, 'single');
-    data(100, 2) = -10;
-    actual = get_PCproj(data, 100, 2, wPCA, 1);
-    verifyEqual(testCase, actual(:,1,1), single([0; -10; 0]));
-end
-end
-
-function testDefaultWaveformMatchesLegacyProjection(testCase)
+function testHistoricalWaveformsMatchLegacyProjection(testCase)
 rng(1);
 data = single(randn(200, 5));
-wPCA = single(randn(61, 3));
 rows = [50; 100];
 cols = [2; 4];
-expected = zeros(5, 2, 3, 'single');
-for i = 1:numel(rows)
-    clip = data(rows(i) + (-20:40), :);
-    clip(:, abs((1:5) - cols(i)) >= 2) = 0;
-    projection = wPCA' * clip;
-    expected(:,i,:) = reshape(projection', 5, 1, 3);
+for nt0 = [33 61]
+    wPCA = single(randn(nt0, 3));
+    expected = zeros(5, 2, 3, 'single');
+    for i = 1:numel(rows)
+        clip = data(rows(i) + (-20:nt0-21), :);
+        clip(:, abs((1:5) - cols(i)) >= 2) = 0;
+        projection = wPCA' * clip;
+        expected(:,i,:) = reshape(projection', 5, 1, 3);
+    end
+    verifyEqual(testCase, get_PCproj(data, rows, cols, wPCA, 2), expected, 'AbsTol', single(1e-5));
 end
-verifyEqual(testCase, get_PCproj(data, rows, cols, wPCA, 2), expected, 'AbsTol', single(1e-5));
-end
-
-function testBatchBoundaryHasActionableError(testCase)
-verifyError(testCase, @() get_PCproj(zeros(100,3), 90, 2, zeros(81,1), 1), ...
-    'KiloSort:WaveformOutOfBounds');
 end
 
 function testNoInitializationSpikesHasActionableError(testCase)
@@ -61,7 +45,7 @@ verifyError(testCase, @() fullMPMU(rez, zeros(128,3,1,'int16')), ...
     'KiloSort:NoSpikesFound');
 end
 
-function testNoActualTrainingDetectionsStopsAfterFirstPass(testCase)
+function testNoActualTrainingDetectionsHasActionableError(testCase)
 rez = makeRez;
 file = [tempname '.mat'];
 cleanup = onCleanup(@() delete(file));
@@ -75,8 +59,17 @@ rez.ops.nannealpasses = 1;
 rez.ops.shuffle_clusters = false;
 rez.ops.showfigures = false;
 rez.temp = struct('Nbatch', 2, 'Nbatch_buff', 2);
-verifyError(testCase, @() fitTemplates(rez, zeros(128,3,2,'int16'), []), ...
-    'KiloSort:NoTemplateMatches');
+% The first pass must warn and continue; only the completed fit fails.
+oldWarning = warning('query', 'KiloSort:NoTemplateMatchesYet');
+warnCleanup = onCleanup(@() warning(oldWarning.state, 'KiloSort:NoTemplateMatchesYet'));
+warning('off', 'KiloSort:NoTemplateMatchesYet');
+try
+    fitTemplates(rez, zeros(128,3,2,'int16'), []);
+    verifyFail(testCase, 'Expected the completed empty fitting run to fail.');
+catch ME
+    verifyEqual(testCase, ME.identifier, 'KiloSort:NoTemplateMatches');
+    verifySubstring(testCase, ME.message, 'finished without detecting');
+end
 end
 
 function rez = makeRez

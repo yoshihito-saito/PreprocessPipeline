@@ -167,16 +167,17 @@ and runtime options inline. These options are version-specific; changing the
 pipeline's bandpass/reference does not automatically rewrite the sorter config.
 
 For Kilosort1, `wave_length` is the number of samples in its waveform model.
-The bundled initialization scales its peak window with that length; earlier
-versions always used the 61-sample offset, misaligning shorter windows such as
-33 samples with their PCA basis. The 61-sample window remains unchanged.
+The historical initialization window is retained, including at 33 samples.
+A proposed change to its offset was withdrawn: a small CPU comparison did not
+establish that this longstanding behavior caused a full GPU run to find no spikes.
 Kilosort1 now stops with an explicit error if initialization finds no isolated
-spikes, the first complete fitting pass detects zero spikes, or final matching
-finds zero spikes. Fitting checks actual detections, because cluster replacement
+spikes, completed template fitting detects zero spikes, or final matching finds
+zero spikes. An empty first fitting pass warns and continues the remaining
+passes. Fitting checks actual detections, because cluster replacement
 can populate its progress counters even when no spikes were detected. Check
 the input, initialization, thresholds and CUDA MEX installation before retrying
-a zero-detection run. Correcting this sorter initialization does not require
-rerunning valid pipeline preprocessing.
+a zero-detection run. These diagnostics do not identify the underlying cause
+of zero detections or require rerunning valid pipeline preprocessing.
 
 ## Postprocessing
 

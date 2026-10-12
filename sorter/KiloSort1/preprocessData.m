@@ -279,12 +279,6 @@ for ibatch = 1:Nbatch
     if strcmp(ops.initialize, 'fromData') %&& rem(ibatch, 10)==1
         % find isolated spikes
         [row, col, mu] = isolated_peaks(dataRAW, ops.loc_range, ops.long_range, ops.spkTh);
-        % The initialization window scales with nt0, including for lengths
-        % above 61 whose trailing window exceeds isolated_peaks' fixed guard.
-        nBefore = ceil(20 * ops.nt0 / 61);
-        valid = row - nBefore >= 1 & row + ops.nt0 - nBefore - 1 <= size(dataRAW, 1);
-        row = row(valid);
-        col = col(valid);
         
         % find their PC projections
         uS = get_PCproj(dataRAW, row, col, wPCA, ops.maskMaxChannels);

@@ -115,13 +115,10 @@ while (i<=Nbatch * ops.nfullpasses+1)
     % replace_clusters can seed nspikes with artificial counts. Only actual
     % matcher detections establish whether the first full pass succeeded.
     if i == Nbatch + 1 && nDetected == 0
-        if Nbatch_buff < Nbatch
-            fclose(fid);
-        end
-        error('KiloSort:NoTemplateMatches', ...
+        warning('KiloSort:NoTemplateMatchesYet', ...
             ['KiloSort1 detected zero spikes during the first full template-fitting pass. ' ...
             'Check initialization, wave_length, Th/lam and the CUDA MEX installation ' ...
-            'before retrying sorting.']);
+            'if later passes also detect no spikes. Continuing remaining passes.']);
     end
     % set the annealing parameters
     if i<Nbatch*ops.nannealpasses
