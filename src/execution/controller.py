@@ -75,7 +75,9 @@ def resolve_backend(
     raise RuntimeError(f"Explicit Slurm backend is unavailable: {detail}")
 
 
-def _analysis_settings_snapshot(settings: Any, *, sorter_snapshot_path: Path) -> dict[str, Any]:
+def _analysis_settings_snapshot(
+    settings: Any, *, sorter_snapshot_path: Path, chanmap_snapshot_path: Path | None = None,
+) -> dict[str, Any]:
     payload = json.loads(settings.to_json())
     preprocess = dict(payload.get("preprocess", {}))
     preprocess.pop("preprocess_worker_count", None)
@@ -88,6 +90,8 @@ def _analysis_settings_snapshot(settings: Any, *, sorter_snapshot_path: Path) ->
     postprocess.pop("worker_count", None)
     payload["postprocess"] = postprocess
     payload.pop("execution", None)
+    if chanmap_snapshot_path is not None:
+        payload["chanmap_path"] = str(chanmap_snapshot_path.resolve())
     return payload
 
 
@@ -314,6 +318,10 @@ def _input_provenance(settings: Any) -> dict[str, Any]:
     return {
         "scan_started_at": scan_started_at,
         "recorded_at": utc_now(),
+        "chanmap_input": (
+            str(settings.resolved_chanmap_path().resolve())
+            if settings.resolved_chanmap_path() is not None else ""
+        ),
         "inputs": values,
     }
 
@@ -406,21 +414,26 @@ def create_run(
         prepare_session_sorter_config(settings)
         sorter_source = _resolve_sorter_config_source(settings)
         sorter_source_bytes = sorter_source.read_bytes() if sorter_source is not None else None
+        chanmap_source_bytes = (
+            resolved_chanmap.read_bytes()
+            if resolved_chanmap is not None and resolved_chanmap.is_file() else None
+        )
     except BaseException:
         abandon_session_claim(claim_path=claim_path, run_id=run_id)
         raise
     sorter_snapshot = run_dir / "snapshots" / (
         sorter_source.name if sorter_source is not None else "sorter-config.yaml"
     )
+    chanmap_snapshot = run_dir / "snapshots" / "chanMap.input.mat" if chanmap_source_bytes is not None else None
     from src.preprocess.gui.config_model import REPO_ROOT
 
     artifact_sha256 = {"xml": _file_sha256(settings.resolved_xml_path())}
+    if chanmap_source_bytes is not None:
+        artifact_sha256["chanmap"] = hashlib.sha256(chanmap_source_bytes).hexdigest()
     if sorter_source_bytes is not None:
         artifact_sha256["sorter_config"] = hashlib.sha256(sorter_source_bytes).hexdigest()
     if mode == "postprocess":
-        chanmap_sha256 = _file_sha256(settings.postprocess_chanmap_path())
-        if chanmap_sha256:
-            artifact_sha256["chanmap"] = chanmap_sha256
+        # The captured bytes, not a second live read, identify the frozen map.
         artifact_sha256["postprocess_sorting_input"] = _sorting_input_identity(
             settings.postprocess_sorting_folder()
         )
@@ -429,7 +442,9 @@ def create_run(
             artifact_sha256["postprocess_dat_input"] = dat_identity
     artifact_sha256 = {key: value for key, value in artifact_sha256.items() if value}
     analysis = AnalysisConfig.create(
-        _analysis_settings_snapshot(settings, sorter_snapshot_path=sorter_snapshot),
+        _analysis_settings_snapshot(
+            settings, sorter_snapshot_path=sorter_snapshot, chanmap_snapshot_path=chanmap_snapshot,
+        ),
         artifact_sha256=artifact_sha256,
     )
     enabled = enabled_stages_for(settings, mode)
@@ -451,6 +466,7 @@ def create_run(
         "session_claim_path": str(claim_path),
         "previous_run_dir": str(claim.get("previous_run_dir") or ""),
         "previous_run_dirs": list(claim.get("previous_run_dirs") or []),
+        "chanmap_source_path": str(resolved_chanmap.resolve()) if chanmap_source_bytes is not None else "",
     }
     store = RunStore(run_dir)
     try:
@@ -458,6 +474,8 @@ def create_run(
         if sorter_source_bytes is not None:
             sorter_snapshot.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_bytes(sorter_snapshot, sorter_source_bytes)
+        if chanmap_snapshot is not None:
+            atomic_write_bytes(chanmap_snapshot, chanmap_source_bytes)
 
         atomic_write_json(run_dir / "snapshots" / "git.json", _git_provenance(REPO_ROOT))
         atomic_write_json(run_dir / "snapshots" / "environment.json", _environment_provenance())

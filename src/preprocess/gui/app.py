@@ -3212,6 +3212,10 @@ class MainWindow(QMainWindow):
         self.reject_channels.textChanged.connect(self._mark_reject_channels_dirty)
         self.chanmap_path = QLineEdit()
         self.chanmap_path.setPlaceholderText("optional explicit chanMap.mat path")
+        self.chanmap_path.setToolTip(
+            "A loaded map supplies the physical coordinates unchanged. "
+            "Editing probe templates clears the selected map; editing bad channels retains it."
+        )
         load_chanmap = QPushButton("Load chanMap")
         load_chanmap.clicked.connect(self._browse_chanmap)
         chanmap_buttons = QHBoxLayout()
@@ -3220,6 +3224,9 @@ class MainWindow(QMainWindow):
         session_form.addRow("bad channels", self.reject_channels)
         session_form.addRow(QLabel("probe assignments"))
         session_form.addRow(self._build_probe_assignment_editor())
+        map_hint = QLabel("Loaded map coordinates are preserved. Edit probe templates to request new geometry.")
+        map_hint.setWordWrap(True)
+        session_form.addRow(map_hint)
         session_form.addRow(chanmap_buttons)
 
         inputs = QGroupBox("Inputs")
@@ -4166,6 +4173,10 @@ class MainWindow(QMainWindow):
         if include_explicit and explicit is not None:
             candidates.append(explicit)
 
+        source = settings.preprocess_source_path
+        if source is not None:
+            candidates.append(source / "chanMap.mat")
+
         output_dir = settings.local_output_dir
         if output_dir is not None:
             candidates.append(output_dir / "chanMap.mat")
@@ -4298,7 +4309,8 @@ class MainWindow(QMainWindow):
             return Path(settings.chanmap_path).expanduser()
         if self.tabs.currentIndex() == 0 and self.ephys_tabs.currentIndex() == 1:
             return settings.postprocess_chanmap_path()
-        return None
+        resolved = settings.resolved_chanmap_path()
+        return resolved if resolved is not None and resolved.is_file() else None
 
     def _current_chanmap_data(self, settings: PipelineGuiSettings | None = None) -> dict[str, Any] | None:
         settings = settings or self._collect_settings()
@@ -6838,6 +6850,16 @@ class MainWindow(QMainWindow):
         prefix = {"ok": "[OK]", "warn": "[WARN]", "error": "[ERROR]"}
         return [f"{prefix.get(c.status, '[?]')} {c.label}: {c.detail}" for c in checks]
 
+    def _prepare_chanmap_with_claim(self, **kwargs):
+        from src.execution.session import acquire_manual_session_claim, release_manual_session_claim
+
+        directory = Path(kwargs["local_output_dir"])
+        token = acquire_manual_session_claim(session_dir=directory, owner="channel map preparation")
+        try:
+            return prepare_chanmap(**kwargs)
+        finally:
+            release_manual_session_claim(session_dir=directory, token=token)
+
     def _generate_chanmap(self) -> None:
         try:
             settings = self._collect_settings()
@@ -6870,7 +6892,7 @@ class MainWindow(QMainWindow):
                 local_root=settings.local_root_path,
                 manual_xml_path=xml_path,
             )
-            chanmap_path, bad_channels = prepare_chanmap(
+            chanmap_path, bad_channels = self._prepare_chanmap_with_claim(
                 basepath=basepath,
                 basename=basename,
                 local_output_dir=local_output_dir,
@@ -6906,13 +6928,20 @@ class MainWindow(QMainWindow):
         local_output_dir = settings.local_output_dir
         if basepath is None or local_output_dir is None:
             raise ValueError("Cannot resolve raw source and processed-session output paths")
-        chanmap_path, bad_channels = prepare_chanmap(
+        selected_map = settings.resolved_chanmap_path()
+        if selected_map is not None and not selected_map.is_file():
+            if settings.chanmap_path.strip():
+                raise FileNotFoundError(f"Selected chanMap does not exist: {selected_map}")
+            selected_map = None
+        chanmap_path, bad_channels = self._prepare_chanmap_with_claim(
             basepath=basepath,
             basename=basename,
             local_output_dir=local_output_dir,
             probe_assignments=settings.preprocess.probe_assignments,
             reject_channels=settings.preprocess.reject_channels,
             xml_path=xml_path,
+            source_chanmap_path=selected_map,
+            overwrite=settings.preprocess.overwrite,
         )
         settings.chanmap_path = str(chanmap_path)
         settings.preprocess.reject_channels = list(bad_channels)

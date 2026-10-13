@@ -77,6 +77,7 @@ def _verify_analysis_artifacts(store: RunStore, stage: StageName) -> None:
     if stage in (StageName.PREPROCESS, StageName.POSTPROCESS):
         _verify_file("xml", settings.resolved_xml_path())
     if stage in (StageName.PREPROCESS, StageName.SORTING):
+        _verify_file("chanmap", settings.resolved_chanmap_path())
         preprocess = analysis.settings.get("preprocess", {})
         path_text = str(preprocess.get("sorter_config_path", "")).strip()
         _verify_file("sorter_config", Path(path_text) if path_text else None)
@@ -148,6 +149,29 @@ def _load_upstream_result(store: RunStore, spec: AttemptSpec, stage: StageName) 
         raise RuntimeError(
             f"Required {stage.value} attempt-{attempt:03d} has no validated completed StageResult"
         )
+    if stage == StageName.PREPROCESS:
+        from .session import PRODUCER_SCHEMAS
+        from scipy.io import loadmat
+        from src.preprocess.channel_layout import channel_map_geometry_sha256
+
+        outputs = result.get("outputs") or {}
+        inventory = outputs.get("output_inventory") or (result.get("validation") or {}).get("output_inventory") or {}
+        producer = result.get("producer_schema") or inventory.get("producer_schema")
+        allowed = {PRODUCER_SCHEMAS[stage.value], "preprocess-output-validated-legacy-resume-v1"}
+        metadata = inventory.get("metadata") or {}
+        expected = metadata.get("channel_layout_geometry_sha256")
+        path = Path(outputs.get("chanmap_path") or "")
+        if producer not in allowed or not expected or not path.is_file():
+            raise RuntimeError(
+                "Preprocessing has no verified physical channel-map contract. "
+                "Older runs may have regenerated incorrect geometry. Regenerate preprocessing "
+                "in a new output folder before sorting or postprocessing."
+            )
+        if channel_map_geometry_sha256(loadmat(path)) != expected:
+            raise RuntimeError("Preprocessing channel-map geometry changed after the recording was produced; regenerate preprocessing")
+        expected_file = metadata.get("channel_layout_sha256")
+        if expected_file and hashlib.sha256(path.read_bytes()).hexdigest() != expected_file:
+            raise RuntimeError("Preprocessing channel-map metadata changed after the recording was produced; regenerate preprocessing")
     return result
 
 
@@ -215,6 +239,16 @@ def _run_preprocess(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
 
     settings = _settings_for_run(store)
     from .session import prepare_preprocess_output_contract
+
+    selected_map = settings.resolved_chanmap_path()
+    if selected_map is not None and not selected_map.is_file() and settings.chanmap_path.strip():
+        raise FileNotFoundError(f"Selected chanMap does not exist: {selected_map}")
+    if selected_map is not None and selected_map.is_file():
+        from scipy.io import loadmat
+        from src.preprocess.channel_layout import channel_map_geometry
+
+        # Validate before overwrite can archive any existing scientific output.
+        channel_map_geometry(loadmat(selected_map))
 
     # This must happen before runtime preparation or pipeline execution can
     # reuse/create a single canonical scientific output.
@@ -288,6 +322,9 @@ def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
 
     map_path = Path(preprocess_fact["outputs"].get("chanmap_path") or
                     config.chanmap_mat_path or Path(preprocess_result.local_output_dir) / "chanMap.mat")
+    # The verified output map may intentionally remap acquisition-board IDs
+    # into the final Open Ephys binary columns.
+    config.chanmap_mat_path = map_path
     active = set(range(preprocess_result.n_channels))
     if map_path.exists():
         layout = load_channel_layout(map_path, preprocess_result.n_channels)

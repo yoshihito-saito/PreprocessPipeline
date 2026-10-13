@@ -43,7 +43,7 @@ _POST_REQUIRED = (
 # has an explicit way to do so.
 OUTPUT_INVENTORY_SCHEMA = "execution-output-inventory-v1"
 PRODUCER_SCHEMAS = {
-    StageName.PREPROCESS.value: "preprocess-output-v2",
+    StageName.PREPROCESS.value: "preprocess-output-v3",
     StageName.SORTING.value: "sorting-output-v1",
     StageName.POSTPROCESS.value: "postprocess-output-v1",
 }
@@ -83,6 +83,7 @@ def stage_fingerprints(analysis: Any) -> dict[str, str]:
         "multi_day_selected_subepoch_paths", []
     )
     preprocess_payload["xml_sha256"] = artifacts.get("xml", "")
+    preprocess_payload["chanmap_sha256"] = artifacts.get("chanmap", "")
     sorting_payload = {
         key: preprocess.get(key)
         for key in sorted(sorting_keys)
@@ -192,11 +193,22 @@ def _input_snapshots_compatible(
             and left.get("sha256") and left.get("sha256") == right.get("sha256")
         )
 
+    geometry_inputs = {
+        str(snapshot.get("chanmap_input") or "")
+        for snapshot in (prior_snapshot, current_snapshot)
+    }
+    selected_map = settings.resolved_chanmap_path()
+    if selected_map is not None:
+        geometry_inputs.add(str(selected_map.resolve()))
+
     def relevant_entries(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        # Map identity is bound by the Stage fingerprint and immutable map
+        # snapshot. Moving that snapshot does not change acquisition samples.
         return {
             str(item.get("path")): item
             for item in snapshot.get("inputs", [])
-            if not unused_multiday_xml(str(item.get("path"))) and any(
+            if str(item.get("path")) not in geometry_inputs
+            and not unused_multiday_xml(str(item.get("path"))) and any(
                 str(item.get("path")) == root
                 or str(item.get("path")).startswith(root + os.sep)
                 for root in relevant_roots
@@ -219,6 +231,7 @@ def _input_snapshots_compatible(
     # immediately before trusting it so an input added, removed, or changed
     # while the Run waited for its worker cannot authorize stale output reuse.
     live_snapshot = _input_provenance(settings)
+    geometry_inputs.add(str(live_snapshot.get("chanmap_input") or ""))
     stored_current = relevant_entries(current_snapshot)
     live_current = relevant_entries(live_snapshot)
     if not stored_current or stored_current.keys() != live_current.keys():
@@ -504,8 +517,13 @@ def preprocess_output_inventory(result: Any, config: Any) -> dict[str, Any]:
             add(path, f"state_score_{index:03d}")
     chanmap_path = output_dir / "chanMap.mat"
     layout_sha256 = ""
+    geometry_sha256 = ""
     if chanmap_path.is_file():
         layout_sha256 = hashlib.sha256(chanmap_path.read_bytes()).hexdigest()
+        from scipy.io import loadmat
+        from src.preprocess.channel_layout import channel_map_geometry_sha256
+
+        geometry_sha256 = channel_map_geometry_sha256(loadmat(chanmap_path))
     return {
         "schema": OUTPUT_INVENTORY_SCHEMA,
         "producer_schema": PRODUCER_SCHEMAS[StageName.PREPROCESS.value],
@@ -517,6 +535,7 @@ def preprocess_output_inventory(result: Any, config: Any) -> dict[str, Any]:
             # it must still consist of complete channel frames.
             "lfp_n_channels": int(result.n_channels),
             "channel_layout_sha256": layout_sha256,
+            "channel_layout_geometry_sha256": geometry_sha256,
         },
         "entries": entries,
     }
@@ -774,6 +793,48 @@ def cleanup_preprocess_binary_partials(
 _PREPROCESS_CONTRACT_NAME = ".preprocess-output-contract.json"
 
 
+def assert_preprocess_geometry(settings: Any, session_dir: Path) -> None:
+    """Require legacy reuse to agree with the authoritative physical layout."""
+    from scipy.io import loadmat
+    from src.preprocess.channel_layout import assert_channel_map_geometry
+    from src.preprocess.io import build_channel_map_data
+
+    selected = settings.resolved_chanmap_path()
+    if selected is not None and selected.is_file():
+        expected = loadmat(selected)
+    elif settings.chanmap_path.strip():
+        raise FileNotFoundError(f"Selected chanMap does not exist: {selected}")
+    else:
+        from src.preprocess.wildx_np import has_wildx_np_marker, session_recordings, channel_map_data
+
+        basepath = settings.preprocess_source_path or settings.basepath_path
+        if basepath is not None and has_wildx_np_marker(basepath):
+            from src.preprocess.io import discover_subsessions
+
+            config = settings.to_preprocess_config()
+            recordings = session_recordings(discover_subsessions(
+                basepath, sort_files=config.sort_files, alt_sort=config.alt_sort,
+                ignore_folders=config.ignore_folders, subsession_order=config.subsession_order,
+            ))
+            expected = channel_map_data(
+                recordings[0], settings.preprocess.reject_channels,
+                probe_assignments=settings.preprocess.probe_assignments,
+            ) if recordings else None
+        else:
+            expected = build_channel_map_data(
+                basepath=basepath,
+                basename=settings.basename,
+                xml_path=settings.resolved_xml_path(),
+                probe_assignments=settings.preprocess.probe_assignments,
+            )
+    if expected is None:
+        raise ValueError("Cannot verify the physical geometry of existing preprocessing outputs")
+    assert_channel_map_geometry(
+        expected, loadmat(Path(session_dir) / "chanMap.mat"),
+        context="Existing preprocessing outputs",
+    )
+
+
 def _preprocess_contract_identity(store: RunStore, session_dir: Path) -> dict[str, str]:
     try:
         inputs = read_json(store.run_dir / "snapshots" / "inputs.json")
@@ -927,6 +988,7 @@ def prepare_preprocess_output_contract(
         atomic_write_json(contract_path, migrated_identity)
         return contract_path
     if existing is None and existing_outputs and _trusted_preprocess_evidence(store, settings, identity):
+        assert_preprocess_geometry(settings, session_dir)
         legacy_identity = dict(identity)
         legacy_identity["producer_schema"] = "legacy-preprocess-v1"
         atomic_write_json(contract_path, legacy_identity)
@@ -986,6 +1048,11 @@ def _claim_blocks_new_run(claim: dict[str, Any]) -> bool:
             pid = int(claim.get("owner_pid") or 0)
             if pid <= 0:
                 return True
+            if os.name == "nt":
+                from .backends.local import _process_exists
+
+                # Signal 0 sends CTRL_C_EVENT on Windows; query identity instead.
+                return _process_exists(pid)
             os.kill(pid, 0)
             return True
         except ProcessLookupError:
@@ -1445,6 +1512,21 @@ def _write_adopted_result(
             path = Path(entry["path"])
             if path.name in metadata_names:
                 entry["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if stage == StageName.PREPROCESS:
+        from scipy.io import loadmat
+        from src.preprocess.channel_layout import channel_map_geometry_sha256
+
+        previous_inventory = outputs.get("output_inventory") or {}
+        previous_metadata = previous_inventory.get("metadata") or {}
+        map_path = Path(outputs.get("chanmap_path") or session_output_dir(settings_for_store(store)) / "chanMap.mat")
+        if not previous_metadata.get("channel_layout_geometry_sha256"):
+            assert_preprocess_geometry(settings_for_store(store), map_path.parent)
+        inventory["metadata"] = {
+            **previous_metadata,
+            "channel_layout_geometry_sha256": channel_map_geometry_sha256(loadmat(map_path)),
+            "channel_layout_sha256": hashlib.sha256(map_path.read_bytes()).hexdigest(),
+        }
+        outputs["chanmap_path"] = str(map_path.resolve())
     outputs["output_inventory"] = inventory
     store.write_attempt_fact(
         stage,

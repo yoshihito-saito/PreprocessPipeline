@@ -46,3 +46,24 @@ Confirmed HEAD, local main and GitHub main are all `83ebca0`; no main merge or c
 - Reviewed the backend input/output contract and the added dependency documentation. The runtime must contain TeraSort PR #1 (or a later version with it). TeraSort source/environment are configured separately and are not vendored by this change.
 - Reused the earlier source/diff review and AST-only check. No additional checks, new tests, dependency installation, GPU/CPU sorting, GUI runs or scientific validation were performed during publication.
 - Runtime/quality and interrupted-resume checks remain open. Ready for code review records the review stage; the implementation has not been demonstrated on a large session.
+## Branch execution before integration
+Goal: execute TeraSort from PP PR #39 before considering main integration. The PR is now Draft and its body records this gate. TeraSort PR #1 remains a separate backend dependency.
+
+1. Reuse the existing WILDX NP 600-second preprocessed AP recording, its XML/chanMap and recorded gain, preserving all earlier outputs and the source data.
+2. Create a fresh execution directory and run-local YAML with nt=41; retain the selected scientific profile and independent physical-probe partitions.
+3. Call this branch's `run_sorting_stage` with the published TeraSort PR source and the existing isolated runtime, then collect process completion and required Phy output metadata.
+4. Record the actual result, failures or fixes and remaining scope. Keep PR #39 unmerged; this execution is not a scientific-quality or full-session validation.
+
+Input: 12,000,000 samples, 20,000 Hz, 768 original binary columns, nominal 2.34375 uV/count, previously excluded columns 191 and 575. Original filtering/reference are already applied. Output: `D:/PreprocessPipeline/diagnostics/terasort_nt41_20261012_pr39/`.
+Runtime budget: the local GPU is an RTX 3080 Ti with 12 GiB. The run-local config sets `vram_limit_gb: 8` to leave allocation headroom; this caps the CuPy pool, not all GPU allocations. nt=41 and all other selected scientific settings are retained. No re-preprocessing, dataset expansion, benchmarks, simulations, ground-truth evaluation or automatic main merge are part of this run.
+## Main refresh after execution cancellation
+- The user cancelled execution. Interrupted the foreground process (exit code 1) and confirmed no Python processes carrying this run's unique output marker remained. Probe1 seed learning had completed at nt41; no completed sorting/Phy validation result was reported. Partial files stay in the fresh execution directory; no further run is requested.
+- Updated origin/main is `c17fbc6`, including PR #37's supplied-channel-map preservation and manual-session ownership fixes.
+
+1. Merge the updated main into `codex/terasort-backend` without rewriting branch history.
+2. Resolve overlapping integration changes while preserving main's supplied physical channel maps, source-column IDs and ownership behavior, together with the bounded TeraSort route/config.
+3. Inspect the scoped merge diff and publish the branch update. Keep PR #39 Draft and perform no further sorting, GPU execution or checks.
+## Main refresh handoff
+- Merged main `c17fbc6` without conflicts. Reviewed the overlapping sorting-stage/worker/GUI changes and the channel-layout caller contract. Main's verified physical-map selection, geometry/hash checks and manual-session ownership remain intact; the bounded TeraSort route, nt41 config and original-column manifest/export contract remain present.
+- The user-cancelled run is not a successful execution result. No sorting, GPU execution, tests or lightweight checks were run after cancellation; the merge was reviewed in source/diff only. The partial new execution directory is retained and is not published as code or validation evidence of completion.
+- PR #39 stays Draft and unmerged. Its execution gate remains for a future user-requested run; current work is limited to updating and publishing the integration branch.

@@ -903,6 +903,16 @@ def _resolve_effective_chanmap_for_postprocess(
         path = Path(chanmap_mat_path)
         if not path.is_file():
             raise FileNotFoundError(f"Selected chanMap does not exist: {path}")
+        if dat_path is not None:
+            associated = Path(dat_path).parent / _CANONICAL_CHANMAP_NAME
+            contract = associated.parent / ".preprocess-output-contract.json"
+            if contract.is_file() and associated.is_file() and associated.resolve() != path.resolve():
+                from scipy.io import loadmat
+                from ..preprocess.channel_layout import assert_channel_map_geometry
+
+                assert_channel_map_geometry(
+                    loadmat(path), loadmat(associated), context="Postprocessing input recording",
+                )
         return path
     candidates: list[Path] = []
     if local_output_dir is not None:

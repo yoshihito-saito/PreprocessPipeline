@@ -33,6 +33,7 @@ from .metafile import (
     XmlMeta,
 )
 from .paths import find_project_root
+from .channel_layout import assert_channel_map_geometry, channel_map_geometry
 
 
 _OPENEPHYS_DATETIME_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})")
@@ -1236,6 +1237,7 @@ def save_cell_explorer_chan_coords(
     chan_map = np.asarray(chanmap_data["chanMap"]).reshape(-1).astype(int)
     xcoords = np.asarray(chanmap_data["xcoords"]).reshape(-1).astype(float)
     ycoords = np.asarray(chanmap_data["ycoords"]).reshape(-1).astype(float)
+    zcoords = np.asarray(chanmap_data["zcoords"]).reshape(-1).astype(float) if "zcoords" in chanmap_data else None
     n = min(len(chan_map), len(xcoords), len(ycoords))
     if n == 0:
         raise ValueError("Cannot write chanCoords: chanMap has no channels.")
@@ -1243,11 +1245,16 @@ def save_cell_explorer_chan_coords(
     n_channels = int(np.nanmax(chan_map[:n]))
     x = np.full((n_channels, 1), np.nan, dtype=float)
     y = np.full((n_channels, 1), np.nan, dtype=float)
+    z = np.full((n_channels, 1), np.nan, dtype=float) if zcoords is not None else None
     for channel_1based, x_value, y_value in zip(chan_map[:n], xcoords[:n], ycoords[:n]):
         channel = int(channel_1based)
         if 1 <= channel <= n_channels:
             x[channel - 1, 0] = float(x_value)
             y[channel - 1, 0] = float(y_value)
+    if z is not None:
+        if len(zcoords) != n:
+            raise ValueError("chanMap zcoords length must match channel IDs")
+        z[chan_map[:n] - 1, 0] = zcoords[:n]
 
     chan_coords = {
         "x": x,
@@ -1257,11 +1264,15 @@ def save_cell_explorer_chan_coords(
         "shankSpacing": np.asarray([[np.nan]], dtype=float),
         "verticalSpacing": np.asarray([[np.nan]], dtype=float),
     }
+    if z is not None:
+        chan_coords["z"] = z
     output_path = Path(output_dir) / f"{basename}.chanCoords.channelInfo.mat"
     if output_path.exists() and not overwrite:
         existing = validate_mat_output(output_path, "chanCoords")["chanCoords"]
         try:
             compatible = _nan_equal(np.asarray(existing["x"]), x) and _nan_equal(np.asarray(existing["y"]), y)
+            if z is not None:
+                compatible = compatible and "z" in existing and _nan_equal(np.asarray(existing["z"]), z)
         except Exception as exc:
             raise ValueError(f"Invalid existing chanCoords output: {output_path}") from exc
         if not compatible:
@@ -1290,16 +1301,51 @@ def prepare_chanmap(
     reject_channels: list[int] | None = None,
     xml_path: Path | None = None,
     overwrite: bool = True,
+    source_chanmap_path: Path | None = None,
 ) -> tuple[Path, list[int]]:
-    chanmap_path = create_channel_map(
-        basepath=basepath,
-        basename=basename,
-        outputDir=local_output_dir,
-        probe_assignments=probe_assignments,
-        reject_channels=reject_channels or [],
-        xml_path=xml_path,
-        overwrite=overwrite,
-    )
+    if source_chanmap_path is not None:
+        source_chanmap_path = Path(source_chanmap_path).expanduser()
+        # Load the complete payload: custom coordinates, wiring, face/shank
+        # identities and extra probe metadata are authoritative, not templates.
+        chan = {key: value for key, value in loadmat(source_chanmap_path).items() if not key.startswith("__")}
+        channel_map_geometry(chan)
+        raw_ids = chan["chanMap0ind"] if "chanMap0ind" in chan else np.asarray(chan["chanMap"]) - 1
+        ids = np.asarray(raw_ids).reshape(-1).astype(int)
+        if "chanMap" not in chan:
+            chan["chanMap"] = (np.asarray(raw_ids) + 1)
+        connected = np.asarray(chan.get("connected", np.ones(ids.size)), dtype=float)
+        if connected.size != ids.size or not np.all(np.isfinite(connected)):
+            raise ValueError("chanMap connected mask must have one finite value per channel")
+        excluded = set(reject_channels or [])
+        selected_xml = Path(xml_path) if xml_path is not None else Path(basepath) / f"{basename}.xml"
+        if selected_xml.is_file():
+            _, spike_channels, has_spike_groups, skipped, _ = _load_xml_groups_for_chanmap(selected_xml)
+            excluded.update(skipped)
+            if has_spike_groups:
+                excluded.update(set(ids.tolist()) - set(spike_channels))
+        chan["connected"] = ((connected.reshape(-1) > 0) & ~np.isin(ids, list(excluded))).reshape(connected.shape)
+        chanmap_path = Path(local_output_dir) / "chanMap.mat"
+        if chanmap_path.exists() and not overwrite:
+            existing = loadmat(chanmap_path)
+            assert_channel_map_geometry(chan, existing, context=f"Existing preprocessing map {chanmap_path}")
+            existing_ids = np.asarray(existing["chanMap0ind"] if "chanMap0ind" in existing else np.asarray(existing["chanMap"]) - 1).reshape(-1)
+            old_mask = np.asarray(existing.get("connected", np.ones(existing_ids.size))).reshape(-1) > 0
+            order = np.argsort(ids)
+            if not np.array_equal(old_mask[np.argsort(existing_ids)], chan["connected"].reshape(-1)[order]):
+                raise ValueError(f"Existing chanMap exclusions differ from current configuration: {chanmap_path}; regenerate preprocessing")
+        else:
+            atomic_savemat(chanmap_path, chan, required_key="chanMap")
+        print(f"Preserved supplied chanMap geometry from {source_chanmap_path}")
+    else:
+        chanmap_path = create_channel_map(
+            basepath=basepath,
+            basename=basename,
+            outputDir=local_output_dir,
+            probe_assignments=probe_assignments,
+            reject_channels=reject_channels or [],
+            xml_path=xml_path,
+            overwrite=overwrite,
+        )
     if chanmap_path is None:
         raise RuntimeError("Failed to create chanMap.mat")
 

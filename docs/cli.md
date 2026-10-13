@@ -315,6 +315,35 @@ Subset sorting keeps exported Phy channel metadata in the full binary's original
 channel numbering. An empty set of eligible active channels is reported as
 `no_active_channels` and sorting is skipped.
 
+## Physical channel maps and existing recordings
+
+A selected `chanMap.mat` supplies the physical geometry for preprocessing,
+sorting, and postprocessing. Its channel IDs, x/y/z coordinates, shank and probe
+IDs, face IDs, and custom metadata are preserved. GUI and XML exclusions only
+disable entries in `connected`; loading a map does not rebuild its geometry from
+the probe-template controls.
+
+Without a selected map, preprocessing first uses the raw session's map. Explicit
+probe-template assignments with an empty map path request generation; the GUI's
+Generate chanMap action also requests generation. Editing geometry clears the
+selected map, while editing bad channels retains it. Preview and local-CMR
+preflight use the same map that the worker will use.
+
+Persistent Runs save an immutable copy at `snapshots/chanMap.input.mat` and
+include its checksum in preprocessing fingerprints. New preprocessing results
+record the geometry used to produce the recording. Sorting and postprocessing
+refuse an older result without that evidence or a map changed after preprocessing.
+
+Runs made before this fix may have replaced a custom map with default geometry.
+If a processed map differs from its selected source, changing only `chanMap.mat`
+cannot repair local CMR or artifact detection that already used the wrong
+geometry. Use a new local output root and rerun from raw data with the original
+map selected. Alternatively, explicit overwrite archives the old preprocessing
+products before producing replacements; existing sorter folders are retained.
+
+The pipeline rejects incompatible cached maps when overwrite is disabled. It
+does not silently repair a map and reuse the associated processed recording.
+
 ## Behavior and CellExplorer
 
 The ephys CLI and persistent Stage list do not export tracking behavior or launch

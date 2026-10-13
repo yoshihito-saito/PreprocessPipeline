@@ -314,7 +314,8 @@ class PreprocessGuiSettings:
     highamp_mode: str = "linear"
     highamp_merge_intervals: bool = False
     reject_channels: list[int] = field(default_factory=list)
-    # Empty means derive geometry and all groups from the selected XML.
+    # With no selected map, explicit assignments request template generation;
+    # empty assignments use an existing source map or derive from XML.
     probe_assignments: list[dict[str, Any]] = field(default_factory=list)
     run_sorter: bool = True
     sorter: str | None = "Kilosort"
@@ -581,21 +582,19 @@ class PipelineGuiSettings:
         explicit = _path_or_none(self.chanmap_path)
         if explicit is not None:
             return explicit
+        if self.preprocess.probe_assignments:
+            # Geometry edits clear the selected map and request generation.
+            return None
         output_dir = self.local_output_dir
-        basepath = self.basepath_path
+        basepath = self.preprocess_source_path or self.basepath_path
         if output_dir is None:
             return (basepath / "chanMap.mat") if basepath is not None else None
-
-        local_chanmap = output_dir / "chanMap.mat"
-        if local_chanmap.exists():
-            return local_chanmap
 
         if basepath is not None:
             basepath_chanmap = basepath / "chanMap.mat"
             if basepath_chanmap.exists():
                 return basepath_chanmap
-
-        return local_chanmap
+        return output_dir / "chanMap.mat"
 
     def resolved_xml_path(self) -> Path | None:
         explicit = _path_or_none(self.xml_path)
@@ -1111,7 +1110,7 @@ def _legacy_session_resume(session_dir: Path) -> LocalSessionResume | None:
     settings.behavior.overwrite = False
     for attribute, name in (("xml_path", f"{settings.basename}.xml"), ("chanmap_path", "chanMap.mat")):
         local_path = session_dir / name
-        if local_path.is_file():
+        if local_path.is_file() and (attribute != "chanmap_path" or not settings.chanmap_path.strip()):
             setattr(settings, attribute, str(local_path))
     return LocalSessionResume(settings, None, metadata_source)
 

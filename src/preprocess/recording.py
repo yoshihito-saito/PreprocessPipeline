@@ -98,20 +98,18 @@ def _build_chanmap_group_properties(chanmap_mat_path: Path, channel_ids: list[in
 
 
 def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path, *, original_num_channels: int | None = None) -> Any:
-    from .channel_layout import load_channel_layout
+    from .channel_layout import channel_map_geometry, load_channel_layout
     original_ids = [int(ch) for ch in recording.get_channel_ids()]
     if original_num_channels is None and hasattr(recording, "get_annotation"):
         original_num_channels = recording.get_annotation("binary_num_channels")
     bound = original_num_channels or (max(original_ids) + 1 if original_ids else 0)
     mat = load_channel_layout(chanmap_mat_path, int(bound))
-    required = {"xcoords", "ycoords", "kcoords", "chanMap"}
-    if not required.issubset(set(mat.keys())):
-        return recording
+    channel_map_geometry(mat)
 
     try:
         from probeinterface import Probe, ProbeGroup
-    except Exception:
-        return recording
+    except ImportError as exc:
+        raise RuntimeError("ProbeInterface is required to retain the selected chanMap geometry") from exc
 
     x = np.asarray(mat["xcoords"]).flatten()
     y = np.asarray(mat["ycoords"]).flatten()
@@ -158,13 +156,7 @@ def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path, *, origina
     n_recording_channels = int(recording.get_num_channels())
     valid_mask = np.isin(device_ch_inds, original_ids)
     if not np.any(valid_mask):
-        warnings.warn(
-            "chanMap has no valid device_channel_indices for this recording; "
-            "skipping probe attachment.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return recording
+        raise ValueError(f"Selected chanMap has no contacts for this recording: {chanmap_mat_path}")
 
     x = x[valid_mask]
     y = y[valid_mask]
@@ -179,7 +171,7 @@ def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path, *, origina
     # exports that cannot display a 3-D probe.
     use_3d = has_z and bool(np.any(z != 0))
     probegroup = ProbeGroup()
-    unique_probes = [p for p in np.unique(probe_ids) if p > 0]
+    unique_probes = np.unique(probe_ids)
     for p_id in unique_probes:
         mask = probe_ids == p_id
         if not np.any(mask):
@@ -201,30 +193,22 @@ def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path, *, origina
         probegroup.add_probe(probe)
 
     if len(probegroup.probes) == 0:
-        return recording
+        raise ValueError(f"Selected chanMap has no assigned probes: {chanmap_mat_path}")
 
     if hasattr(recording, "set_probegroup"):
         try:
             recording = recording.set_probegroup(probegroup, group_mode="by_probe")
         except Exception as exc:
-            warnings.warn(
-                f"Failed to attach probe from chanMap ({chanmap_mat_path}): {exc}. "
-                "Continuing without probe geometry.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return recording
+            raise ValueError(f"Cannot retain selected chanMap geometry ({chanmap_mat_path}): {exc}") from exc
     elif hasattr(recording, "set_probe"):
+        if len(probegroup.probes) > 1:
+            raise ValueError("Recording cannot retain the selected map's multiple probes")
         try:
             recording = recording.set_probe(probegroup.probes[0])
         except Exception as exc:
-            warnings.warn(
-                f"Failed to attach probe from chanMap ({chanmap_mat_path}): {exc}. "
-                "Continuing without probe geometry.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return recording
+            raise ValueError(f"Cannot retain selected chanMap geometry ({chanmap_mat_path}): {exc}") from exc
+    else:
+        raise ValueError("Recording cannot attach the selected chanMap geometry")
 
     if has_z:
         z_by_channel = {int(ch): float(depth) for ch, depth in zip(valid_device_ids, z, strict=True)}

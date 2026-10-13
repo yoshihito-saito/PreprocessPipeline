@@ -6,7 +6,7 @@ from typing import Any
 import warnings
 
 import numpy as np
-from scipy.io import savemat
+from scipy.io import loadmat, savemat
 from .io import atomic_savemat, validate_mat_output
 
 from .metafile import MergePointsData, SessionXmlMeta
@@ -317,7 +317,14 @@ def build_session_struct(
     chan_coords_from_kilosort, kilosort_group_count = _extract_kilosort_metadata(source_basepath, n_channels)
     if chan_coords_from_kilosort is not None:
         chan_coords = chan_coords_from_kilosort
-    if kilosort_group_count is not None and kilosort_group_count < len(spike_groups_0based) and spike_groups.shape[1] > 0:
+    physical_coords_path = local_basepath / f"{basename}.chanCoords.channelInfo.mat"
+    if physical_coords_path.is_file():
+        # The processed recording's physical layout takes precedence over
+        # older sorter projections and the generic session-layout default.
+        physical_coords = loadmat(physical_coords_path, simplify_cells=True)["chanCoords"]
+        chan_coords = dict(physical_coords)
+    if (not physical_coords_path.is_file() and kilosort_group_count is not None
+            and kilosort_group_count < len(spike_groups_0based) and spike_groups.shape[1] > 0):
         kilosort_setdiff_channels = np.asarray(spike_groups[0, -1], dtype=chan_dtype).reshape(1, -1)
         bad_channels = _channels_union(
             channels_1based=[int(ch) for ch in bad_channels.reshape(-1)],

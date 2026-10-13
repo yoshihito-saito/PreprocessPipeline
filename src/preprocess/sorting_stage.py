@@ -37,9 +37,21 @@ def _resolved_xml_path(config: PreprocessConfig, result: PreprocessResult) -> Pa
 
 
 def _resolved_chanmap_path(config: PreprocessConfig, result: PreprocessResult) -> Path | None:
+    selected = Path(config.chanmap_mat_path) if config.chanmap_mat_path is not None else None
+    canonical = Path(result.local_output_dir) / "chanMap.mat"
+    if selected is not None:
+        if not selected.is_file():
+            raise FileNotFoundError(f"Selected chanMap does not exist: {selected}")
+        if canonical.is_file() and selected.resolve() != canonical.resolve():
+            from scipy.io import loadmat
+            from .channel_layout import assert_channel_map_geometry
+
+            assert_channel_map_geometry(
+                loadmat(selected), loadmat(canonical), context="Sorting input recording",
+            )
     candidates = [
-        Path(result.local_output_dir) / "chanMap.mat",
-        Path(config.chanmap_mat_path) if config.chanmap_mat_path is not None else None,
+        canonical,
+        selected,
         Path(result.basepath) / "chanMap.mat",
     ]
     for candidate in candidates:

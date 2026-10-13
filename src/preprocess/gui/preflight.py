@@ -116,10 +116,13 @@ def _local_cmr_check(settings: PipelineGuiSettings, *, apply_preprocess: bool | 
     if basepath is None:
         return None
 
-    use_existing = bool(settings.chanmap_path.strip()) or apply_preprocess is not None
+    resolved_map = settings.resolved_chanmap_path()
+    use_existing = bool(settings.chanmap_path.strip()) or apply_preprocess is not None or (
+        resolved_map is not None and resolved_map.is_file()
+    )
     try:
         if use_existing:
-            path = settings.postprocess_chanmap_path() if apply_preprocess is not None else Path(settings.chanmap_path).expanduser()
+            path = settings.postprocess_chanmap_path() if apply_preprocess is not None else resolved_map
             data = loadmat(path) if path is not None else None
         elif has_wildx_np_marker(basepath):
             recordings = session_recordings(discover_subsessions(

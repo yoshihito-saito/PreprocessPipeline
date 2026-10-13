@@ -126,7 +126,10 @@ def test_persistent_preprocessing_keeps_downstream_sorter_in_estimate(tmp_path, 
     from src.execution import session
     import src.preprocess as preprocess
     config = PreprocessConfig(tmp_path, sorter="Kilosort")
-    settings = SimpleNamespace(preprocess=SimpleNamespace(overwrite=False), to_preprocess_config=lambda: config)
+    settings = SimpleNamespace(
+        preprocess=SimpleNamespace(overwrite=False), to_preprocess_config=lambda: config,
+        resolved_chanmap_path=lambda: None, chanmap_path="",
+    )
     monkeypatch.setattr(worker, "_settings_for_run", lambda store: settings)
     monkeypatch.setattr(session, "prepare_preprocess_output_contract", lambda *a, **k: tmp_path / "contract")
     monkeypatch.setattr(runtime_prep, "prepare_preprocess_settings", lambda settings: {})

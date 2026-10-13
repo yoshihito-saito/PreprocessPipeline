@@ -57,7 +57,7 @@ jobs:
           import sys
           import tempfile
 
-          tests = [
+          pipeline_tests = [
               "tests/cli",
               "tests/setup",
               "tests/preprocess/test_intan_validation.py",
@@ -68,6 +68,10 @@ jobs:
               "tests/execution/test_input_identity.py",
               "tests/execution/test_progress.py",
               "tests/execution/test_headless_plotting.py",
+          ]
+          # GUI state must not carry into process-pool regression tests.
+          gui_tests = [
+              "tests/preprocess/test_chanmap_preservation.py",
               "tests/gui/test_gui_config_model.py::test_persistent_progress_updates_preserve_lines_across_polls",
               "tests/gui/test_gui_config_model.py::test_persistent_progress_uses_stage_rows_main_log_and_force_stop",
               "tests/gui/test_gui_move_outputs.py::test_move_rewrites_recovery_paths_and_copies_custom_destination_metadata",
@@ -78,9 +82,13 @@ jobs:
               test_root = Path(temp_dir)
               test_env = os.environ.copy()
               test_env["NUMBA_CACHE_DIR"] = str(test_root / "n")
-              result = subprocess.run(
-                  [sys.executable, "-m", "pytest", *tests, "-q", "-p", "no:cacheprovider",
-                   "--basetemp", str(test_root / "p"), "--durations=5"],
-                  env=test_env,
-              )
+              for group_name, selected_tests in (("pipeline", pipeline_tests), ("gui", gui_tests)):
+                  print(f"Running {group_name} regressions in a separate pytest process", flush=True)
+                  result = subprocess.run(
+                      [sys.executable, "-m", "pytest", *selected_tests, "-vv", "-p", "no:cacheprovider",
+                       "--basetemp", str(test_root / group_name), "--durations=5"],
+                      env=test_env,
+                  )
+                  if result.returncode:
+                      break
           sys.exit(result.returncode)

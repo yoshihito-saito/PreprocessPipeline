@@ -344,13 +344,55 @@ def _prepare_effective_chanmap_for_final_channel_space(
     output_dir: Path,
     final_num_channels: int,
     ephys_channel_indices_by_subsession: list[list[int] | None] | None,
+    overwrite: bool = True,
+    basename: str | None = None,
 ) -> tuple[Path | None, dict[int, int] | None]:
     if chanmap_mat_path is None:
         return None, None
     source_chanmap = Path(chanmap_mat_path)
-    if not source_chanmap.exists():
-        return source_chanmap, None
+    if not source_chanmap.is_file():
+        raise FileNotFoundError(f"Selected chanMap does not exist: {source_chanmap}")
     canonical_path = Path(output_dir) / "chanMap.mat"
+    # A newly staged acquisition map can still need channel-ID remapping.
+    # That adaptation is safe before any processed recording exists.
+    sidecars = {"analogin.dat", "digitalin.dat", "auxiliary.dat", "supply.dat", "time.dat"}
+    processed_recording_exists = any(
+        path.name not in sidecars and not path.name.endswith("_raw.dat")
+        for path in Path(output_dir).glob("*.dat")
+    )
+    staged_input = source_chanmap.resolve() == canonical_path.resolve() and not processed_recording_exists
+
+    def save_coordinates(payload: dict[str, object]) -> None:
+        from .io import save_cell_explorer_chan_coords
+
+        save_cell_explorer_chan_coords(
+            chanmap_data=payload, output_dir=output_dir,
+            basename=basename or Path(output_dir).name,
+            overwrite=overwrite or staged_input,
+        )
+
+    def publish(payload: dict[str, object]) -> None:
+        from .channel_layout import assert_channel_map_geometry
+        from .io import atomic_savemat
+
+        if canonical_path.is_file() and not overwrite and not staged_input:
+            existing = loadmat(canonical_path)
+            assert_channel_map_geometry(
+                payload, existing, context=f"Existing preprocessing map {canonical_path}",
+            )
+            masks = []
+            for data in (payload, existing):
+                ids = np.asarray(data["chanMap0ind"] if "chanMap0ind" in data else np.asarray(data["chanMap"]) - 1).reshape(-1)
+                mask = np.asarray(data.get("connected", np.ones(ids.size)), dtype=float).reshape(-1)
+                if mask.size != ids.size or not np.all(np.isfinite(mask)):
+                    raise ValueError("chanMap connected mask must have one finite value per channel")
+                masks.append((mask > 0)[np.argsort(ids)])
+            if not np.array_equal(*masks):
+                raise ValueError("Existing chanMap exclusions changed; regenerate preprocessing")
+            save_coordinates(payload)
+            return
+        atomic_savemat(canonical_path, payload, required_key="chanMap")
+        save_coordinates(payload)
 
     n_final = int(final_num_channels)
     selections = _ephys_channel_selections(
@@ -362,8 +404,9 @@ def _prepare_effective_chanmap_for_final_channel_space(
         if source_chanmap.resolve() != canonical_path.resolve():
             loaded = loadmat(str(source_chanmap))
             payload = {key: value for key, value in loaded.items() if not key.startswith("__")}
-            savemat(str(canonical_path), payload)
+            publish(payload)
             return canonical_path, None
+        save_coordinates(loadmat(source_chanmap))
         return source_chanmap, None
 
     loaded = loadmat(str(source_chanmap))
@@ -427,7 +470,7 @@ def _prepare_effective_chanmap_for_final_channel_space(
     remapped_payload["chanMap0ind"] = final_channels.reshape(-1, 1)
     remapped_payload["chanMap"] = final_channels.astype(np.float64).reshape(-1, 1) + 1.0
 
-    savemat(str(canonical_path), remapped_payload)
+    publish(remapped_payload)
     return canonical_path, source_to_final
 
 
@@ -910,6 +953,8 @@ def run_preprocess_session(
         output_dir=output_dir,
         final_num_channels=effective_n_channels,
         ephys_channel_indices_by_subsession=ephys_channel_indices_by_subsession,
+        overwrite=config.overwrite,
+        basename=basename,
     )
     recordings = load_subsession_recordings(
         dat_paths=catalog.amplifier_paths,
@@ -1428,7 +1473,10 @@ def run_preprocess_session(
     )
 
     if config.sorter:
-        result = run_sorting_stage(config, result, execute_job=execute_sorting_job)
+        result = run_sorting_stage(
+            replace(config, chanmap_mat_path=effective_chanmap_mat_path),
+            result, execute_job=execute_sorting_job,
+        )
 
     _step("Save manifest and return")
 
