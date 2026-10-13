@@ -259,6 +259,18 @@ Real execution uses data/output paths and can write results, submit jobs, retry
 stages or cancel active work. Define the input, destination, command and expected
 result separately before using those actions as an end-to-end test.
 
+## Recording reconstruction in process workers
+
+```bash
+python -m pytest -q tests/preprocess/test_recording_serialization.py
+```
+
+These regressions verify dictionary/pickle reconstruction of the custom 3D
+local-reference recording, retaining traces, physical coordinates and groups.
+They also run the real high-amplitude detector in two loky worker processes and
+require identical artifact triggers to serial execution. They cover the
+`src.__version__` declaration already supplied by the upstream source fix.
+
 ## MATLAB
 
 From the repository root in MATLAB:

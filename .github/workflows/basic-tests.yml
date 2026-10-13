@@ -64,6 +64,7 @@ jobs:
               "tests/preprocess/test_disk_space.py",
               "tests/preprocess/test_kilosort_partition_channels.py",
               "tests/preprocess/test_chanmap3d_postprocess.py",
+              "tests/preprocess/test_recording_serialization.py",
               "tests/preprocess/test_postprocess_cleanup.py",
               "tests/execution/test_input_identity.py",
               "tests/execution/test_progress.py",
