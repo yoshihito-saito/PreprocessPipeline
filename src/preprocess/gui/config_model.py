@@ -42,6 +42,7 @@ SORTING_OUTPUT_PATTERNS = (
     "Kilosort2_5_*",
     "Kilosort2.5_*",
     "Kilosort4_*",
+    "Terasort_*",
 )
 REPO_ROOT = find_project_root(Path(__file__))
 DEFAULT_LOCAL_WORKING_DIR = REPO_ROOT / "preprocess_tmp"

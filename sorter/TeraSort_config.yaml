@@ -1,0 +1,10 @@
+# Bounded TeraSort configuration; sampling rate/gain/geometry come from input metadata.
+# 41 samples / 20,000 Hz = 2.05 ms. TeraSort's standalone default remains 61.
+# nt must be odd and >= 21 for the existing raw-anchor holdout.
+nt: 41
+
+# Other scientific defaults retain TeraSort's selected bounded profile.
+# Optional sample-based overrides: half_width, shift_radius, overlap_window_samples.
+# Optional time overrides: halo_ms, core_seconds, shard_seconds.
+# Optional runtime overrides: read_buffer_mb, prefetch_depth, vram_limit_gb.
+# The default strict overlap window follows nt; other sample-based defaults stay unchanged.

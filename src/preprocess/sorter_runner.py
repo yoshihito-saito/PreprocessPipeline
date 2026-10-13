@@ -59,6 +59,7 @@ _SORTER_ALIASES = {
     "kilosort2_5": "kilosort2_5",
     "kilosort25": "kilosort2_5",
     "kilosort4": "kilosort4",
+    "terasort": "terasort",
 }
 
 _INSTALLED_SORTERS = tuple(_SORTER_ALIASES.keys())
@@ -233,6 +234,8 @@ def _default_sorter_config_path(sorter: str) -> Path:
         return _repo_root() / "sorter" / "Kilosort2.5_config.yaml"
     if s == "kilosort4":
         return _repo_root() / "sorter" / "Kilosort4_config.yaml"
+    if s == "terasort":
+        return _repo_root() / "sorter" / "TeraSort_config.yaml"
     raise ValueError(f"Unsupported sorter: {sorter}")
 
 
@@ -1821,6 +1824,8 @@ def execute_sorting_job(
     local_radius_um: tuple[float, float] = (50.0, 200.0),
     sorter_verbose: bool = False,
     cleanup_temp_wh: bool = True,
+    terasort_path: Path | None = None,
+    terasort_resume: bool = False,
 ) -> Path:
     sorter_input = sorter.lower()
     if sorter_input not in _SORTER_ALIASES:
@@ -1849,6 +1854,21 @@ def execute_sorting_job(
             Path(output_folder), sorting_space_components(Path(dat_path).stat().st_size),
             stage="Sorting",
         )
+    if sorter_input == "terasort":
+        from .terasort_runner import execute_terasort_job
+        cfg_path = (config_path or _default_sorter_config_path(sorter_input)).resolve()
+        params = _load_params(cfg_path)
+        result = execute_terasort_job(
+            dat_path=Path(dat_path), chanmap_path=chanmap_mat_path,
+            output_folder=Path(output_folder), terasort_path=terasort_path,
+            sampling_frequency=sr, num_channels=nch,
+            gain_to_uV=gain_to_uV, offset_to_uV=offset_to_uV, dtype=dtype,
+            active_channels_0based=resolved_active_channels_0based,
+            input_is_preprocessed=input_is_preprocessed, params=params,
+            resume=terasort_resume)
+        _save_sorter_config_snapshot(output_folder=result, source_config_path=cfg_path, resolved_params=params)
+        _write_phy_shanks_from_chanmap(result, chanmap_mat_path, nch)
+        return result
     matlab_cmd: str | None = None
     ks4_auto_geom_enabled = False
     ks4_auto_geom_options: dict[str, Any] = {}
@@ -2223,6 +2243,10 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
             remove_existing_folder=args.remove_existing_folder,
             docker_image=args.docker_image,
             preprocess_for_sorting=False,
+            **({"terasort_path": Path(args.terasort_path) if args.terasort_path else None,
+                "terasort_resume": args.terasort_resume,
+                "input_is_preprocessed": args.input_is_preprocessed}
+               if str(args.sorter).lower() == "terasort" else {}),
             sorter_verbose=bool(args.sorter_verbose),
             cleanup_temp_wh=not bool(args.keep_temp_wh_dat),
         )
@@ -2310,6 +2334,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep Kilosort1 temp_wh.dat (default behavior removes it after sorting).",
     )
+    p.add_argument("--terasort-path", default=None, help="TeraSort checkout with .venv or Python executable")
+    p.add_argument("--terasort-resume", action="store_true", help="Resume the same TeraSort native run")
+    p.add_argument("--input-is-preprocessed", action="store_true", help="TeraSort input is already filtered/referenced")
     return p
 
 

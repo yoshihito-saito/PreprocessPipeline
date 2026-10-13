@@ -304,7 +304,10 @@ def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
     from src.preprocess.sorting_stage import run_sorting_stage
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
-    if spec.attempt > 1:
+    is_terasort = str(config.sorter).lower() == "terasort"
+    if is_terasort:
+        timestamp = f"run_{store.run_dir.name}"
+    elif spec.attempt > 1:
         timestamp = f"{timestamp}_a{spec.attempt:03d}"
     selected_gpu = gpu_selection["selected_gpu"]
     if active and (not isinstance(selected_gpu, dict) or not selected_gpu.get("uuid")):
@@ -320,6 +323,7 @@ def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
             config,
             preprocess_result,
             output_timestamp=timestamp,
+            **({"resume_terasort": spec.attempt > 1} if is_terasort else {}),
         )
     except BaseException:
         if gpu_monitor is not None:
