@@ -355,41 +355,95 @@ Behavior export produces `<basename>.animal.behavior.mat`. Postprocessing produc
 Phy-compatible sorting/metrics; CellExplorer processing is a separate action.
 
 
-## Bounded TeraSort backend and waveform length
+## TeraSort modes, KS4 settings and waveform length
 
 Select `preprocess.sorter="terasort"`, point `preprocess.sorter_path` to the
 updated TeraSort integration checkout with its `.venv` (or its Python executable),
 and use `preprocess.sorter_config_path="sorter/TeraSort_config.yaml"`.
-The runtime must include [TeraSort PR #1](https://github.com/ayalab1/TeraSort/pull/1)
-(or a later version containing it) for the preprocessed/source-column manifest,
-configurable bounded nt and flat Phy export contract.
-The GUI offers the same sorter/path/config controls. Per-session configuration
-copies and sorter configuration snapshots use the existing pipeline workflow.
+The runtime must contain the configurable modes/KS4 settings changes on
+[TeraSort PR #1](https://github.com/ayalab1/TeraSort/pull/1)'s integration branch,
+in addition to its preprocessed/source-column and flat Phy input/output contract.
+PP does not vendor TeraSort or install its runtime. The GUI uses the existing
+sorter/path/config controls; selecting the mode happens in the sorter YAML.
 
-The default PP configuration contains `nt: 41`: 2.05 ms at 20 kHz. TeraSort's
-standalone default remains 61. `nt` is an odd integer at least 21, required by
-the existing 17-sample raw-anchor score plus its two-sample shift holdouts.
-Sample rate, count scale and source-column geometry come from the input metadata;
-changing `nt` does not resample or reinterpret the binary.
+```yaml
+mode: bounded
+nt: 41
+ks4_backend: deep_tiled
+ks4_settings: {}  # Explicit overrides; empty preserves native KS4 defaults.
+```
 
-Seed learning, local model alignment, CPU/CUDA matching, novelty/PCA observations,
-waveform caches and Phy templates use the same `nt`. The default strict template
-overlap window follows `nt`; scoring half width, shift radius, thresholds,
-distance/radius settings and other selected-profile values are preserved.
-Optional config fields include `half_width`, `shift_radius`,
+- `mode: bounded` calls `session-sort`: fixed-budget KS4 seed learning followed
+  by the selected CUDA streaming profile, restartable shards and flat Phy export.
+  This remains the PP default for large/long recordings.
+- `mode: kilosort4` calls TeraSort's KS4-compatible `sort` route. Its feature and
+  clustering memory can grow with recording length. It does not resume bounded
+  checkpoints; persistent retries create fresh output directories.
+- Original KS1 (`ks1-sort`) is a separate experimental route requiring the pinned
+  original-KS1 CUDA/calibration sources, normally with MATLAB calibration. It
+  rejects this integration's preprocessed/source-column input contract.
+
+`ks4_backend` selects `auto`, `standard`, `deep_tiled` or `cublas` for full KS4
+sorting or for bounded initial KS4 learning. It does not change the bounded dense
+CUDA profile. The dedicated cuBLAS backend requires `nt=41` or `nt=61` and
+`n_templates=6`, plus a platform-native bridge. Linux build/runtime remains unverified.
+
+Use native KS4 parameter names inside `ks4_settings`, for example:
+
+```yaml
+ks4_settings:
+  Th_single_ch: 6
+  Th_universal: 9
+  Th_learned: 8
+  n_templates: 6
+  nearest_chans: 10
+  whitening_range: 32
+  batch_size: 60000
+  nblocks: 0
+```
+
+In bounded mode these affect initial KS4 learning only. Seed learning requires
+`nblocks=0`; full `kilosort4` mode accepts its native drift setting and defaults
+to `nblocks=1` when omitted. These values are not copied automatically from
+`Kilosort4_config.yaml`. The default TeraSort YAML leaves scientific overrides
+empty to preserve existing seed behavior. Bounded thresholds such as `floor_snr`
+and `score_floor` retain their own meaning rather than being translated from KS4
+thresholds. Unknown native keys/types/ranges are checked in the TeraSort runtime.
+
+Common `nt=41` is 2.05 ms at 20 kHz. It is odd; bounded requires at least 21
+for its existing raw-anchor holdout. TeraSort's standalone default remains 61. Sample rate, gain, full binary width,
+source-column geometry and selected input interval come from PP input metadata.
+Do not duplicate `nt`, `fs`, `n_chan_bin`, `scale`, `shift`, source/probe paths,
+`tmin` or `tmax` in `ks4_settings`. PP owns high-pass filtering and reference:
+`highpass_cutoff` and `do_CAR` are not sorter-config overrides here. Preprocessed
+input bypasses high-pass filtering and CAR in both modes while retaining KS4
+whitening/learning. No resampling or reinterpretation of the binary occurs.
+
+The existing flat bounded controls remain supported: `half_width`, `shift_radius`,
 `overlap_window_samples`, `halo_ms`, `core_seconds`, `shard_seconds`,
-`read_buffer_mb`, `prefetch_depth` and `vram_limit_gb`.
+`read_buffer_mb`, `prefetch_depth` and `vram_limit_gb`. Additional explicit controls
+are `floor_snr`, `score_floor`, `residual_passes`, `max_candidates`,
+`freeze_templates`, `novelty` (`off`/`shadow`/`enroll`) and `preset`
+(`default`/`fast`). These controls are rejected in `kilosort4` mode. Fast changes
+residual passes, novelty admission and cache policy, so it is a scientific preset,
+not another sorting mode. Omitted settings retain the selected profile, including
+60-second shards, a 64 MiB read buffer and prefetch depth 4. The VRAM setting
+budgets the CuPy pool, not all GPU allocations.
 
-The backend retains full binary width and original channel IDs, explicitly marks
-preprocessed input, and publishes flat Phy output per pipeline partition.
-The current bounded geometry is planar XY; nonzero or unknown active z coordinates
-are rejected rather than projected silently.
-WILD-NP uses its existing independent probe partitions. Native checkpoints and
-seed banks remain in `.terasort/` alongside the Phy export. Persistent retries
-reuse the same native output; standalone retries use `--terasort-resume`.
-A changed `nt` requires a new output/seed bank: incompatible cached model lengths
-and recorded input/configuration identities are rejected. Existing 61-sample
-runs retain their default configuration identity.
+Both modes retain original binary-column IDs and publish flat Phy output per PP
+partition. The current adapter requires planar XY geometry and rejects nonzero
+or unknown active z coordinates. WILD-NP retains independent physical-probe
+partitions. Input/config identities and source/probe/settings JSON are stored in
+`.terasort/`; the output keeps its source/resolved YAML snapshot and
+`terasort_run.json` pointer. Full KS4 writes `terasort_settings.json` with native
+effective settings and the actual selected backend. Bounded seed reports retain
+the same effective KS4 record; native `run.json` records dense settings. Nonfinite
+native limits are represented as strings only in the viewable effective-settings
+metadata; runtime settings are unchanged.
 
-Only the bounded `session-sort` route is connected here. KS4-compatible sorting,
-bounded KS1 and the Windows-specific cuBLAS bridge retain their existing behavior.
+Bounded retries retain checkpoints and seed banks. Explicit KS4 seed overrides
+and backend changes are pinned in the seed plan/report and reject incompatible
+resume. Changing `nt` or scientific settings requires a fresh output/seed bank.
+The default empty KS4 overrides and `deep_tiled` seed backend retain existing
+legacy seed-plan and PP job identities. No sorting, GUI, CUDA, resume or quality
+validation is implied by the source implementation.

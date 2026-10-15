@@ -1855,9 +1855,9 @@ def execute_sorting_job(
             stage="Sorting",
         )
     if sorter_input == "terasort":
-        from .terasort_runner import execute_terasort_job
+        from .terasort_runner import execute_terasort_job, normalize_terasort_config
         cfg_path = (config_path or _default_sorter_config_path(sorter_input)).resolve()
-        params = _load_params(cfg_path)
+        params = normalize_terasort_config(_load_params(cfg_path))
         result = execute_terasort_job(
             dat_path=Path(dat_path), chanmap_path=chanmap_mat_path,
             output_folder=Path(output_folder), terasort_path=terasort_path,
@@ -1868,6 +1868,8 @@ def execute_sorting_job(
             resume=terasort_resume)
         _save_sorter_config_snapshot(output_folder=result, source_config_path=cfg_path, resolved_params=params)
         _write_phy_shanks_from_chanmap(result, chanmap_mat_path, nch)
+        _patch_params_py(result / "params.py", dat_path=Path(dat_path), n_channels_dat=nch,
+                         hp_filtered=bool(input_is_preprocessed), dtype=dtype)
         return result
     matlab_cmd: str | None = None
     ks4_auto_geom_enabled = False

@@ -1,4 +1,4 @@
-"""Run TeraSort's session sorter against the existing preprocessing output."""
+"""Run TeraSort sorting modes against the existing preprocessing output."""
 from __future__ import annotations
 
 import json
@@ -23,7 +23,96 @@ _OPTIONS = {
     "read_buffer_mb": "--read-buffer-mb",
     "prefetch_depth": "--prefetch-depth",
     "vram_limit_gb": "--vram-limit-gb",
+    "floor_snr": "--floor-snr",
+    "score_floor": "--score-floor",
+    "residual_passes": "--residual-passes",
+    "max_candidates": "--max-candidates",
 }
+
+
+_BOOL_OPTIONS = {"freeze_templates": "--freeze-templates"}
+_ENUM_OPTIONS = {"preset": ("default", "fast"), "novelty": ("off", "shadow", "enroll")}
+_MANAGED_KS4_SETTINGS = {"n_chan_bin", "fs", "scale", "shift", "nt", "tmin", "tmax",
+                         "highpass_cutoff", "filename", "data_dir", "results_dir",
+                         "probe_name", "probe_path"}
+
+
+def terasort_mode(params: dict) -> str:
+    mode = params.get("mode", "bounded")
+    if mode not in ("bounded", "kilosort4"):
+        raise ValueError("TeraSort mode must be bounded or kilosort4; original KS1 does not accept this input contract")
+    return mode
+
+
+def normalize_terasort_config(params: dict) -> dict:
+    """Validate mode-specific controls without changing scientific defaults."""
+    if not isinstance(params, dict) or any(not isinstance(key, str) for key in params):
+        raise ValueError("TeraSort config must be a mapping with string keys")
+    mode = terasort_mode(params)
+    unknown = set(params) - (set(_OPTIONS) | set(_BOOL_OPTIONS) | set(_ENUM_OPTIONS)
+                              | {"mode", "ks4_backend", "ks4_settings"})
+    if unknown:
+        raise ValueError(f"Unsupported TeraSort options: {sorted(unknown)}")
+    backend = params.get("ks4_backend", "deep_tiled")
+    if backend not in ("auto", "standard", "deep_tiled", "cublas"):
+        raise ValueError("ks4_backend must be auto, standard, deep_tiled, or cublas")
+    ks4 = params.get("ks4_settings", {})
+    if not isinstance(ks4, dict) or any(not isinstance(key, str) for key in ks4):
+        raise ValueError("ks4_settings must be a mapping with native KS4 parameter names")
+    managed = set(ks4) & _MANAGED_KS4_SETTINGS
+    if managed:
+        raise ValueError(f"KS4 input/preprocessing settings are managed by PP/common nt: {sorted(managed)}")
+    ks4 = dict(ks4)
+    if mode == "bounded":
+        if "nblocks" in ks4 and (type(ks4["nblocks"]) is not int or ks4["nblocks"] != 0):
+            raise ValueError("Bounded KS4 seed learning requires nblocks=0")
+        ks4.pop("nblocks", None)
+    elif set(params) & ((set(_OPTIONS) - {"nt"}) | set(_BOOL_OPTIONS) | set(_ENUM_OPTIONS)):
+        raise ValueError("Bounded controls cannot be used with mode=kilosort4")
+    numeric = {key: value for key, value in params.items() if key in _OPTIONS}
+    for key, value in numeric.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
+            raise ValueError(f"TeraSort {key} must be a finite number")
+        if key in ("nt", "half_width", "shift_radius", "overlap_window_samples", "read_buffer_mb",
+                   "prefetch_depth", "residual_passes", "max_candidates") and not isinstance(value, int):
+            raise ValueError(f"TeraSort {key} must be an integer")
+        if key == "nt":
+            minimum = 21 if mode == "bounded" else 1
+            if value < minimum or value % 2 != 1:
+                raise ValueError(f"TeraSort {mode} nt must be an odd integer >= {minimum}")
+        elif key == "half_width":
+            if not 3 <= value <= numeric.get("nt", 61) // 2:
+                raise ValueError("TeraSort half_width must fit nt")
+        elif key == "shift_radius":
+            if not 0 <= value <= 8:
+                raise ValueError("TeraSort shift_radius must be in [0, 8]")
+        elif key == "overlap_window_samples":
+            if not 0 <= value <= numeric.get("nt", 61):
+                raise ValueError("TeraSort overlap_window_samples must be in [0, nt]")
+        elif key == "halo_ms":
+            if value < 0:
+                raise ValueError("TeraSort halo_ms must be nonnegative")
+        elif key == "read_buffer_mb":
+            if not 0 <= value <= 1024:
+                raise ValueError("TeraSort read_buffer_mb must be between 0 and 1024 MiB")
+        elif key == "residual_passes":
+            if not 1 <= value <= 12:
+                raise ValueError("TeraSort residual_passes must be in [1, 12]")
+        elif key == "score_floor":
+            if not 0 < value <= 1:
+                raise ValueError("TeraSort score_floor must be in (0, 1]")
+        elif value <= 0 or (key == "prefetch_depth" and value > 64):
+            raise ValueError(f"TeraSort {key} is outside its supported positive range")
+    for key in _BOOL_OPTIONS:
+        if key in params and not isinstance(params[key], bool):
+            raise ValueError(f"TeraSort {key} must be boolean")
+    for key, choices in _ENUM_OPTIONS.items():
+        if key in params and params[key] not in choices:
+            raise ValueError(f"TeraSort {key} must be one of {choices}")
+    if backend == "cublas":
+        if numeric.get("nt", 61) not in (41, 61) or ks4.get("n_templates", 6) != 6:
+            raise ValueError("The dedicated cuBLAS backend requires nt=41 or 61 and n_templates=6")
+    return {**params, "mode": mode, "ks4_backend": backend, "ks4_settings": ks4}
 
 
 def _python_executable(path: Path | None) -> Path:
@@ -73,7 +162,7 @@ def build_terasort_manifest(
     if "zcoords" in layout:
         z = np.asarray(layout["zcoords"], dtype=float).reshape(-1)[rows]
         if not np.isfinite(z).all() or np.any(z != 0):
-            raise ValueError("Bounded TeraSort currently requires planar XY geometry (active zcoords=0)")
+            raise ValueError("TeraSort integration currently requires planar XY geometry (active zcoords=0)")
     if np.any(shanks != np.floor(shanks)) or np.any(probes != np.floor(probes)):
         raise ValueError("Probe and shank identifiers must be integers")
     # Local shank numbers may repeat across probes. Keep those groups separate
@@ -123,36 +212,20 @@ def execute_terasort_job(
         raise ValueError("TeraSort input currently requires offset_to_uV=0")
     if chanmap_path is None:
         raise ValueError("TeraSort requires the effective chanMap.mat")
-    unknown = set(params) - set(_OPTIONS)
-    if unknown:
-        raise ValueError(f"Unsupported TeraSort options: {sorted(unknown)}")
+    params = normalize_terasort_config(params)
+    mode = params["mode"]
+    ks4_backend = params["ks4_backend"]
+    ks4_settings = params["ks4_settings"]
+    if mode == "kilosort4" and resume:
+        raise ValueError("TeraSort kilosort4 mode cannot resume checkpoints; choose a new output")
     option_arguments = []
     for key, value in params.items():
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
-            raise ValueError(f"TeraSort {key} must be a finite number")
-        if key in ("nt", "half_width", "shift_radius", "overlap_window_samples", "read_buffer_mb", "prefetch_depth") and not isinstance(value, int):
-            raise ValueError(f"TeraSort {key} must be an integer")
-        if key == "nt":
-            if value < 21 or value % 2 != 1:
-                raise ValueError("TeraSort nt must be an odd integer >= 21")
-        elif key == "half_width":
-            if not 3 <= value <= params.get("nt", 61) // 2:
-                raise ValueError("TeraSort half_width must fit nt")
-        elif key == "shift_radius":
-            if not 0 <= value <= 8:
-                raise ValueError("TeraSort shift_radius must be in [0, 8]")
-        elif key == "overlap_window_samples":
-            if not 0 <= value <= params.get("nt", 61):
-                raise ValueError("TeraSort overlap_window_samples must be in [0, nt]")
-        elif key == "halo_ms":
-            if value < 0:
-                raise ValueError("TeraSort halo_ms must be nonnegative")
-        elif key == "read_buffer_mb":
-            if not 0 <= value <= 1024:
-                raise ValueError("TeraSort read_buffer_mb must be between 0 and 1024 MiB")
-        elif value <= 0 or (key == "prefetch_depth" and value > 64):
-            raise ValueError(f"TeraSort {key} is outside its supported positive range")
-        option_arguments.extend([_OPTIONS[key], str(value)])
+        if key in _OPTIONS:
+            option_arguments.extend([_OPTIONS[key], str(value)])
+        elif key in _BOOL_OPTIONS and value:
+            option_arguments.append(_BOOL_OPTIONS[key])
+        elif key in _ENUM_OPTIONS:
+            option_arguments.extend(["--" + key.replace("_", "-"), value])
     executable = _python_executable(terasort_path)
     manifest = build_terasort_manifest(
         dat_path=dat_path, chanmap_path=chanmap_path, num_channels=num_channels,
@@ -167,23 +240,53 @@ def execute_terasort_job(
     native_exists = native_root.exists() or seed_root.exists()
     if (output.exists() or native_exists) and not resume:
         raise FileExistsError(f"TeraSort output already exists; use an explicit resume or new output: {output}")
-    if output.exists() and not (native_root / "run.json").is_file():
+    if mode == "bounded" and output.exists() and not (native_root / "run.json").is_file():
         raise ValueError("A TeraSort Phy folder cannot be resumed without its native run.json")
     native_parent.mkdir(parents=True, exist_ok=True)
     manifest_path = native_parent / (output.name + ".manifest.json")
     job_path = native_parent / (output.name + ".job.json")
     _pin_json(manifest_path, manifest, resume=resume)
-    _pin_json(job_path, {"python": str(executable), "params": params,
+    pinned_params = dict(params)
+    if mode == "bounded":
+        pinned_params.pop("mode")
+        if ks4_backend == "deep_tiled":
+            pinned_params.pop("ks4_backend")
+        if not ks4_settings:
+            pinned_params.pop("ks4_settings")
+    _pin_json(job_path, {"python": str(executable), "params": pinned_params,
                         "phy_output": str(output)}, resume=resume)
-    command = [
-        str(executable), "-u", "-m", "terasort.cli", "session-sort",
-        "--manifest", str(manifest_path), "--output-root", str(native_root),
-        "--phy-flat-output", str(output),
-    ]
-    command.extend(option_arguments)
-    if resume and native_exists:
-        command.append("--resume")
-    print(f"Running TeraSort session sorter -> {output}", flush=True)
+    command = [str(executable), "-u", "-m", "terasort.cli"]
+    if mode == "bounded":
+        command.extend(["session-sort", "--manifest", str(manifest_path),
+                        "--output-root", str(native_root), "--phy-flat-output", str(output)])
+        command.extend(option_arguments)
+        if ks4_settings:
+            settings_path = native_parent / (output.name + ".seed-settings.json")
+            _pin_json(settings_path, ks4_settings, resume=resume)
+            command.extend(["--seed-settings", str(settings_path)])
+        if ks4_backend != "deep_tiled":
+            command.extend(["--seed-backend", ks4_backend])
+        if resume and native_exists:
+            command.append("--resume")
+    else:
+        probe = manifest["probes"][0]
+        geometry = probe["geometry"]
+        settings_path = native_parent / (output.name + ".ks4-settings.json")
+        probe_path = native_parent / (output.name + ".ks4-probe.json")
+        settings = {**ks4_settings, "nt": params.get("nt", 61),
+                    "fs": float(sampling_frequency), "n_chan_bin": int(num_channels),
+                    "scale": float(gain_to_uV)}
+        _pin_json(settings_path, settings, resume=False)
+        _pin_json(probe_path, {"chanMap": active_channels_0based,
+                              "xc": geometry["x_um"], "yc": geometry["y_um"],
+                              "kcoords": geometry["shank"], "n_chan": len(active_channels_0based)},
+                  resume=False)
+        command.extend(["sort", "--settings", str(settings_path), "--probe-json", str(probe_path),
+                        "--filename", str(Path(dat_path).resolve()), "--results-dir", str(output),
+                        "--backend", ks4_backend])
+        if input_is_preprocessed:
+            command.append("--input-is-preprocessed")
+    print(f"Running TeraSort mode={mode}, ks4_backend={ks4_backend} -> {output}", flush=True)
     # Inherit the controller's CUDA visibility, process tree and streamed logs.
     subprocess.run(command, check=True)
     required = ("params.py", "spike_times.npy", "spike_clusters.npy", "templates.npy", "channel_map.npy")
@@ -194,6 +297,7 @@ def execute_terasort_job(
         raise ValueError("TeraSort export channel_map disagrees with input binary columns")
     pointer = output / "terasort_run.json"
     if not pointer.exists():
-        atomic_write_json(pointer, {"native_run": str(native_root), "manifest": str(manifest_path),
-                                   "job": str(job_path)})
+        atomic_write_json(pointer, {"mode": mode, "manifest": str(manifest_path),
+                                   "job": str(job_path),
+                                   **({"native_run": str(native_root)} if mode == "bounded" else {})})
     return output

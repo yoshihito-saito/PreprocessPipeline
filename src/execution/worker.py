@@ -342,7 +342,13 @@ def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
     is_terasort = str(config.sorter).lower() == "terasort"
+    resume_terasort = False
     if is_terasort:
+        from src.preprocess.sorter_runner import _default_sorter_config_path, _load_params
+        from src.preprocess.terasort_runner import terasort_mode
+        config_path = config.sorter_config_path or _default_sorter_config_path("terasort")
+        resume_terasort = terasort_mode(_load_params(Path(config_path))) == "bounded"
+    if resume_terasort:
         timestamp = f"run_{store.run_dir.name}"
     elif spec.attempt > 1:
         timestamp = f"{timestamp}_a{spec.attempt:03d}"
@@ -360,7 +366,7 @@ def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
             config,
             preprocess_result,
             output_timestamp=timestamp,
-            **({"resume_terasort": spec.attempt > 1} if is_terasort else {}),
+            **({"resume_terasort": spec.attempt > 1} if resume_terasort else {}),
         )
     except BaseException:
         if gpu_monitor is not None:
