@@ -50,12 +50,15 @@ def resolve_phy_dat_path(folder: Path) -> Path | None:
 def write_phy_shank_metadata(
     folder: Path, *, source_channel_ids: Any, shank_ids: Any,
     probe_ids: Any, exported_channel_ids: Any,
+    separate_overlapping_positions: bool = False,
 ) -> None:
     """Write zero-based probe/shank labels in the exported channel-map order.
 
     Shanks are numbered by sorted (probe, shank) pairs so repeated local shank
     IDs cannot mix channels from different probes in Phy's waveform selection.
-    Only metadata is written; channel maps, positions and sorting are unchanged.
+    Channel maps and sorting are unchanged. With the optional display correction,
+    overlapping probe/shank groups are translated horizontally for Phy while
+    their original coordinates are retained in channel_positions_local.npy.
     """
     import numpy as np
 
@@ -85,5 +88,41 @@ def write_phy_shank_metadata(
     # Validate and align both arrays before publishing either file.
     exported_shanks = np.asarray([pair_labels[pairs[i]] for i in indices], dtype=np.int32)
     exported_probes = np.asarray([probe_labels[int(probes[i])] for i in indices], dtype=np.int32)
-    np.save(Path(folder) / "channel_shanks.npy", exported_shanks)
-    np.save(Path(folder) / "channel_probe.npy", exported_probes)
+    folder = Path(folder)
+    local_positions = display_positions = None
+    offsets = {}
+    positions_path = folder / "channel_positions.npy"
+    if separate_overlapping_positions and positions_path.exists():
+        positions = np.load(positions_path)
+        if positions.shape != (len(exported), 2) or not np.all(np.isfinite(positions)):
+            raise ValueError("Phy positions must be finite and match exported channels")
+        if len(np.unique(positions, axis=0)) != len(positions):
+            groups = np.unique(exported_shanks)
+            if any(len(np.unique(positions[exported_shanks == group], axis=0))
+                   != np.count_nonzero(exported_shanks == group) for group in groups):
+                raise ValueError("Duplicate Phy positions within one probe/shank")
+            local_positions = positions
+            display_positions = positions.astype(np.float64, copy=True)
+            # The 100 um gap is a display convention, not physical probe spacing.
+            step = float(np.ptp(positions[:, 0])) + 100.0
+            for rank, group in enumerate(groups):
+                offset = rank * step
+                display_positions[exported_shanks == group, 0] += offset
+                offsets[str(int(group))] = offset
+            local_path = folder / "channel_positions_local.npy"
+            if local_path.exists() and not np.array_equal(np.load(local_path), local_positions):
+                raise ValueError("Saved local Phy coordinates disagree with this export")
+    np.save(folder / "channel_shanks.npy", exported_shanks)
+    np.save(folder / "channel_probe.npy", exported_probes)
+    if local_positions is not None:
+        import json
+
+        np.save(folder / "channel_positions_local.npy", local_positions)
+        (folder / "channel_positions_display.json").write_text(json.dumps({
+            "format": "PreprocessPipeline Phy display geometry", "version": 1,
+            "units": "um", "source_positions": "channel_positions_local.npy",
+            "display_positions": "channel_positions.npy", "grouping": "channel_shanks.npy",
+            "x_offsets_um": offsets,
+            "purpose": "Separate overlapping groups for Phy; offsets are not physical probe spacing",
+        }, indent=2) + "\n", encoding="utf-8")
+        np.save(positions_path, display_positions)

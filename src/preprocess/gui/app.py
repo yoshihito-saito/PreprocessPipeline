@@ -259,6 +259,7 @@ SORTER_DEFAULTS: dict[str, tuple[str, str]] = {
     "Kilosort": ("sorter/KiloSort1", "sorter/Kilosort1_config.yaml"),
     "Kilosort2_5": ("sorter/Kilosort2.5", "sorter/Kilosort2.5_config.yaml"),
     "kilosort4": ("sorter/Kilosort4", "sorter/Kilosort4_config.yaml"),
+    "terasort": ("sorter/TeraSort", "sorter/TeraSort_config.yaml"),
     "disabled": ("", ""),
 }
 
@@ -3341,7 +3342,7 @@ class MainWindow(QMainWindow):
         sf = self._form_layout(sorter)
         self.run_sorter = QCheckBox("Run sorter")
         self.sorter = NoWheelComboBox()
-        self.sorter.addItems(["Kilosort", "Kilosort2_5", "kilosort4", "disabled"])
+        self.sorter.addItems(["Kilosort", "Kilosort2_5", "kilosort4", "terasort", "disabled"])
         self.sorter.currentTextChanged.connect(self._sorter_changed)
         self.run_sorter.toggled.connect(self._update_sorter_enabled)
         self.sorter_partition_mode = NoWheelComboBox()
@@ -4043,7 +4044,8 @@ class MainWindow(QMainWindow):
                 for control in (self.analog_inputs, self.digital_inputs, self.state_score,
                                 self.remove_ttl_artifacts, self.remove_highamp_artifacts):
                     control.setChecked(False)
-                self.sorter.setCurrentText("kilosort4")
+                if self.sorter.currentText().lower() not in {"kilosort4", "terasort"}:
+                    self.sorter.setCurrentText("kilosort4")
                 self.sorter_partition_mode.setCurrentIndex(self.sorter_partition_mode.findData("probe"))
                 for row in self._probe_rows:
                     row["groups"].setReadOnly(True)
@@ -4179,7 +4181,7 @@ class MainWindow(QMainWindow):
         if output_dir is not None:
             candidates.append(output_dir / "chanMap.mat")
             sorter_candidates: list[Path] = []
-            for pattern in ("Kilosort_*", "Kilosort2_5_*", "Kilosort2.5_*", "Kilosort4_*"):
+            for pattern in ("Kilosort_*", "Kilosort2_5_*", "Kilosort2.5_*", "Kilosort4_*", "Terasort_*"):
                 for run_dir in output_dir.glob(pattern):
                     if not run_dir.is_dir() or run_dir.name.endswith("_spi"):
                         continue

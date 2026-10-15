@@ -48,6 +48,7 @@ _SORTING_OUTPUT_PATTERNS = (
     "Kilosort2_5_*",
     "Kilosort2.5_*",
     "Kilosort4_*",
+    "Terasort_*",
 )
 _CANONICAL_CHANMAP_NAME = "chanMap.mat"
 
@@ -88,7 +89,7 @@ def _find_sorting_output_dirs_from_manifest(root: Path) -> list[Path]:
         except ValueError:
             # A manifest is an input, not authority to read arbitrary folders.
             continue
-        # Partition manifests are allowed to select only direct Kilosort run
+        # Partition manifests are allowed to select only direct sorter run
         # directories below the session root.  Do not let a malformed manifest
         # turn the session root itself (or a nested arbitrary folder) into a
         # Phy input.
