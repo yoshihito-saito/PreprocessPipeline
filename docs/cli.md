@@ -94,7 +94,7 @@ JSON's `preprocess` object:
 {
   "run_sorter": true,
   "sorter": "terasort",
-  "sorter_path": "D:/TeraSort-bounded-nt-pr",
+  "sorter_path": "D:/TeraSort-preprocess-pipeline-integration",
   "sorter_config_path": "sorter/TeraSort_config.yaml"
 }
 ```
@@ -161,8 +161,9 @@ python -m src.preprocess.sorter_runner --sorter terasort --config sorter/TeraSor
 Use the actual recording gain, not the example value. For a raw binary, omit
 `--input-is-preprocessed`. To resume the same standalone output, repeat the
 command with `--terasort-resume`; changed inputs/settings require a new output.
-The integration has not yet been validated on real recordings, GPU execution,
-interrupted retries, or interactive Phy curation.
+A 600-second WILDX Neuropixels excerpt completed preprocessing, GPU sorting,
+checkpoint resume, and Phy export through this route. Full-session GUI runs,
+scientific sorting quality, and interactive Phy/postprocessing remain unverified.
 
 ## Direct multi-day run
 
