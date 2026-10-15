@@ -80,6 +80,7 @@ from src.preprocess.io import (
     set_tree_world_rw,
 )
 from src.preprocess.multiday import MULTI_DAY_MANIFEST, discover_multi_day_subepochs
+from src.preprocess.wildx_np import has_wildx_np_marker, session_recordings, prepare_session_metadata, channel_map_data
 from src.preprocess.paths import find_project_root, resolve_project_path
 from src.worker_defaults import default_worker_count, normalize_worker_count
 from src.execution.backends import SlurmCapabilities, detect_slurm_capabilities
@@ -113,7 +114,7 @@ from .preflight import CheckResult, run_preflight
 from .run_pipeline import ERROR_PREFIX, RESULT_PREFIX
 
 
-REPO_ROOT = find_project_root()
+REPO_ROOT = find_project_root(Path(__file__))
 CONFIG_DIR = REPO_ROOT / "config"
 PUBLIC_DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "preprocess_gui_default_config.json"
 LOCAL_DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "preprocess_gui_default_config.local.json"
@@ -250,6 +251,7 @@ SORTER_DEFAULTS: dict[str, tuple[str, str]] = {
     "Kilosort": ("sorter/KiloSort1", "sorter/Kilosort1_config.yaml"),
     "Kilosort2_5": ("sorter/Kilosort2.5", "sorter/Kilosort2.5_config.yaml"),
     "kilosort4": ("sorter/Kilosort4", "sorter/Kilosort4_config.yaml"),
+    "terasort": ("", "sorter/TeraSort_config.yaml"),
     "disabled": ("", ""),
 }
 
@@ -3263,7 +3265,7 @@ class MainWindow(QMainWindow):
         sf = self._form_layout(sorter)
         self.run_sorter = QCheckBox("Run sorter")
         self.sorter = NoWheelComboBox()
-        self.sorter.addItems(["Kilosort", "Kilosort2_5", "kilosort4", "disabled"])
+        self.sorter.addItems(["Kilosort", "Kilosort2_5", "kilosort4", "terasort", "disabled"])
         self.sorter.currentTextChanged.connect(self._sorter_changed)
         self.run_sorter.toggled.connect(self._update_sorter_enabled)
         self.sorter_partition_mode = NoWheelComboBox()
@@ -4014,7 +4016,7 @@ class MainWindow(QMainWindow):
         if output_dir is not None:
             candidates.append(output_dir / "chanMap.mat")
             sorter_candidates: list[Path] = []
-            for pattern in ("Kilosort_*", "Kilosort2_5_*", "Kilosort2.5_*", "Kilosort4_*"):
+            for pattern in ("Kilosort_*", "Kilosort2_5_*", "Kilosort2.5_*", "Kilosort4_*", "Terasort_*"):
                 for run_dir in output_dir.glob(pattern):
                     if not run_dir.is_dir() or run_dir.name.endswith("_spi"):
                         continue
@@ -4094,12 +4096,19 @@ class MainWindow(QMainWindow):
         self._append_warning_log(message)
 
     def _load_settings_chanmap_preview(self, settings: PipelineGuiSettings) -> bool:
-        basepath = settings.basepath_path
+        basepath = settings.preprocess_source_path or settings.basepath_path
         if basepath is None:
             return False
         xml_path = settings.resolved_xml_path()
         try:
             explicit = self._preview_chanmap_path(settings)
+            if explicit is None and has_wildx_np_marker(basepath):
+                data = self._current_chanmap_data(settings)
+                if data is None:
+                    return False
+                self.chanmap_canvas.render_chanmap(data, source="WILDX NP applied settings")
+                self._last_chanmap_preview_key = None
+                return True
             if (xml_path is None or not xml_path.exists()) and explicit is None:
                 self._warn_missing_xml_for_settings(settings, context="chanmap-preview")
                 return False
@@ -4138,10 +4147,16 @@ class MainWindow(QMainWindow):
     def _current_chanmap_data(self, settings: PipelineGuiSettings | None = None) -> dict[str, Any] | None:
         settings = settings or self._collect_settings()
         explicit = self._preview_chanmap_path(settings)
-        basepath = settings.basepath_path
+        basepath = settings.preprocess_source_path or settings.basepath_path
         xml_path = settings.resolved_xml_path()
+        use_np = explicit is None and basepath is not None and has_wildx_np_marker(basepath)
         if explicit is not None:
             data = loadmat(explicit)
+        elif use_np:
+            recordings = session_recordings(discover_subsessions(
+                basepath, sort_files=True, alt_sort=None, ignore_folders=[],
+                subsession_order=settings.subsession_order))
+            data = channel_map_data(recordings[0], settings.preprocess.reject_channels) if recordings else None
         elif basepath is not None and xml_path is not None and xml_path.exists():
             data = build_channel_map_data(
                 basepath=basepath,
@@ -4157,7 +4172,8 @@ class MainWindow(QMainWindow):
         if data is not None:
             rejected = set(settings.preprocess.reject_channels)
             ids = np.asarray(data["chanMap0ind"] if "chanMap0ind" in data else np.asarray(data["chanMap"]) - 1).reshape(-1)
-            rejected.update(settings.xml_excluded_channels(ids.tolist()))
+            if not use_np:
+                rejected.update(settings.xml_excluded_channels(ids.tolist()))
             connected = np.asarray(data.get("connected", np.ones(len(ids))), dtype=float).reshape(-1) > 0
             if len(ids) != len(connected):
                 raise AnatomicalMapError("chanMap connected mask and channel IDs have different lengths.")
@@ -6559,6 +6575,21 @@ class MainWindow(QMainWindow):
             settings = self._collect_settings()
             if settings.basepath_path is None:
                 raise ValueError("basepath is required.")
+            if has_wildx_np_marker(settings.basepath_path):
+                recordings = session_recordings(discover_subsessions(
+                    settings.basepath_path, sort_files=True, alt_sort=None, ignore_folders=[],
+                    subsession_order=settings.subsession_order))
+                xml_path, chanmap_path = prepare_session_metadata(
+                    recordings, output_dir=settings.local_output_dir, basename=settings.basename,
+                    reject_channels=settings.preprocess.reject_channels, overwrite=True)
+                self.xml_path.setText(str(xml_path))
+                self.chanmap_path.setText(str(chanmap_path))
+                connected = np.asarray(channel_map_data(recordings[0])["connected"]).reshape(-1)
+                self._append_log(f"Generated WILDX NP chanMap: {chanmap_path}\n"
+                                 f"Inactive binary columns: {np.flatnonzero(~connected).tolist()}\n")
+                self._load_chanmap_preview(chanmap_path)
+                self._refresh_preview()
+                return
             xml_path = settings.resolved_xml_path()
             if xml_path is None or not xml_path.exists():
                 self._warn_missing_xml_for_settings(settings, context="generate-chanmap")

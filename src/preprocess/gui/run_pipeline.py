@@ -47,6 +47,9 @@ def _postprocess_config_from_preprocess_result(
     post_config.dat_path = pre_result.dat_path
     post_config.sampling_frequency = pre_result.sr
     post_config.num_channels = pre_result.n_channels
+    if getattr(pre_result, "gain_to_uV", None) is not None:
+        post_config.gain_to_uV = float(pre_result.gain_to_uV)
+        post_config.offset_to_uV = float(pre_result.offset_to_uV)
     produced_map = local_output_dir / "chanMap.mat"
     post_config.chanmap_mat_path = produced_map if produced_map.exists() else settings.resolved_chanmap_path()
     post_config.reject_channels = list(pre_result.bad_channels_0based)

@@ -60,9 +60,10 @@ def save_mergepoints_events_mat(path: Path, data: MergePointsData, *, overwrite:
     if Path(path).exists() and not overwrite:
         existing = validate_mat_output(Path(path), "MergePoints")["MergePoints"]
         try:
-            timestamps = np.asarray(existing["timestamps"], dtype=float)
-            timestamps_samples = np.asarray(existing["timestamps_samples"], dtype=float)
-            firstlast = np.asarray(existing["firstlasttimpoints_samples"], dtype=float)
+            # simplify_cells squeezes a single epoch from (1, 2) to (2,).
+            timestamps = np.atleast_2d(np.asarray(existing["timestamps"], dtype=float))
+            timestamps_samples = np.atleast_2d(np.asarray(existing["timestamps_samples"], dtype=float))
+            firstlast = np.atleast_2d(np.asarray(existing["firstlasttimpoints_samples"], dtype=float))
             foldernames = [str(item) for item in np.asarray(existing["foldernames"], dtype=object).reshape(-1)]
         except Exception as exc:
             raise ValueError(f"Invalid existing MergePoints output: {path}") from exc

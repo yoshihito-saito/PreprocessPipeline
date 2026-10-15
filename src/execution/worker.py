@@ -297,7 +297,11 @@ def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
     from src.preprocess.sorting_stage import run_sorting_stage
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
-    if spec.attempt > 1:
+    is_terasort = str(config.sorter).lower() == "terasort"
+    if is_terasort:
+        # One native run per persistent run/partition; retries resume its shards.
+        timestamp = f"run_{store.run_dir.name}"
+    elif spec.attempt > 1:
         timestamp = f"{timestamp}_a{spec.attempt:03d}"
     selected_gpu = gpu_selection["selected_gpu"]
     if active and (not isinstance(selected_gpu, dict) or not selected_gpu.get("uuid")):
@@ -313,6 +317,7 @@ def _run_sorting(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
             config,
             preprocess_result,
             output_timestamp=timestamp,
+            **({'resume_terasort': spec.attempt > 1} if is_terasort else {}),
         )
     except BaseException:
         if gpu_monitor is not None:
@@ -365,6 +370,9 @@ def _run_postprocess(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
         config.dtype = str(preprocess_fact["outputs"].get("dtype", config.dtype))
         config.chanmap_mat_path = Path(preprocess_fact["outputs"]["chanmap_path"])
         config.reject_channels = [int(value) for value in pre.get("bad_channels_0based", [])]
+        if pre.get("gain_to_uV") is not None:
+            config.gain_to_uV = float(pre["gain_to_uV"])
+            config.offset_to_uV = float(pre["offset_to_uV"])
     if StageName.SORTING.value in spec.upstream_attempts:
         sorting_fact = _load_upstream_result(store, spec, StageName.SORTING)
         sorting_outputs = sorting_fact["outputs"]
@@ -381,7 +389,8 @@ def _run_postprocess(store: RunStore, spec: AttemptSpec) -> dict[str, Any]:
     elif config.sorting_search_root is not None:
         candidate_sorting_dirs.extend(
             path
-            for path in Path(config.sorting_search_root).glob("Kilosort*")
+            for pattern in ("Kilosort*", "Terasort_*")
+            for path in Path(config.sorting_search_root).glob(pattern)
             if path.is_dir()
             and "_spi" not in path.name
             and ".preserved-" not in path.name

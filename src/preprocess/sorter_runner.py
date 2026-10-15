@@ -58,6 +58,7 @@ _SORTER_ALIASES = {
     "kilosort2_5": "kilosort2_5",
     "kilosort25": "kilosort2_5",
     "kilosort4": "kilosort4",
+    "terasort": "terasort",
 }
 
 _INSTALLED_SORTERS = tuple(_SORTER_ALIASES.keys())
@@ -225,6 +226,8 @@ def _default_sorter_config_path(sorter: str) -> Path:
         return _repo_root() / "sorter" / "Kilosort2.5_config.yaml"
     if s == "kilosort4":
         return _repo_root() / "sorter" / "Kilosort4_config.yaml"
+    if s == "terasort":
+        return _repo_root() / "sorter" / "TeraSort_config.yaml"
     raise ValueError(f"Unsupported sorter: {sorter}")
 
 
@@ -1348,6 +1351,7 @@ def _patch_channel_map_for_raw_dat(
 
 def _write_phy_shanks_from_chanmap(
     output_folder: Path, chanmap_mat_path: Path | None, num_channels: int,
+    *, separate_overlapping_positions: bool = False,
 ) -> None:
     if chanmap_mat_path is None or not Path(chanmap_mat_path).exists():
         return
@@ -1361,6 +1365,7 @@ def _write_phy_shanks_from_chanmap(
                 shank_ids=layout["kcoords"],
                 probe_ids=layout.get("probe_ids", np.zeros_like(layout["chanMap0ind"])),
                 exported_channel_ids=np.load(path),
+                separate_overlapping_positions=separate_overlapping_positions,
             )
     except (ValueError, TypeError, OSError) as exc:
         warnings.warn(f"Could not export Phy shank metadata: {exc}", RuntimeWarning, stacklevel=2)
@@ -1813,6 +1818,8 @@ def execute_sorting_job(
     local_radius_um: tuple[float, float] = (50.0, 200.0),
     sorter_verbose: bool = False,
     cleanup_temp_wh: bool = True,
+    terasort_path: Path | None = None,
+    terasort_resume: bool = False,
 ) -> Path:
     sorter_input = sorter.lower()
     if sorter_input not in _SORTER_ALIASES:
@@ -1832,6 +1839,30 @@ def execute_sorting_job(
         exclude_channels_0based=exclude_channels_0based,
         active_channels_0based=active_channels_0based,
     )
+    if sorter_input == "terasort":
+        if preprocess_for_sorting or docker_image:
+            raise ValueError("TeraSort uses the supplied binary and its separate local environment")
+        from .terasort_runner import execute_terasort_job
+
+        cfg_path = Path(config_path) if config_path is not None else _default_sorter_config_path(sorter)
+        params = _load_params(cfg_path)
+        result = execute_terasort_job(
+            dat_path=Path(dat_path), chanmap_path=chanmap_mat_path,
+            output_folder=Path(output_folder), terasort_path=terasort_path,
+            sampling_frequency=sr, num_channels=nch, gain_to_uV=gain_to_uV,
+            offset_to_uV=offset_to_uV, dtype=dtype,
+            active_channels_0based=resolved_active_channels_0based,
+            input_is_preprocessed=input_is_preprocessed, params=params,
+            resume=terasort_resume,
+        )
+        _save_sorter_config_snapshot(output_folder=result, source_config_path=cfg_path, resolved_params=params)
+        _write_phy_shanks_from_chanmap(
+            result, chanmap_mat_path, nch, separate_overlapping_positions=True,
+        )
+        if chanmap_mat_path is not None and not (result / "chanMap.mat").exists():
+            shutil.copy2(chanmap_mat_path, result / "chanMap.mat")
+        print("Sorter finished")
+        return result
     # A retry always allocates fresh sorter outputs. Failed attempts remain
     # on disk and are already included in the volume's used space.
     from .disk_space import require_disk_space, sorting_space_components
@@ -2205,6 +2236,11 @@ def run_sorter_cli(args: argparse.Namespace) -> None:
             preprocess_for_sorting=False,
             sorter_verbose=bool(args.sorter_verbose),
             cleanup_temp_wh=not bool(args.keep_temp_wh_dat),
+            **({
+                "terasort_path": Path(args.terasort_path) if args.terasort_path else None,
+                "terasort_resume": bool(args.terasort_resume),
+                "input_is_preprocessed": bool(args.input_is_preprocessed),
+            } if str(args.sorter).lower() == "terasort" else {}),
         )
     except NoActiveChannels as exc:
         print(f"Skipping sorter {args.sorter}: reason=no_active_channels ({exc})")
@@ -2227,7 +2263,7 @@ def _parse_cli_int_list(text: str | None) -> list[int] | None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run spike sorting from config file (YAML/JSON)")
-    p.add_argument("--sorter", default="kilosort", help="Sorter name (kilosort, kilosort2.5, or kilosort4)")
+    p.add_argument("--sorter", default="kilosort", help="Sorter name (kilosort, kilosort2.5, kilosort4, or terasort)")
     p.add_argument(
         "--config",
         default=None,
@@ -2281,6 +2317,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gain-to-uV", type=float, default=0.195, help="gain_to_uV")
     p.add_argument("--offset-to-uV", type=float, default=0.0, help="offset_to_uV")
 
+    p.add_argument("--terasort-path", default=None, help="TeraSort checkout with .venv, or its Python executable")
+    p.add_argument("--terasort-resume", action="store_true", help="Resume this TeraSort output and its native checkpoints")
+    p.add_argument("--input-is-preprocessed", action="store_true", help="TeraSort input has already been filtered and referenced")
     p.add_argument("--output-folder", required=True, help="Sorter output folder")
     p.add_argument("--remove-existing-folder", action="store_true", help="Delete existing output folder")
     p.add_argument("--docker-image", default=None, help="Optional docker image")

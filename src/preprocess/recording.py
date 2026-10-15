@@ -132,6 +132,22 @@ def attach_probe_from_chanmap(recording: Any, chanmap_mat_path: Path, *, origina
     probe_ids = probe_ids[:n_contacts]
     device_ch_inds = device_ch_inds[:n_contacts]
 
+    finite_locations = np.isfinite(x) & np.isfinite(y)
+    if not np.all(finite_locations):
+        connected = np.asarray(mat["connected"]).reshape(-1)[:n_contacts]
+        if np.any(connected & ~finite_locations):
+            raise ValueError("An active chanMap channel has no finite geometry")
+        if set(device_ch_inds.tolist()) != set(original_ids):
+            raise ValueError("A chanMap with missing inactive geometry must retain every binary column")
+        positions_by_channel = {int(ch): index for index, ch in enumerate(device_ch_inds)}
+        rows = [positions_by_channel[ch] for ch in original_ids]
+        recording.set_channel_locations(np.column_stack((x[rows], y[rows])))
+        groups = _build_chanmap_group_properties(chanmap_mat_path, original_ids)
+        for key, values in groups.items():
+            _set_channel_property_compat(recording, original_ids, key, values)
+        _set_channel_property_compat(recording, original_ids, "group", groups["artifact_group_probe"])
+        return recording
+
     n_recording_channels = int(recording.get_num_channels())
     valid_mask = np.isin(device_ch_inds, original_ids)
     if not np.any(valid_mask):
@@ -1015,19 +1031,53 @@ def preprocess_selected_channels_preserve_shape(
         return recording_raw
 
     rec_selected = select_recording_channels(recording_raw, selected_ids_in_order)
-    rec_selected_pre = apply_preprocessing(
-        recording_raw=rec_selected,
-        bandpass_min_hz=bandpass_min_hz,
-        bandpass_max_hz=bandpass_max_hz,
-        reference=reference,
-        local_radius_um=local_radius_um,
-    )
+    if recording_raw.get_annotation("recording_format") == "wildx_np":
+        # NP coordinates are relative to each physical probe. Reference each
+        # probe separately so overlapping coordinates never mix its signals.
+        probe_groups = rec_selected.get_property("artifact_group_probe")
+        processed_probes = []
+        for probe_group in np.unique(probe_groups):
+            probe_channel_ids = rec_selected.get_channel_ids()[probe_groups == probe_group].tolist()
+            processed_probes.append(apply_preprocessing(
+                recording_raw=select_recording_channels(rec_selected, probe_channel_ids),
+                bandpass_min_hz=bandpass_min_hz,
+                bandpass_max_hz=bandpass_max_hz,
+                reference=reference,
+                local_radius_um=local_radius_um,
+            ))
+        rec_selected_pre = _aggregate_wildx_np_channels(processed_probes, rec_selected)
+    else:
+        rec_selected_pre = apply_preprocessing(
+            recording_raw=rec_selected,
+            bandpass_min_hz=bandpass_min_hz,
+            bandpass_max_hz=bandpass_max_hz,
+            reference=reference,
+            local_radius_um=local_radius_um,
+        )
     return _merge_selected_with_bypass_preserve_order(
         recording_raw=recording_raw,
         recording_selected_processed=rec_selected_pre,
         selected_set=selected_set,
         all_channel_ids=all_channel_ids,
     )
+
+
+def _aggregate_wildx_np_channels(recordings: list[Any], source_recording: Any) -> Any:
+    if len(recordings) == 1:
+        return recordings[0]
+
+    # SI aggregation requires globally unique coordinates, whereas separate NP
+    # probes legitimately share relative coordinates. Omit locations only on
+    # private clones during aggregation, then restore the actual coordinates.
+    channel_ids = np.concatenate([rec.get_channel_ids() for rec in recordings])
+    locations = source_recording.get_channel_locations(channel_ids=channel_ids)
+    runs = [rec.clone() for rec in recordings]
+    for rec in runs:
+        rec.delete_property("location")
+    combined = si.aggregate_channels(runs, renamed_channel_ids=channel_ids)
+    combined.set_channel_locations(locations)
+    combined.annotate(recording_format="wildx_np")
+    return combined
 
 
 def _merge_selected_with_bypass_preserve_order(
@@ -1069,6 +1119,8 @@ def _merge_selected_with_bypass_preserve_order(
 
     if len(run_recordings) == 1:
         return run_recordings[0]
+    if recording_raw.get_annotation("recording_format") == "wildx_np":
+        return _aggregate_wildx_np_channels(run_recordings, recording_raw)
     return si.aggregate_channels(run_recordings)
 
 

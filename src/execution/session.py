@@ -355,7 +355,8 @@ def _legacy_sorting_compatible(session_dir: Path, store: RunStore, settings: Any
     params_path = session_dir / "preprocessSession_params.json"
     candidates = [
         path
-        for output in session_dir.glob("Kilosort*")
+        for pattern in ("Kilosort*", "Terasort_*")
+        for output in session_dir.glob(pattern)
         if output.is_dir()
         and "_spi" not in output.name
         and ".preserved-" not in output.name
@@ -1360,7 +1361,7 @@ def _sorting_outputs(session_dir: Path) -> tuple[list[Path], Path | None]:
                 if (
                     candidate.parent == session_dir.resolve()
                     and candidate.is_dir()
-                    and candidate.name.startswith("Kilosort")
+                    and candidate.name.startswith(("Kilosort", "Terasort_"))
                     and "_spi" not in candidate.name
                     and ".preserved-" not in candidate.name
                 ):
@@ -1369,7 +1370,8 @@ def _sorting_outputs(session_dir: Path) -> tuple[list[Path], Path | None]:
         outputs = sorted(
             (
                 path.resolve()
-                for path in session_dir.glob("Kilosort*")
+                for pattern in ("Kilosort*", "Terasort_*")
+                for path in session_dir.glob(pattern)
                 if path.is_dir()
                 and "_spi" not in path.name
                 and ".preserved-" not in path.name
@@ -1783,7 +1785,7 @@ def adopt_existing_outputs(store: RunStore) -> dict[str, str]:
                     "validated_paths": validated,
                 },
                 validated_paths=validated,
-                source="validated existing Kilosort output",
+                source="validated existing sorting output",
             )
             decisions[StageName.SORTING.value] = "reuse"
 

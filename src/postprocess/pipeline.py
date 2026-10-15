@@ -42,6 +42,7 @@ _SORTING_OUTPUT_PATTERNS = (
     "Kilosort2_5_*",
     "Kilosort2.5_*",
     "Kilosort4_*",
+    "Terasort_*",
 )
 _CANONICAL_CHANMAP_NAME = "chanMap.mat"
 
@@ -1598,8 +1599,8 @@ def build_preprocessed_recording_from_result(
         sampling_frequency=result.sr,
         dtype=preprocess_config.dtype,
         num_channels=result.n_channels,
-        gain_to_uV=preprocess_config.gain_to_uV,
-        offset_to_uV=preprocess_config.offset_to_uV,
+        gain_to_uV=(preprocess_config.gain_to_uV if result.gain_to_uV is None else result.gain_to_uV),
+        offset_to_uV=(preprocess_config.offset_to_uV if result.offset_to_uV is None else result.offset_to_uV),
         chanmap_mat_path=_resolve_effective_chanmap_for_postprocess(
             (Path(result.local_output_dir) / _CANONICAL_CHANMAP_NAME
              if (Path(result.local_output_dir) / _CANONICAL_CHANMAP_NAME).exists()

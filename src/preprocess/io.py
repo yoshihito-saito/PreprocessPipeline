@@ -20,6 +20,7 @@ from scipy.io import loadmat, savemat
 from scipy.io.matlab import MatWriteError
 
 from .intan_rhd import IntanRhdHeader, read_intan_rhd_header
+from .wildx_np import find_wildx_np_recording_directories, read_wildx_np_recording
 from .metafile import (
     AcquisitionCatalog,
     PreprocessConfig,
@@ -1810,15 +1811,34 @@ def discover_subsessions(
                 continue
             amp = child / "amplifier.dat"
             cont = child / "continuous.dat"
-            if amp.exists():
+            if (child / "neuropixels_ap.dat").exists() or any(child.glob("neuropixels_probe*_metadata.json")):
+                if amp.exists() or cont.exists():
+                    raise ValueError(f"Ambiguous acquisition formats in {child}")
+                np_recording = read_wildx_np_recording(child)
+                paths.append(np_recording.ap_path)
+            elif amp.exists():
                 paths.append(amp)
             elif cont.exists():
                 paths.append(cont)
+        # Keep the selected day folder as basepath; descend only through the
+        # known WILDX capture/segment hierarchy for its NP recordings.
+        for directory in find_wildx_np_recording_directories(basepath):
+            if directory == basepath or directory.parent == basepath:
+                continue
+            if any(tok.lower() in str(directory).lower() for tok in ignore_folders):
+                continue
+            if (directory / "amplifier.dat").exists() or (directory / "continuous.dat").exists():
+                raise ValueError(f"Ambiguous acquisition formats in {directory}")
+            paths.append(read_wildx_np_recording(directory).ap_path)
 
     if not paths:
         direct_amp = basepath / "amplifier.dat"
         direct_cont = basepath / "continuous.dat"
-        if direct_amp.exists():
+        if (basepath / "neuropixels_ap.dat").exists() or any(basepath.glob("neuropixels_probe*_metadata.json")):
+            if direct_amp.exists() or direct_cont.exists():
+                raise ValueError(f"Ambiguous acquisition formats in {basepath}")
+            paths = [read_wildx_np_recording(basepath).ap_path]
+        elif direct_amp.exists():
             paths = [direct_amp]
         elif direct_cont.exists():
             paths = [direct_cont]
@@ -2041,6 +2061,7 @@ def build_acquisition_catalog(
     openephys_sampling_frequency: float | None = None
     intan_paths: list[Path] = []
     intan_sample_counts: list[int] = []
+    wildx_np_recordings = []
 
     for raw_path in amplifier_paths:
         path = Path(raw_path)
@@ -2090,6 +2111,31 @@ def build_acquisition_catalog(
             continue
 
         d = path.parent
+        if path.name == "neuropixels_ap.dat":
+            info = read_wildx_np_recording(d)
+            wildx_np_recordings.append(info)
+            source_types.append("wildx_np")
+            subsession_names.append(d.name)
+            recording_paths.append(d)
+            recording_stream_names.append(None)
+            ttl_event_paths_by_subsession.append(None)
+            resolved_amplifier_paths.append(info.ap_path)
+            sample_counts.append(info.sample_count)
+            source_total_channels.append(info.num_channels)
+            source_ephys_channels.append(info.num_channels)
+            source_adc_channels.append(0)
+            ephys_channel_indices_by_subsession.append(None)
+            adc_channel_indices_by_subsession.append([])
+            adc_channel_names_by_subsession.append([])
+            adc_gains_volts_by_subsession.append([])
+            adc_native_orders_by_subsession.append([])
+            adc_output_indices_by_subsession.append([])
+            adc_layout_sources_by_subsession.append("wildx_np_applied_receipt")
+            analogin_source_paths.append(None)
+            ephys_sampling_frequencies_by_subsession.append(info.sampling_frequency)
+            analog_sample_counts_by_subsession.append(None)
+            analog_sampling_frequencies_by_subsession.append(None)
+            continue
         wild_info = _resolve_wild_merged_info(d)
         if wild_info is None:
             sample_count = _validate_intan_recording(
@@ -2250,7 +2296,17 @@ def build_acquisition_catalog(
             f"{unique_ephys_channels}"
         )
 
-    if source_types and all(source_type == "openephys" for source_type in source_types):
+    if "wildx_np" in source_types:
+        if not all(source_type == "wildx_np" for source_type in source_types):
+            raise ValueError("Mixing WILDX NP and other acquisition formats is unsupported")
+        rates = {info.sampling_frequency for info in wildx_np_recordings}
+        if len(rates) != 1:
+            raise ValueError("WILDX NP subepochs have mismatched AP sampling rates")
+        catalog_source_type = "wildx_np"
+        sampling_frequency = rates.pop()
+        ttl_event_paths = []
+        amplifier_channels = unique_ephys_channels[0]
+    elif source_types and all(source_type == "openephys" for source_type in source_types):
         catalog_source_type = "openephys"
         sampling_frequency = openephys_sampling_frequency
         ttl_event_paths = [path for path in ttl_event_paths_by_subsession if path is not None]
@@ -2309,6 +2365,7 @@ def build_acquisition_catalog(
         analog_sample_counts_by_subsession=analog_sample_counts_by_subsession,
         analog_sampling_frequencies_by_subsession=analog_sampling_frequencies_by_subsession,
         adc_gains_volts_by_subsession=adc_gains_volts_by_subsession,
+        wildx_np_recordings=wildx_np_recordings,
     )
 
 

@@ -1,0 +1,8 @@
+# Standard TeraSort session-sort profile in a separately configured environment.
+# Input preprocessing and channel selection come from PreprocessPipeline.
+# Optional scientific options: nt (odd >=21 samples), seed_backend
+# (auto, standard, deep_tiled, cublas). cuBLAS supports nt=41 or 61 and six
+# temporal templates. These are passed only when explicitly configured.
+# Optional runtime overrides: core_seconds, shard_seconds, read_buffer_mb,
+# prefetch_depth, vram_limit_gb. Omitted values use TeraSort's selected profile.
+{}

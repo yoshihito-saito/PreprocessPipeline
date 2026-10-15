@@ -8,7 +8,8 @@ import tempfile
 import numpy as np
 from scipy.io import loadmat
 
-from src.preprocess.io import build_channel_map_data, find_rhd_source
+from src.preprocess.io import build_channel_map_data, find_rhd_source, discover_subsessions
+from src.preprocess.wildx_np import has_wildx_np_marker, session_recordings, channel_map_data
 from src.preprocess.paths import resolve_project_path
 from src.preprocess.recording import _local_reference_channels_without_neighbors
 from src.execution.models import StageName
@@ -117,6 +118,11 @@ def _local_cmr_check(settings: PipelineGuiSettings, *, apply_preprocess: bool | 
         if use_existing:
             path = settings.postprocess_chanmap_path() if apply_preprocess is not None else Path(settings.chanmap_path).expanduser()
             data = loadmat(path) if path is not None else None
+        elif has_wildx_np_marker(basepath):
+            recordings = session_recordings(discover_subsessions(
+                basepath, sort_files=True, alt_sort=None, ignore_folders=[],
+                subsession_order=settings.subsession_order))
+            data = channel_map_data(recordings[0], p.reject_channels)
         else:
             data = build_channel_map_data(
                 basepath=basepath,
@@ -230,15 +236,35 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
         checks.append(CheckResult("Local output", "ok" if output_dir.parent.exists() else "warn", str(output_dir)))
 
     if basepath is not None:
+        np_recordings = []
+        if mode in ("all", "preprocess") and has_wildx_np_marker(basepath):
+            try:
+                np_recordings = session_recordings(discover_subsessions(
+                    basepath, sort_files=True, alt_sort=None, ignore_folders=[],
+                    subsession_order=settings.subsession_order))
+                first = np_recordings[0]
+                connected = np.asarray(channel_map_data(first)["connected"]).reshape(-1)
+                checks.append(CheckResult("Acquisition format", "ok",
+                                          f"WILDX NP v1: {first.num_channels} saved columns, "
+                                          f"{int(connected.sum())} active; AP {first.sampling_frequency:g} Hz"))
+                if settings.preprocess.analog_inputs or settings.preprocess.digital_inputs:
+                    checks.append(CheckResult("WILDX NP sensor export", "error",
+                                              "Disable analog/digital export; the mixed sensor stream needs its own decoder"))
+                if settings.preprocess.state_score:
+                    checks.append(CheckResult("WILDX NP state scoring", "error",
+                                              "Disable state scoring until AP/LF time alignment is verified"))
+            except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+                checks.append(CheckResult("WILDX NP metadata", "error", str(exc)))
         xml = settings.resolved_xml_path()
         checks.append(
             CheckResult(
                 "Session XML",
-                "ok" if xml is not None and xml.exists() else "error",
-                str(xml) if xml is not None and xml.exists() else "not set. Load XML before running.",
+                "ok" if np_recordings or (xml is not None and xml.exists()) else "error",
+                "generated from WILDX NP applied settings in the Stage worker" if np_recordings else (
+                    str(xml) if xml is not None and xml.exists() else "not set. Load XML before running."),
             )
         )
-        if not _has_openephys_recording(basepath):
+        if not np_recordings and not _has_openephys_recording(basepath):
             rhd = find_rhd_source(basepath, basepath.name)
             if rhd is None and output_dir is not None:
                 local_rhd = output_dir / f"{basepath.name}.rhd"

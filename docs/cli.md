@@ -85,6 +85,85 @@ Success exits with code 0 and prints a final JSON line prefixed by
 `<local_root>/<basename>/preprocess.log`; compatible completed files are reused
 when overwrite is false. The command does not perform the final storage copy.
 
+## Use TeraSort for the sorting stage
+
+Select `terasort` in the GUI, or change these keys in the existing pipeline
+JSON's `preprocess` object:
+
+```json
+{
+  "run_sorter": true,
+  "sorter": "terasort",
+  "sorter_path": "D:/TeraSort-bounded-nt-pr",
+  "sorter_config_path": "sorter/TeraSort_config.yaml"
+}
+```
+
+The TeraSort checkout must have its own installed `.venv` and include the
+PreprocessPipeline integration changes. Alternatively, set `sorter_path` to
+the Python executable in an environment with that TeraSort version installed.
+The adapter launches this environment as a child process and inherits the
+worker's GPU visibility. It does not install TeraSort or its dependencies.
+
+The pipeline still produces its usual final `.dat`, then passes it and the
+effective `chanMap.mat` to TeraSort's standard `session-sort` route. It marks
+this input as preprocessed so TeraSort skips a second reference/filter pass;
+KS4 preview seed learning retains whitening, and INT16 matching retains its
+headroom quantization. Postprocessing consumes the exported Phy folder through
+the existing path. Existing Kilosort selection and defaults are unchanged.
+
+`chanMap0ind` identifies columns of the actual input `.dat`, after any upstream
+remapping. Geometry rows are selected by these IDs in the active-channel order.
+Rejected/disconnected channels are omitted from sorting without rewriting or
+renumbering the binary; Phy's `channel_map.npy` retains the original column IDs
+and `params.py` records the full binary width. Distinct `(probe_id, shank_id)`
+pairs stay separate even when probes reuse local shank numbers.
+
+This route requires little-endian INT16, zero voltage offset, a positive
+microvolt-per-count gain, and matching sample rate/geometry. The adapter treats
+the final binary as one contiguous sample axis; it does not import WILD
+`valid_samples.dat` masks or reconstruct acquisition gaps. Existing preprocessing
+and disk-space preflight remain in effect, including the conservative two-times
+source-size estimate; this integration does not establish end-to-end bounded
+disk use for very large recordings.
+
+The default `sorter/TeraSort_config.yaml` is `{}` and uses TeraSort's selected
+session profile. To opt into 41-sample KS4 seeds with the native cuBLAS backend,
+set `nt: 41` and `seed_backend: cublas` in that YAML. `nt` is the bounded
+sorter's waveform length too; changing it requires a new output and seed bank.
+The seed backend applies only to initial KS4 seed learning, not the bounded
+matching stage. It requires the updated TeraSort checkout and its platform-native
+bridge; an explicit `cublas` request fails if the bridge is unavailable. The
+Kilosort4 YAML configuration is separate and is not inherited by TeraSort.
+Optional runtime keys are `core_seconds`, `shard_seconds`, `read_buffer_mb`,
+`prefetch_depth`, and `vram_limit_gb`. Omitted keys retain TeraSort's defaults.
+The selected options are pinned in `.terasort/<output>.job.json` for retry.
+The GUI makes an editable per-session copy of the selected YAML once; edit that
+copy for an existing GUI session rather than expecting later template changes to
+replace it.
+
+Each result is a flat `Terasort_<timestamp>` Phy folder. Native shards, the pinned
+manifest/settings, and preview seeds live beside it under `.terasort/`; retain
+that directory for retry. Persistent Runs use the same output/checkpoints on
+sorting retries. If different probe/shank groups have overlapping coordinates,
+the integration separates them horizontally in Phy's `channel_positions.npy`.
+`channel_positions_local.npy` retains the original selected-channel geometry;
+`channel_positions_display.json` records the display offsets. These offsets
+do not describe physical spacing between implanted probes. Sorting geometry,
+binary channel IDs, and curation remain unchanged. After repairing an existing
+export, save curation and close Phy, then reopen with `--clear-cache` to refresh
+geometry-dependent caches. The standalone equivalent for an already preprocessed binary is:
+
+```bash
+python -m src.preprocess.sorter_runner --sorter terasort --config sorter/TeraSort_config.yaml --dat-path /scratch/preprocess/session01/session01.dat --xml-path /scratch/preprocess/session01/session01.xml --chanmap /scratch/preprocess/session01/chanMap.mat --terasort-path /opt/TeraSort --input-is-preprocessed --gain-to-uV 0.195 --output-folder /scratch/preprocess/session01/Terasort_manual
+```
+
+Use the actual recording gain, not the example value. For a raw binary, omit
+`--input-is-preprocessed`. To resume the same standalone output, repeat the
+command with `--terasort-resume`; changed inputs/settings require a new output.
+The integration has not yet been validated on real recordings, GPU execution,
+interrupted retries, or interactive Phy curation.
+
 ## Direct multi-day run
 
 Add these top-level keys to the single-day JSON:
@@ -301,3 +380,77 @@ the pipeline JSON can still control the exported synchronization inputs.
 
 Behavior export produces `<basename>.animal.behavior.mat`. Postprocessing produces
 Phy-compatible sorting/metrics; CellExplorer processing is a separate action.
+
+## WILDX Neuropixels input and local excerpts
+
+WILDX NP is detected from `neuropixels_probe*_metadata.json` receipts with
+`format="WILDX NP applied probe receipt"` and `format_version=1`. The initial
+route accepts one complete merged segment of NP1 `PRB_1_4_0480_1` probes per
+session. Incomplete segments, multiple segments with unknown gap timing,
+other probe models/storage layouts, and mixed acquisition formats are rejected.
+
+Select the day folder as basepath when it contains
+`NP_SESSION_*/segment_*`. A capture folder with a direct segment child, or the
+segment itself, is also supported. The selected basepath and its output basename
+are retained. Each discovered segment must contain `neuropixels_ap.dat`,
+`neuropixels_probes.txt`, and one applied-probe JSON
+per physical port. `neuropixels_lfp.dat` is required when `make_lfp=true`.
+No input XML or IMRO is needed for this route: saved stream metadata determine
+the AP width, little-endian INT16 storage, sample rate, and physical-port order;
+the receipts determine hardware-channel/site selection and validity.
+
+The worker creates XML, `chanMap.mat`, channel coordinates, and
+`wildx_np_metadata.json` locally. The map retains every saved binary column,
+including disconnected/standby channels with no site. Unknown coordinates stay
+NaN; these channels are excluded from reference estimation and sorting. The NP1
+geometry uses physical site IDs and micrometre coordinates, independent of
+hardware channel number and bank. Filtering/reference estimation runs separately
+for each physical probe, preserving its relative coordinates and the configured
+reference radius/operator. Geometry and nominal gain conversion follow
+the [Open Ephys NP1 implementation](https://github.com/open-ephys-plugins/neuropixels-pxi/blob/8c2d85a2ace63fd873b1f74fb7516a660b30562d/Source/Probes/Geometry.cpp#L141)
+and its [gain table and voltage conversion](https://github.com/open-ephys-plugins/neuropixels-pxi/blob/8c2d85a2ace63fd873b1f74fb7516a660b30562d/Source/Probes/Neuropixels1.cpp#L471).
+
+AP values retain the ADC count scale through the existing preprocessing path.
+The nominal NP1 scale is `1.2e6 / 1024 / applied_gain` microvolts/count, using
+uniform applied gain indices. For AP gain 500 it is 2.34375 microvolts/count.
+Per-channel calibration has not been applied. The output scale is carried to
+sorting and postprocessing rather than using the Intan default.
+
+With `make_lfp=true`, the saved LF samples are exported at their recorded rate;
+AP is not refiltered to synthesize LF. LF retains its own nominal count scale
+and first-saved-row time origin, recorded in `<basename>.lfp_metadata.json` and
+the session metadata. AP/LF alignment and the ADC DC zero point remain
+unverified. Set `state_score=false`, `analog_inputs=false`, and
+`digital_inputs=false`: state scoring needs a verified common time origin, and
+the mixed WILDX sensor stream needs a separate decoder.
+
+To make a local prefix copy without touching the server recording:
+
+```powershell
+python -m src.preprocess.wildx_np --source 'R:/data/segment_0001' --destination 'D:/np_validation/input/day_10min/segment_0001' --seconds 600
+```
+
+This copies whole AP/LF frames from sample zero, preserves receipts, saves the
+original stream metadata as `neuropixels_probes.source.txt`, and updates the
+excerpt's merged row counts. `neuropixels_excerpt.json` records each copied
+stream's source, interval, byte count, and SHA-256. Unpaired tails and sensor
+streams are not included. The destination must not already exist.
+
+Use the copy's parent session as `basepath`, a local output directory as
+`local_root`, and the existing `--mode preprocess` command. Set
+`preprocess.run_sorter=true`, `preprocess.sorter="terasort"`, its dedicated
+checkout/environment as `preprocess.sorter_path`, and
+`sorter/TeraSort_config.yaml` as the sorter config. Leave XML/chanMap paths
+empty for automatic generation. Keep `overwrite=false` to reuse compatible
+outputs, including a one-subepoch MergePoints file.
+
+For the GUI, keep the selected day folder as Basepath; NP discovery descends
+through `NP_SESSION_*/segment_*`. Leave XML/chanMap and manual probe assignments empty;
+the NP preview uses applied receipts and marks inactive binary slots. Run with
+**Preprocess only** and **Run sorter** enabled. A persistent GUI Run uses the
+checkout containing the launched GUI, unless `PREPROCESS_PIPELINE_ROOT` is
+explicitly set. Restart an already open GUI after updating its code.
+
+A persistent Run cannot adopt older foreground outputs without its compatible
+output contract. Use a fresh `local_root` and execution workspace for that Run;
+keep `overwrite=false` to preserve the older outputs and Phy curation.

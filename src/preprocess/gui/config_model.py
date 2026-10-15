@@ -12,6 +12,7 @@ from src.preprocess.io import load_session_xml_metadata, load_xml_metadata
 from src.phy_metadata import read_phy_params, resolve_phy_dat_path
 from src.sorting_manifest import all_partitions_skipped
 from src.preprocess.paths import find_project_root, resolve_project_path
+from src.preprocess.wildx_np import has_wildx_np_marker
 from src.worker_defaults import default_worker_count, normalize_worker_count
 from src.execution.models import (
     AnalysisConfig,
@@ -41,8 +42,9 @@ SORTING_OUTPUT_PATTERNS = (
     "Kilosort2_5_*",
     "Kilosort2.5_*",
     "Kilosort4_*",
+    "Terasort_*",
 )
-REPO_ROOT = find_project_root()
+REPO_ROOT = find_project_root(Path(__file__))
 DEFAULT_LOCAL_WORKING_DIR = REPO_ROOT / "preprocess_tmp"
 
 
@@ -184,9 +186,12 @@ def _looks_like_processed_session(path: Path) -> bool:
 
 
 def _raw_recording_is_present(path: Path) -> bool:
+    if has_wildx_np_marker(path):
+        return True
     if (path / "structure.oebin").exists():
         return True
-    if (path / "amplifier.dat").exists() or (path / "continuous.dat").exists():
+    if ((path / "amplifier.dat").exists() or (path / "continuous.dat").exists()
+            or (path / "neuropixels_ap.dat").exists()):
         return True
     return any(
         child.is_dir()
@@ -194,6 +199,7 @@ def _raw_recording_is_present(path: Path) -> bool:
             (child / "amplifier.dat").exists()
             or (child / "continuous.dat").exists()
             or (child / "structure.oebin").exists()
+            or (child / "neuropixels_ap.dat").exists()
         )
         for child in path.iterdir()
     )

@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .io import prepare_chanmap
+from .io import prepare_chanmap, discover_subsessions
+from .wildx_np import has_wildx_np_marker, session_recordings, prepare_session_metadata
 from .multiday import prepare_multi_day_basepath
 
 
@@ -61,6 +62,20 @@ def prepare_preprocess_settings(settings: Any) -> dict[str, Any]:
     basename = settings.basename
     local_output_dir = settings.local_output_dir
     xml_path = settings.resolved_xml_path()
+    if basepath is not None and local_output_dir is not None and has_wildx_np_marker(basepath):
+        recordings = session_recordings(discover_subsessions(
+            basepath, sort_files=True, alt_sort=None, ignore_folders=[],
+            subsession_order=settings.subsession_order))
+        if recordings:
+            xml_path, chanmap_path = prepare_session_metadata(
+                recordings, output_dir=local_output_dir, basename=basename,
+                reject_channels=settings.preprocess.reject_channels,
+                overwrite=settings.preprocess.overwrite)
+            settings.xml_path = str(xml_path)
+            settings.chanmap_path = str(chanmap_path)
+            print(f"Detected acquisition: wildx_np; prepared chanMap: {chanmap_path}", flush=True)
+            payload["source_type"] = "wildx_np"
+            return payload
     if basepath is None or local_output_dir is None or xml_path is None:
         raise ValueError("Cannot resolve source, output, and XML paths for chanMap generation")
     chanmap_path, bad_channels = prepare_chanmap(

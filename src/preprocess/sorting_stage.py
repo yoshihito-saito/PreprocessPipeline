@@ -56,6 +56,7 @@ def run_sorting_stage(
     *,
     output_timestamp: str | None = None,
     execute_job: Callable[..., Path] = execute_sorting_job,
+    resume_terasort: bool = False,
 ) -> PreprocessResult:
     """Run only the sorter portion of the existing preprocess workflow."""
     if not config.sorter:
@@ -74,6 +75,8 @@ def run_sorting_stage(
     xml_path = _resolved_xml_path(config, preprocess_result)
     chanmap_path = _resolved_chanmap_path(config, preprocess_result)
     bad_0 = sorted(set(int(value) for value in preprocess_result.bad_channels_0based))
+    output_gain = getattr(preprocess_result, "gain_to_uV", None)
+    output_offset = getattr(preprocess_result, "offset_to_uV", None)
     sorter_input_is_preprocessed = bool(config.do_preprocess)
     sorter_exclude_channels_0based = (
         bad_0 if config.bad_channels and bad_0 else None
@@ -114,7 +117,7 @@ def run_sorting_stage(
             continue
         suffix = "" if partition.mode == "all" else f"_{partition.name}"
         output_folder = output_dir / f"{sorter_output_prefix(sorter_label)}_{timestamp}{suffix}"
-        if output_folder.exists():
+        if output_folder.exists() and not (sorter_label.lower() == "terasort" and resume_terasort):
             counter = 1
             while (candidate := output_dir / f"{sorter_output_prefix(sorter_label)}_{timestamp}{suffix}_{counter:02d}").exists():
                 counter += 1
@@ -145,8 +148,8 @@ def run_sorting_stage(
             matlab_max_workers=config.matlab_max_workers,
             chanmap_mat_path=chanmap_path,
             dtype=config.dtype,
-            gain_to_uV=config.gain_to_uV,
-            offset_to_uV=config.offset_to_uV,
+            gain_to_uV=config.gain_to_uV if output_gain is None else output_gain,
+            offset_to_uV=config.offset_to_uV if output_offset is None else output_offset,
             sampling_frequency=float(preprocess_result.sr),
             num_channels=int(preprocess_result.n_channels),
             active_channels_0based=(
@@ -167,6 +170,8 @@ def run_sorting_stage(
             local_radius_um=config.local_radius_um,
             sorter_verbose=bool(config.sorter_verbose),
             cleanup_temp_wh=bool(config.cleanup_temp_wh),
+            **({"terasort_path": config.sorter_path, "terasort_resume": resume_terasort}
+               if sorter_label.lower() == "terasort" else {}),
         )
         sorter_output_dirs.append(output_folder)
         manifest_partitions[-1] = replace(current, status="completed")

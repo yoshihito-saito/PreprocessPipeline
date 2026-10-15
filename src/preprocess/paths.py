@@ -74,9 +74,10 @@ def find_project_root(start: Path | None = None) -> Path:
             )
         return root
 
-    starts = list(_direct_url_roots())
+    starts: list[Path] = []
     if start is not None:
         starts.append(start)
+    starts.extend(_direct_url_roots())
     starts.append(Path.cwd())
     starts.append(Path(__file__).resolve())
 
