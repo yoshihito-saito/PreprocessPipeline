@@ -259,7 +259,7 @@ SORTER_DEFAULTS: dict[str, tuple[str, str]] = {
     "Kilosort": ("sorter/KiloSort1", "sorter/Kilosort1_config.yaml"),
     "Kilosort2_5": ("sorter/Kilosort2.5", "sorter/Kilosort2.5_config.yaml"),
     "kilosort4": ("sorter/Kilosort4", "sorter/Kilosort4_config.yaml"),
-    "terasort": ("", "sorter/TeraSort_config.yaml"),
+    "terasort": ("sorter/TeraSort", "sorter/TeraSort_config.yaml"),
     "disabled": ("", ""),
 }
 

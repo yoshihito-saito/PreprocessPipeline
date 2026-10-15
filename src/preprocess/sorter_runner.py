@@ -1862,7 +1862,8 @@ def execute_sorting_job(
         params = normalize_terasort_config(_load_params(cfg_path))
         result = execute_terasort_job(
             dat_path=Path(dat_path), chanmap_path=chanmap_mat_path,
-            output_folder=Path(output_folder), terasort_path=terasort_path,
+            output_folder=Path(output_folder),
+            terasort_path=terasort_path or (_repo_root() / "sorter" / "TeraSort"),
             sampling_frequency=sr, num_channels=nch,
             gain_to_uV=gain_to_uV, offset_to_uV=offset_to_uV, dtype=dtype,
             active_channels_0based=resolved_active_channels_0based,

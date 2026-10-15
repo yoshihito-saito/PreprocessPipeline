@@ -1,0 +1,7 @@
+# Full-recording KS4-compatible route with six 41-sample cuBLAS filters.
+# Requires the native cuBLAS bridge in the TeraSort Python environment.
+mode: kilosort4
+nt: 41
+ks4_backend: cublas
+ks4_settings:
+  n_templates: 6

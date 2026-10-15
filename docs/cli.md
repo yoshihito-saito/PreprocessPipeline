@@ -357,22 +357,38 @@ Phy-compatible sorting/metrics; CellExplorer processing is a separate action.
 
 ## TeraSort modes, KS4 settings and waveform length
 
-Select `preprocess.sorter="terasort"`, point `preprocess.sorter_path` to the
-updated TeraSort integration checkout with its `.venv` (or its Python executable),
-and use `preprocess.sorter_config_path="sorter/TeraSort_config.yaml"`.
-If the selected checkout uses a separate existing Python environment, set
-`PREPROCESS_TERASORT_PYTHON` to that environment's Python executable before
-starting PP. PP places the selected checkout's `src` first on the TeraSort child
-process's import path, verifies the imported package origin, and pins a digest
-of that package plus the Python path in the job identity. When a Python executable
-is selected directly, PP pins the package actually importable in that environment.
-Changing source files or Python path requires a new output rather than a bounded
-resume; older jobs without a source identity cannot resume under this contract.
-The runtime must contain the configurable modes/KS4 settings changes on
-[TeraSort PR #1](https://github.com/ayalab1/TeraSort/pull/1)'s integration branch,
-in addition to its preprocessed/source-column and flat Phy input/output contract.
-PP does not vendor TeraSort or install its runtime. The GUI uses the existing
-sorter/path/config controls; selecting the mode happens in the sorter YAML.
+PP includes the pinned TeraSort source in `sorter/TeraSort` (upstream
+`codex/preprocess-bounded-nt` at `734e145`). Selecting `terasort` in the GUI
+fills **Sorter path** with `sorter/TeraSort`; the CLI uses that path when
+`--terasort-path` is omitted. **Sorter config** remains a separate YAML path,
+defaulting to `sorter/TeraSort_config.yaml`. Existing explicit external paths
+still select their specified TeraSort source.
+
+The bundled source needs its own Python environment. On Linux, from the PP
+checkout, install it in the bundled directory; for `ks4_backend: cublas`, also
+build the native bridge with a C++17 compiler:
+
+```bash
+bash sorter/TeraSort/scripts/install-linux.sh
+sorter/TeraSort/.venv/bin/python sorter/TeraSort/scripts/build_cublas_bridge_linux.py
+```
+
+The installer requires an NVIDIA GPU/driver and downloads pinned Python
+dependencies. It is not run automatically by PP. If using a separate existing
+TeraSort Python environment instead of the bundled `.venv`, set
+`PREPROCESS_TERASORT_PYTHON` to its absolute Python path before launching PP.
+PP prepends the selected source's `src` to the child process import path,
+verifies the imported package origin, and pins a package-content digest and
+Python path in the job identity. Changing source files or Python path requires
+a new output instead of a bounded resume. Selecting a Python executable as
+Sorter path directly remains supported, but then PP uses the TeraSort package
+importable by that interpreter.
+
+The GUI's **Open config** creates a session-local copy only if it does not
+already exist; changing branches does not overwrite an older session copy.
+For a new full-KS4/cuBLAS run, choose the opt-in
+`sorter/TeraSort_kilosort4_cublas.yaml` with a fresh session/output path.
+Selecting the mode happens in the sorter YAML.
 
 ```yaml
 mode: bounded
