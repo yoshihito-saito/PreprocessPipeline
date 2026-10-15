@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -118,12 +119,55 @@ def normalize_terasort_config(params: dict) -> dict:
 def _python_executable(path: Path | None) -> Path:
     if path is None:
         raise ValueError("TeraSort requires sorter_path/--terasort-path pointing to its checkout or Python executable")
-    path = Path(path).expanduser().resolve()
+    path = Path(path).expanduser()
     if path.is_dir():
-        path = path / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        configured = os.environ.get("PREPROCESS_TERASORT_PYTHON", "").strip()
+        path = (Path(configured).expanduser() if configured else
+                path / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
+    # Resolve the path spelling without dereferencing a venv's Python symlink.
+    path = Path(os.path.abspath(path))
     if not path.is_file():
         raise FileNotFoundError(f"TeraSort Python environment not found: {path}")
     return path
+
+
+def _source_identity(executable: Path, selected_path: Path, env: dict[str, str]) -> dict:
+    """Identify the package loaded by the same interpreter/environment as the job."""
+    source_root = selected_path if selected_path.is_dir() else None
+    if source_root is not None:
+        source_dir = source_root / "src"
+        if not (source_dir / "terasort" / "__init__.py").is_file():
+            raise ValueError(f"TeraSort checkout has no src/terasort package: {source_root}")
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (str(source_dir), env.get("PYTHONPATH", "")) if part
+        )
+    probe = (
+        "import importlib.util, json; "
+        "spec = importlib.util.find_spec('terasort'); "
+        "print(json.dumps({'origin': spec.origin if spec else None}))"
+    )
+    result = subprocess.run(
+        [str(executable), "-c", probe], env=env, capture_output=True, text=True, check=True,
+    )
+    origin = json.loads(result.stdout)["origin"]
+    if origin is None:
+        raise ImportError(f"TeraSort is not importable with {executable}")
+    module_path = Path(origin).resolve(strict=True)
+    if module_path.name != "__init__.py":
+        raise ValueError(f"TeraSort must resolve to a package directory: {module_path}")
+    if source_root is not None and module_path != (source_root / "src" / "terasort" / "__init__.py").resolve():
+        raise ValueError(f"TeraSort imported from {module_path}, not the selected checkout {source_root}")
+    package_dir = module_path.parent
+    digest = hashlib.sha256()
+    for file in sorted(package_dir.rglob("*")):
+        if not file.is_file() or "__pycache__" in file.parts or file.suffix in {".pyc", ".pyo"}:
+            continue
+        digest.update(file.relative_to(package_dir).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        with file.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return {"module": str(module_path), "sha256": digest.hexdigest()}
 
 
 def build_terasort_manifest(
@@ -227,6 +271,9 @@ def execute_terasort_job(
         elif key in _ENUM_OPTIONS:
             option_arguments.extend(["--" + key.replace("_", "-"), value])
     executable = _python_executable(terasort_path)
+    selected_path = Path(terasort_path).expanduser().resolve()
+    runtime_env = os.environ.copy()
+    source_identity = _source_identity(executable, selected_path, runtime_env)
     manifest = build_terasort_manifest(
         dat_path=dat_path, chanmap_path=chanmap_path, num_channels=num_channels,
         sampling_frequency=sampling_frequency, gain_to_uV=gain_to_uV,
@@ -253,7 +300,8 @@ def execute_terasort_job(
             pinned_params.pop("ks4_backend")
         if not ks4_settings:
             pinned_params.pop("ks4_settings")
-    _pin_json(job_path, {"python": str(executable), "params": pinned_params,
+    _pin_json(job_path, {"python": str(executable), "source": source_identity,
+                        "params": pinned_params,
                         "phy_output": str(output)}, resume=resume)
     command = [str(executable), "-u", "-m", "terasort.cli"]
     if mode == "bounded":
@@ -288,7 +336,7 @@ def execute_terasort_job(
             command.append("--input-is-preprocessed")
     print(f"Running TeraSort mode={mode}, ks4_backend={ks4_backend} -> {output}", flush=True)
     # Inherit the controller's CUDA visibility, process tree and streamed logs.
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, env=runtime_env)
     required = ("params.py", "spike_times.npy", "spike_clusters.npy", "templates.npy", "channel_map.npy")
     if not all((output / name).is_file() for name in required):
         raise RuntimeError(f"TeraSort did not publish a complete Phy folder: {output}")

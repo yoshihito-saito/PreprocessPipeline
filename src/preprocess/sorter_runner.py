@@ -1359,6 +1359,7 @@ def _patch_channel_map_for_raw_dat(
 
 def _write_phy_shanks_from_chanmap(
     output_folder: Path, chanmap_mat_path: Path | None, num_channels: int,
+    *, separate_overlapping_positions: bool = False,
 ) -> None:
     if chanmap_mat_path is None or not Path(chanmap_mat_path).exists():
         return
@@ -1372,6 +1373,7 @@ def _write_phy_shanks_from_chanmap(
                 shank_ids=layout["kcoords"],
                 probe_ids=layout.get("probe_ids", np.zeros_like(layout["chanMap0ind"])),
                 exported_channel_ids=np.load(path),
+                separate_overlapping_positions=separate_overlapping_positions,
             )
     except (ValueError, TypeError, OSError) as exc:
         warnings.warn(f"Could not export Phy shank metadata: {exc}", RuntimeWarning, stacklevel=2)
@@ -1867,7 +1869,9 @@ def execute_sorting_job(
             input_is_preprocessed=input_is_preprocessed, params=params,
             resume=terasort_resume)
         _save_sorter_config_snapshot(output_folder=result, source_config_path=cfg_path, resolved_params=params)
-        _write_phy_shanks_from_chanmap(result, chanmap_mat_path, nch)
+        _write_phy_shanks_from_chanmap(
+            result, chanmap_mat_path, nch, separate_overlapping_positions=True,
+        )
         _patch_params_py(result / "params.py", dat_path=Path(dat_path), n_channels_dat=nch,
                          hp_filtered=bool(input_is_preprocessed), dtype=dtype)
         return result

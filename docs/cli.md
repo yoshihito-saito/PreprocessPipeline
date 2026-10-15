@@ -360,6 +360,14 @@ Phy-compatible sorting/metrics; CellExplorer processing is a separate action.
 Select `preprocess.sorter="terasort"`, point `preprocess.sorter_path` to the
 updated TeraSort integration checkout with its `.venv` (or its Python executable),
 and use `preprocess.sorter_config_path="sorter/TeraSort_config.yaml"`.
+If the selected checkout uses a separate existing Python environment, set
+`PREPROCESS_TERASORT_PYTHON` to that environment's Python executable before
+starting PP. PP places the selected checkout's `src` first on the TeraSort child
+process's import path, verifies the imported package origin, and pins a digest
+of that package plus the Python path in the job identity. When a Python executable
+is selected directly, PP pins the package actually importable in that environment.
+Changing source files or Python path requires a new output rather than a bounded
+resume; older jobs without a source identity cannot resume under this contract.
 The runtime must contain the configurable modes/KS4 settings changes on
 [TeraSort PR #1](https://github.com/ayalab1/TeraSort/pull/1)'s integration branch,
 in addition to its preprocessed/source-column and flat Phy input/output contract.
@@ -433,9 +441,14 @@ budgets the CuPy pool, not all GPU allocations.
 Both modes retain original binary-column IDs and publish flat Phy output per PP
 partition. The current adapter requires planar XY geometry and rejects nonzero
 or unknown active z coordinates. WILD-NP retains independent physical-probe
-partitions. Input/config identities and source/probe/settings JSON are stored in
-`.terasort/`; the output keeps its source/resolved YAML snapshot and
-`terasort_run.json` pointer. Full KS4 writes `terasort_settings.json` with native
+partitions. Postprocessing discovers every completed `Terasort_*` partition from
+the saved manifest. If a TeraSort Phy export contains overlapping XY positions
+across probe/shank groups, PP separates only their display X coordinates and
+saves the original positions in `channel_positions_local.npy`; these display
+offsets are not physical probe spacing. Input/config identities and
+source/probe/settings JSON are stored in `.terasort/`; the output keeps its
+source/resolved YAML snapshot and `terasort_run.json` pointer. Full KS4 writes
+`terasort_settings.json` with native
 effective settings and the actual selected backend. Bounded seed reports retain
 the same effective KS4 record; native `run.json` records dense settings. Nonfinite
 native limits are represented as strings only in the viewable effective-settings
