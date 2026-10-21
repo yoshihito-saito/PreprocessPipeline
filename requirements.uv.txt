@@ -21,7 +21,9 @@ psutil==7.1.3
 tqdm==4.67.1
 packaging==25.0
 
-# Phy and its log-summary integration.
-phy @ git+https://github.com/cortex-lab/phy.git@1ddcd015e0382c3fc0ba20cd99dd5b8771bb8702
+# Pinned Phy 2.1.1.dev0 build and its log-summary integration.
+phy @ git+https://github.com/cortex-lab/phy.git@807cf1825c16a3d95cb591091c291bad6803e81d
+phylib==2.7.0
+PyOpenGL==3.1.10
 nelpy @ git+https://github.com/nelpy/nelpy.git
 neuro-analysis-py==0.0.2
