@@ -40,7 +40,7 @@ def test_environment_supplies_vendored_dependencies_without_kilosort_distributio
         assert not any(entry.startswith("nelpy==") for entry in requirements)
         assert "neuro-analysis-py==0.0.2" in requirements
         assert "git" in names
-        assert "phy @ git+https://github.com/cortex-lab/phy.git@1ddcd015e0382c3fc0ba20cd99dd5b8771bb8702" in requirements
+        assert "phy @ git+https://github.com/cortex-lab/phy.git@807cf1825c16a3d95cb591091c291bad6803e81d" in requirements
         assert not any(entry.startswith("phy==") for entry in requirements)
         assert "--extra-index-url https://download.pytorch.org/whl/cu130" in requirements
         assert "torch==2.9.1+cu130" in requirements
@@ -159,6 +159,6 @@ def test_uv_requirements_cover_sorter_and_preserve_git_sources():
                 and any(isinstance(t, ast.Name) and t.id == "install_deps" for t in n.targets))
     assert {Requirement(d).name.lower() for d in deps} <= reqs.keys()
     assert str(reqs["torch"].specifier) == "==2.9.1"
-    assert reqs["phy"].url.endswith("@1ddcd015e0382c3fc0ba20cd99dd5b8771bb8702")
+    assert reqs["phy"].url.endswith("@807cf1825c16a3d95cb591091c291bad6803e81d")
     assert reqs["nelpy"].url == "git+https://github.com/nelpy/nelpy.git"
     assert not {"kilosort", "klustakwik2"} & reqs.keys()
