@@ -44,6 +44,12 @@ preprocess-gui
 Rerunning setup updates an existing environment. Setup uses the customized
 Kilosort4 source in `sorter/Kilosort4`; keep the repository checkout available.
 
+The Linux Conda definition and the uv requirements pin Phy 2.1.1.dev0 to commit
+`807cf1825c16a3d95cb591091c291bad6803e81d`, with phylib 2.7.0 and PyOpenGL
+3.1.10. Save and close Phy before rerunning setup. Launch the pipeline GUI from
+the resulting `preprocess` Conda environment or uv `.venv` so **Launch Phy** uses
+that environment's executable. Custom Phy plugins must support this build.
+
 ## Basic use
 
 ### Single-day session

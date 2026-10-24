@@ -400,9 +400,9 @@ dependencies:
       - nvidia-nvtx==13.0.39
       - nvidia-nvtx-cu12==12.8.90
       - pathspec==0.12.1
-      # Same source commit as the existing phy2 environment (reports 2.0b6).
-      - phy @ git+https://github.com/cortex-lab/phy.git@1ddcd015e0382c3fc0ba20cd99dd5b8771bb8702
-      - phylib==2.6.3
+      # Pinned Phy 2.1.1.dev0 build used by the updated server Phy environment.
+      - phy @ git+https://github.com/cortex-lab/phy.git@807cf1825c16a3d95cb591091c291bad6803e81d
+      - phylib==2.7.0
       - prettytable==3.17.0
       - probeinterface==0.3.1
       - propcache==0.4.1
@@ -410,7 +410,7 @@ dependencies:
       - pydantic==2.12.5
       - pydantic-core==2.41.5
       - pynndescent==0.5.13
-      - pyopengl==3.1.6
+      - pyopengl==3.1.10
       - pyqt6==6.10.0
       - pyqt6-qt6==6.10.1
       - pyqt6-sip==13.10.2

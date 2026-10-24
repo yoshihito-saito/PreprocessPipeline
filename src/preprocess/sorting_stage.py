@@ -67,6 +67,7 @@ def run_sorting_stage(
     preprocess_result: PreprocessResult,
     *,
     output_timestamp: str | None = None,
+    resume_terasort: bool = False,
     execute_job: Callable[..., Path] = execute_sorting_job,
 ) -> PreprocessResult:
     """Run only the sorter portion of the existing preprocess workflow."""
@@ -97,8 +98,8 @@ def run_sorting_stage(
 
     sorter_label = str(config.sorter).strip()
     partition_mode = "probe" if is_np else str(config.sorter_partition_mode).strip().lower()
-    if is_np and sorter_label.lower() != "kilosort4":
-        raise ValueError("WILD-NP currently supports the common Kilosort4 route")
+    if is_np and sorter_label.lower() not in {"kilosort4", "terasort"}:
+        raise ValueError("WILD-NP supports the Kilosort4 and TeraSort routes with independent probe partitions")
     if partition_mode not in {"all", "probe", "shank"}:
         raise ValueError(
             "sorter_partition_mode must be one of ['all', 'probe', 'shank']. "
@@ -142,7 +143,7 @@ def run_sorting_stage(
             continue
         suffix = "" if partition.mode == "all" else f"_{partition.name}"
         output_folder = output_dir / f"{sorter_output_prefix(sorter_label)}_{timestamp}{suffix}"
-        if output_folder.exists():
+        if output_folder.exists() and not (sorter_label.lower() == "terasort" and resume_terasort):
             counter = 1
             while (candidate := output_dir / f"{sorter_output_prefix(sorter_label)}_{timestamp}{suffix}_{counter:02d}").exists():
                 counter += 1
@@ -169,6 +170,8 @@ def run_sorting_stage(
             kilosort1_path=config.sorter_path,
             kilosort25_path=config.sorter_path,
             kilosort4_path=config.sorter_path,
+            **({"terasort_path": config.sorter_path, "terasort_resume": resume_terasort}
+               if sorter_label.lower() == "terasort" else {}),
             matlab_path=config.matlab_path,
             matlab_max_workers=config.matlab_max_workers,
             chanmap_mat_path=chanmap_path,

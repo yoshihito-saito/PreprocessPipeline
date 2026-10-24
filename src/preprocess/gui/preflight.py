@@ -282,8 +282,8 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
                                           f"{incomplete} incomplete saved prefixes; {unknown_identity} epochs lack confirmed probe identity. "
                                           "Nominal gain only; ADC calibration and AP/PC/LFP synchronization are unverified."))
                 pp = settings.preprocess
-                if pp.run_sorter and str(pp.sorter).lower() != "kilosort4":
-                    checks.append(CheckResult("NP sorter", "error", "Select kilosort4; NP uses independent probe partitions"))
+                if pp.run_sorter and str(pp.sorter).lower() not in {"kilosort4", "terasort"}:
+                    checks.append(CheckResult("NP sorter", "error", "Select kilosort4 or terasort; NP uses independent probe partitions"))
                 if pp.remove_ttl_artifacts or pp.remove_highamp_artifacts:
                     checks.append(CheckResult("NP artifact interpolation", "error", "Disable artifact removal for this NP route"))
                 if settings.preprocess.analog_inputs or settings.preprocess.digital_inputs:
@@ -398,7 +398,7 @@ def run_preflight(settings: PipelineGuiSettings, mode: RunMode) -> list[CheckRes
         if sorter and sorter.lower() != "disabled":
             sorter_path = _repo_relative_path(settings.preprocess.sorter_path)
             sorter_config = _repo_relative_path(settings.preprocess.sorter_config_path)
-            checks.append(_check_path("Sorter path", sorter_path, must_be_dir=True))
+            checks.append(_check_path("Sorter path", sorter_path, must_be_dir=sorter.lower() != "terasort"))
             checks.append(_check_path("Sorter config", sorter_config))
             if "kilosort" in sorter.lower() and sorter.lower() != "kilosort4":
                 matlab_text = (
